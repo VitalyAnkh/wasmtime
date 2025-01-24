@@ -16,18 +16,19 @@
 //! can be somewhat arbitrary, an intentional decision.
 
 use crate::component::{
-    CanonicalAbiInfo, ComponentTypesBuilder, FlatType, InterfaceType, StringEncoding,
-    TypeEnumIndex, TypeFlagsIndex, TypeListIndex, TypeOptionIndex, TypeRecordIndex,
-    TypeResultIndex, TypeTupleIndex, TypeUnionIndex, TypeVariantIndex, VariantInfo, FLAG_MAY_ENTER,
-    FLAG_MAY_LEAVE, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS,
+    CanonicalAbiInfo, ComponentTypesBuilder, FixedEncoding as FE, FlatType, InterfaceType,
+    StringEncoding, Transcode, TypeEnumIndex, TypeFlagsIndex, TypeListIndex, TypeOptionIndex,
+    TypeRecordIndex, TypeResourceTableIndex, TypeResultIndex, TypeTupleIndex, TypeVariantIndex,
+    VariantInfo, FLAG_MAY_ENTER, FLAG_MAY_LEAVE, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS,
 };
 use crate::fact::signature::Signature;
-use crate::fact::transcode::{FixedEncoding as FE, Transcode, Transcoder};
+use crate::fact::transcode::Transcoder;
 use crate::fact::traps::Trap;
 use crate::fact::{
     AdapterData, Body, Context, Function, FunctionId, Helper, HelperLocation, HelperType, Module,
     Options,
 };
+use crate::prelude::*;
 use crate::{FuncIndex, GlobalIndex};
 use std::collections::HashMap;
 use std::mem;
@@ -70,9 +71,28 @@ struct Compiler<'a, 'b> {
     /// to be a heuristic to split up the main function into theoretically
     /// reusable portions.
     fuel: usize,
+
+    /// Indicates whether an "enter call" should be emitted in the generated
+    /// function with a call to `Resource{Enter,Exit}Call` at the beginning and
+    /// end of the function for tracking of information related to borrowed
+    /// resources.
+    emit_resource_call: bool,
 }
 
 pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
+    match (adapter.lower.options.async_, adapter.lift.options.async_) {
+        (false, false) => {}
+        (true, true) => {
+            todo!()
+        }
+        (false, true) => {
+            todo!()
+        }
+        (true, false) => {
+            todo!()
+        }
+    }
+
     let lower_sig = module.types.signature(&adapter.lower, Context::Lower);
     let lift_sig = module.types.signature(&adapter.lift, Context::Lift);
     let ty = module
@@ -81,6 +101,17 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
     let result = module
         .funcs
         .push(Function::new(Some(adapter.name.clone()), ty));
+
+    // If this type signature contains any borrowed resources then invocations
+    // of enter/exit call for resource-related metadata tracking must be used.
+    // It shouldn't matter whether the lower/lift signature is used here as both
+    // should return the same answer.
+    let emit_resource_call = module.types.contains_borrow_resource(&adapter.lower);
+    assert_eq!(
+        emit_resource_call,
+        module.types.contains_borrow_resource(&adapter.lift)
+    );
+
     Compiler {
         types: module.types,
         module,
@@ -90,6 +121,7 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
         traps: Vec::new(),
         result,
         fuel: INITIAL_FUEL,
+        emit_resource_call,
     }
     .compile_adapter(adapter, &lower_sig, &lift_sig)
 }
@@ -145,7 +177,7 @@ pub(super) fn compile_helper(module: &mut Module<'_>, result: FunctionId, helper
                 .unwrap();
             Destination::Stack(&dst_flat, &helper.dst.opts)
         }
-        // This is the same as a memroy-based source but note that the address
+        // This is the same as a memory-based source but note that the address
         // of the destination is passed as the final parameter to the function.
         HelperLocation::Memory => {
             nlocals += 1;
@@ -165,6 +197,9 @@ pub(super) fn compile_helper(module: &mut Module<'_>, result: FunctionId, helper
         traps: Vec::new(),
         result,
         fuel: INITIAL_FUEL,
+        // This is a helper function and only the top-level function is
+        // responsible for emitting these intrinsic calls.
+        emit_resource_call: false,
     };
     compiler.translate(&helper.src.ty, &src, &helper.dst.ty, &dst);
     compiler.finish();
@@ -245,6 +280,11 @@ impl Compiler<'_, '_> {
             );
         }
 
+        if self.emit_resource_call {
+            let enter = self.module.import_resource_enter_call();
+            self.instruction(Call(enter.as_u32()));
+        }
+
         // Perform the translation of arguments. Note that `FLAG_MAY_LEAVE` is
         // cleared around this invocation for the callee as per the
         // `canon_lift` definition in the spec. Additionally note that the
@@ -308,14 +348,27 @@ impl Compiler<'_, '_> {
             self.free_temp_local(tmp);
         }
 
+        if self.emit_resource_call {
+            let exit = self.module.import_resource_exit_call();
+            self.instruction(Call(exit.as_u32()));
+        }
+
         self.finish()
     }
 
     fn translate_params(&mut self, adapter: &AdapterData, param_locals: &[(u32, ValType)]) {
-        let src_tys = &self.types[adapter.lower.ty].params;
-        let src_tys = src_tys.iter().copied().collect::<Vec<_>>();
-        let dst_tys = &self.types[adapter.lift.ty].params;
-        let dst_tys = dst_tys.iter().copied().collect::<Vec<_>>();
+        let src_tys = self.types[adapter.lower.ty].params;
+        let src_tys = self.types[src_tys]
+            .types
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let dst_tys = self.types[adapter.lift.ty].params;
+        let dst_tys = self.types[dst_tys]
+            .types
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
         let lift_opts = &adapter.lift.options;
         let lower_opts = &adapter.lower.options;
 
@@ -388,10 +441,18 @@ impl Compiler<'_, '_> {
         param_locals: &[(u32, ValType)],
         result_locals: &[(u32, ValType)],
     ) {
-        let src_tys = &self.types[adapter.lift.ty].results;
-        let src_tys = src_tys.iter().map(|ty| *ty).collect::<Vec<_>>();
-        let dst_tys = &self.types[adapter.lower.ty].results;
-        let dst_tys = dst_tys.iter().map(|ty| *ty).collect::<Vec<_>>();
+        let src_tys = self.types[adapter.lift.ty].results;
+        let src_tys = self.types[src_tys]
+            .types
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let dst_tys = self.types[adapter.lower.ty].results;
+        let dst_tys = self.types[dst_tys]
+            .types
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
         let lift_opts = &adapter.lift.options;
         let lower_opts = &adapter.lower.options;
 
@@ -473,7 +534,7 @@ impl Compiler<'_, '_> {
         // The general goal is to avoid creating an exponentially sized function
         // for a linearly sized input (the type section). By outlining helper
         // functions there will ideally be a constant set of helper functions
-        // per type (to accomodate in-memory or on-stack transfers as well as
+        // per type (to accommodate in-memory or on-stack transfers as well as
         // src/dst options) which means that each function is at most a certain
         // size and we have a linear number of functions which should guarantee
         // an overall linear size of the output.
@@ -533,11 +594,19 @@ impl Compiler<'_, '_> {
             InterfaceType::Record(i) => self.types[*i].fields.len(),
             InterfaceType::Tuple(i) => self.types[*i].types.len(),
             InterfaceType::Variant(i) => self.types[*i].cases.len(),
-            InterfaceType::Union(i) => self.types[*i].types.len(),
             InterfaceType::Enum(i) => self.types[*i].names.len(),
 
             // 2 cases to consider for each of these variants.
             InterfaceType::Option(_) | InterfaceType::Result(_) => 2,
+
+            // TODO(#6696) - something nonzero, is 1 right?
+            InterfaceType::Own(_) | InterfaceType::Borrow(_) => 1,
+
+            InterfaceType::Future(_)
+            | InterfaceType::Stream(_)
+            | InterfaceType::ErrorContext(_) => {
+                todo!()
+            }
         };
 
         match self.fuel.checked_sub(cost) {
@@ -567,10 +636,16 @@ impl Compiler<'_, '_> {
                     InterfaceType::Flags(f) => self.translate_flags(*f, src, dst_ty, dst),
                     InterfaceType::Tuple(t) => self.translate_tuple(*t, src, dst_ty, dst),
                     InterfaceType::Variant(v) => self.translate_variant(*v, src, dst_ty, dst),
-                    InterfaceType::Union(u) => self.translate_union(*u, src, dst_ty, dst),
                     InterfaceType::Enum(t) => self.translate_enum(*t, src, dst_ty, dst),
                     InterfaceType::Option(t) => self.translate_option(*t, src, dst_ty, dst),
                     InterfaceType::Result(t) => self.translate_result(*t, src, dst_ty, dst),
+                    InterfaceType::Own(t) => self.translate_own(*t, src, dst_ty, dst),
+                    InterfaceType::Borrow(t) => self.translate_borrow(*t, src, dst_ty, dst),
+                    InterfaceType::Future(_)
+                    | InterfaceType::Stream(_)
+                    | InterfaceType::ErrorContext(_) => {
+                        todo!()
+                    }
                 }
             }
 
@@ -1178,7 +1253,7 @@ impl Compiler<'_, '_> {
         self.validate_string_length(src, src_enc);
 
         // Optimistically assume that the code unit length of the source is
-        // all that's needed in the destination. Perform that allocaiton
+        // all that's needed in the destination. Perform that allocation
         // here and proceed to transcoding below.
         self.convert_src_len_to_dst(src.len.idx, src.opts.ptr(), dst_opts.ptr());
         let dst_len = self.local_tee_new_tmp(dst_opts.ptr());
@@ -1684,7 +1759,7 @@ impl Compiler<'_, '_> {
         self.instruction(Block(BlockType::Empty));
 
         // Calculate the full byte size of memory with `memory.size`. Note that
-        // arithmetic here is done always in 64-bits to accomodate 4G memories.
+        // arithmetic here is done always in 64-bits to accommodate 4G memories.
         // Additionally it's assumed that 64-bit memories never fill up
         // entirely.
         self.instruction(MemorySize(opts.memory.unwrap().as_u32()));
@@ -2129,64 +2204,30 @@ impl Compiler<'_, '_> {
             _ => panic!("expected a variant"),
         };
 
-        let src_info = variant_info(self.types, src_ty.cases.iter().map(|c| c.ty.as_ref()));
-        let dst_info = variant_info(self.types, dst_ty.cases.iter().map(|c| c.ty.as_ref()));
+        let src_info = variant_info(self.types, src_ty.cases.iter().map(|(_, c)| c.as_ref()));
+        let dst_info = variant_info(self.types, dst_ty.cases.iter().map(|(_, c)| c.as_ref()));
 
-        let iter = src_ty.cases.iter().enumerate().map(|(src_i, src_case)| {
-            let dst_i = dst_ty
-                .cases
-                .iter()
-                .position(|c| c.name == src_case.name)
-                .unwrap();
-            let dst_case = &dst_ty.cases[dst_i];
-            let src_i = u32::try_from(src_i).unwrap();
-            let dst_i = u32::try_from(dst_i).unwrap();
-            VariantCase {
-                src_i,
-                src_ty: src_case.ty.as_ref(),
-                dst_i,
-                dst_ty: dst_case.ty.as_ref(),
-            }
-        });
+        let iter = src_ty
+            .cases
+            .iter()
+            .enumerate()
+            .map(|(src_i, (src_case, src_case_ty))| {
+                let dst_i = dst_ty
+                    .cases
+                    .iter()
+                    .position(|(c, _)| c == src_case)
+                    .unwrap();
+                let dst_case_ty = &dst_ty.cases[dst_i];
+                let src_i = u32::try_from(src_i).unwrap();
+                let dst_i = u32::try_from(dst_i).unwrap();
+                VariantCase {
+                    src_i,
+                    src_ty: src_case_ty.as_ref(),
+                    dst_i,
+                    dst_ty: dst_case_ty.as_ref(),
+                }
+            });
         self.convert_variant(src, &src_info, dst, &dst_info, iter);
-    }
-
-    fn translate_union(
-        &mut self,
-        src_ty: TypeUnionIndex,
-        src: &Source<'_>,
-        dst_ty: &InterfaceType,
-        dst: &Destination,
-    ) {
-        let src_ty = &self.types[src_ty];
-        let dst_ty = match dst_ty {
-            InterfaceType::Union(t) => &self.types[*t],
-            _ => panic!("expected an option"),
-        };
-        assert_eq!(src_ty.types.len(), dst_ty.types.len());
-        let src_info = variant_info(self.types, src_ty.types.iter().map(Some));
-        let dst_info = variant_info(self.types, dst_ty.types.iter().map(Some));
-
-        self.convert_variant(
-            src,
-            &src_info,
-            dst,
-            &dst_info,
-            src_ty
-                .types
-                .iter()
-                .zip(dst_ty.types.iter())
-                .enumerate()
-                .map(|(i, (src_ty, dst_ty))| {
-                    let i = u32::try_from(i).unwrap();
-                    VariantCase {
-                        src_i: i,
-                        dst_i: i,
-                        src_ty: Some(src_ty),
-                        dst_ty: Some(dst_ty),
-                    }
-                }),
-        );
     }
 
     fn translate_enum(
@@ -2431,6 +2472,66 @@ impl Compiler<'_, '_> {
         }
     }
 
+    fn translate_own(
+        &mut self,
+        src_ty: TypeResourceTableIndex,
+        src: &Source<'_>,
+        dst_ty: &InterfaceType,
+        dst: &Destination,
+    ) {
+        let dst_ty = match dst_ty {
+            InterfaceType::Own(t) => *t,
+            _ => panic!("expected an `Own`"),
+        };
+        let transfer = self.module.import_resource_transfer_own();
+        self.translate_resource(src_ty, src, dst_ty, dst, transfer);
+    }
+
+    fn translate_borrow(
+        &mut self,
+        src_ty: TypeResourceTableIndex,
+        src: &Source<'_>,
+        dst_ty: &InterfaceType,
+        dst: &Destination,
+    ) {
+        let dst_ty = match dst_ty {
+            InterfaceType::Borrow(t) => *t,
+            _ => panic!("expected an `Borrow`"),
+        };
+
+        let transfer = self.module.import_resource_transfer_borrow();
+        self.translate_resource(src_ty, src, dst_ty, dst, transfer);
+    }
+
+    /// Translates the index `src`, which resides in the table `src_ty`, into
+    /// and index within `dst_ty` and is stored at `dst`.
+    ///
+    /// Actual translation of the index happens in a wasmtime libcall, which a
+    /// cranelift-generated trampoline to satisfy this import will call. The
+    /// `transfer` function is an imported function which takes the src, src_ty,
+    /// and dst_ty, and returns the dst index.
+    fn translate_resource(
+        &mut self,
+        src_ty: TypeResourceTableIndex,
+        src: &Source<'_>,
+        dst_ty: TypeResourceTableIndex,
+        dst: &Destination,
+        transfer: FuncIndex,
+    ) {
+        self.push_dst_addr(dst);
+        match src {
+            Source::Memory(mem) => self.i32_load(mem),
+            Source::Stack(stack) => self.stack_get(stack, ValType::I32),
+        }
+        self.instruction(I32Const(src_ty.as_u32() as i32));
+        self.instruction(I32Const(dst_ty.as_u32() as i32));
+        self.instruction(Call(transfer.as_u32()));
+        match dst {
+            Destination::Memory(mem) => self.i32_store(mem),
+            Destination::Stack(stack, _) => self.stack_set(stack, ValType::I32),
+        }
+    }
+
     fn trap_if_not_flag(&mut self, flags_global: GlobalIndex, flag_to_test: i32, trap: Trap) {
         self.instruction(GlobalGet(flags_global.as_u32()));
         self.instruction(I32Const(flag_to_test));
@@ -2648,10 +2749,8 @@ impl Compiler<'_, '_> {
             | (ValType::F64, ValType::F32)
 
             // not used in the component model
-            | (ValType::ExternRef, _)
-            | (_, ValType::ExternRef)
-            | (ValType::FuncRef, _)
-            | (_, ValType::FuncRef)
+            | (ValType::Ref(_), _)
+            | (_, ValType::Ref(_))
             | (ValType::V128, _)
             | (_, ValType::V128) => {
                 panic!("cannot get {dst_ty:?} from {src_ty:?} local");
@@ -2705,10 +2804,8 @@ impl Compiler<'_, '_> {
             | (ValType::F32, ValType::F64)
 
             // not used in the component model
-            | (ValType::ExternRef, _)
-            | (_, ValType::ExternRef)
-            | (ValType::FuncRef, _)
-            | (_, ValType::FuncRef)
+            | (ValType::Ref(_), _)
+            | (_, ValType::Ref(_))
             | (ValType::V128, _)
             | (_, ValType::V128) => {
                 panic!("cannot get {dst_ty:?} from {src_ty:?} local");
@@ -2996,13 +3093,14 @@ impl<'a> Source<'a> {
 
 impl<'a> Destination<'a> {
     /// Same as `Source::record_field_srcs` but for destinations.
-    fn record_field_dsts<'b>(
+    fn record_field_dsts<'b, I>(
         &'b self,
         types: &'b ComponentTypesBuilder,
-        fields: impl IntoIterator<Item = InterfaceType> + 'b,
-    ) -> impl Iterator<Item = Destination> + 'b
+        fields: I,
+    ) -> impl Iterator<Item = Destination<'b>> + use<'b, I>
     where
         'a: 'b,
+        I: IntoIterator<Item = InterfaceType> + 'b,
     {
         let mut offset = 0;
         fields.into_iter().map(move |ty| match self {

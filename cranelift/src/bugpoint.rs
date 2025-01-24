@@ -26,14 +26,14 @@ pub struct Options {
     file: PathBuf,
 
     /// Configure Cranelift settings
-    #[clap(long = "set")]
+    #[arg(long = "set")]
     settings: Vec<String>,
 
     /// Specify the target architecture.
     target: String,
 
     /// Be more verbose
-    #[clap(short, long)]
+    #[arg(short, long)]
     verbose: bool,
 }
 
@@ -55,15 +55,17 @@ pub fn run(options: &Options) -> Result<()> {
         anyhow::bail!("compilation requires a target isa");
     };
 
-    std::env::set_var("RUST_BACKTRACE", "0"); // Disable backtraces to reduce verbosity
+    unsafe {
+        std::env::set_var("RUST_BACKTRACE", "0"); // Disable backtraces to reduce verbosity
+    }
 
     for (func, _) in test_file.functions {
         let (orig_block_count, orig_inst_count) = (block_count(&func), inst_count(&func));
 
         match reduce(isa, func, options.verbose) {
             Ok((func, crash_msg)) => {
-                println!("Crash message: {}", crash_msg);
-                println!("\n{}", func);
+                println!("Crash message: {crash_msg}");
+                println!("\n{func}");
                 println!(
                     "{} blocks {} insts -> {} blocks {} insts",
                     orig_block_count,
@@ -72,7 +74,7 @@ pub fn run(options: &Options) -> Result<()> {
                     inst_count(&func)
                 );
             }
-            Err(err) => println!("Warning: {}", err),
+            Err(err) => println!("Warning: {err}"),
         }
     }
 
@@ -134,9 +136,9 @@ impl Mutator for RemoveInst {
             let msg = if func.layout.block_insts(prev_block).next().is_none() {
                 // Make sure empty blocks are removed, as `next_inst_ret_prev` depends on non empty blocks
                 func.layout.remove_block(prev_block);
-                format!("Remove inst {} and empty block {}", prev_inst, prev_block)
+                format!("Remove inst {prev_inst} and empty block {prev_block}")
             } else {
-                format!("Remove inst {}", prev_inst)
+                format!("Remove inst {prev_inst}")
             };
             (func, msg, ProgressStatus::ExpandedOrShrinked)
         })
@@ -269,14 +271,10 @@ impl Mutator for ReplaceInstWithTrap {
                 let status = if func.dfg.insts[prev_inst].opcode() == ir::Opcode::Trap {
                     ProgressStatus::Skip
                 } else {
-                    func.dfg.replace(prev_inst).trap(TrapCode::User(0));
+                    func.dfg.replace(prev_inst).trap(TrapCode::unwrap_user(1));
                     ProgressStatus::Changed
                 };
-                (
-                    func,
-                    format!("Replace inst {} with trap", prev_inst),
-                    status,
-                )
+                (func, format!("Replace inst {prev_inst} with trap"), status)
             },
         )
     }
@@ -316,7 +314,7 @@ impl Mutator for MoveInstToEntryBlock {
             if first_block == prev_block || self.block != prev_block {
                 return (
                     func,
-                    format!("did nothing for {}", prev_inst),
+                    format!("did nothing for {prev_inst}"),
                     ProgressStatus::Skip,
                 );
             }
@@ -327,7 +325,7 @@ impl Mutator for MoveInstToEntryBlock {
 
             (
                 func,
-                format!("Move inst {} to entry block", prev_inst),
+                format!("Move inst {prev_inst} to entry block"),
                 ProgressStatus::ExpandedOrShrinked,
             )
         })
@@ -365,7 +363,7 @@ impl Mutator for RemoveBlock {
             func.layout.remove_block(self.block);
             (
                 func,
-                format!("Remove block {}", next_block),
+                format!("Remove block {next_block}"),
                 ProgressStatus::ExpandedOrShrinked,
             )
         })
@@ -465,7 +463,6 @@ impl Mutator for RemoveUnusedEntities {
         4
     }
 
-    #[allow(clippy::cognitive_complexity)]
     fn mutate(&mut self, mut func: Function) -> Option<(Function, String, ProgressStatus)> {
         let name = match self.kind {
             0 => {
@@ -702,7 +699,7 @@ impl Mutator for MergeBlocks {
         if cfg.pred_iter(block).count() != 1 {
             return Some((
                 func,
-                format!("did nothing for {}", block),
+                format!("did nothing for {block}"),
                 ProgressStatus::Skip,
             ));
         }
@@ -715,7 +712,7 @@ impl Mutator for MergeBlocks {
         if branch_dests.len() != 1 {
             return Some((
                 func,
-                format!("did nothing for {}", block),
+                format!("did nothing for {block}"),
                 ProgressStatus::Skip,
             ));
         }
@@ -775,9 +772,6 @@ fn replace_with_const(pos: &mut FuncCursor, param: Value) -> &'static str {
     } else if ty == F64 {
         pos.ins().with_result(param).f64const(0.0);
         "f64const"
-    } else if ty.is_ref() {
-        pos.ins().with_result(param).null(ty);
-        "null"
     } else if ty.is_vector() {
         let zero_data = vec![0; ty.bytes() as usize].into();
         let zero_handle = pos.func.dfg.constants.insert(zero_data);
@@ -823,20 +817,21 @@ fn inst_count(func: &Function) -> usize {
         .sum()
 }
 
-fn resolve_aliases(func: &mut Function) {
-    for block in func.stencil.layout.blocks() {
-        for inst in func.stencil.layout.block_insts(block) {
-            func.stencil.dfg.resolve_aliases_in_arguments(inst);
-        }
-    }
-}
-
 /// Resolve aliases only if function still crashes after this.
 fn try_resolve_aliases(context: &mut CrashCheckContext, func: &mut Function) {
     let mut func_with_resolved_aliases = func.clone();
-    resolve_aliases(&mut func_with_resolved_aliases);
+    func_with_resolved_aliases.dfg.resolve_all_aliases();
     if let CheckResult::Crash(_) = context.check_for_crash(&func_with_resolved_aliases) {
         *func = func_with_resolved_aliases;
+    }
+}
+
+/// Remove sourcelocs if the function still crashes after they are removed, to make the reduced clif IR easier to read.
+fn try_remove_srclocs(context: &mut CrashCheckContext, func: &mut Function) {
+    let mut func_with_removed_sourcelocs = func.clone();
+    func_with_removed_sourcelocs.srclocs.clear();
+    if let CheckResult::Crash(_) = context.check_for_crash(&func_with_removed_sourcelocs) {
+        *func = func_with_removed_sourcelocs;
     }
 }
 
@@ -848,6 +843,7 @@ fn reduce(isa: &dyn TargetIsa, mut func: Function, verbose: bool) -> Result<(Fun
     }
 
     try_resolve_aliases(&mut context, &mut func);
+    try_remove_srclocs(&mut context, &mut func);
 
     let progress_bar = ProgressBar::with_draw_target(0, ProgressDrawTarget::stdout());
     progress_bar.set_style(
@@ -917,7 +913,7 @@ fn reduce(isa: &dyn TargetIsa, mut func: Function, verbose: bool) -> Result<(Fun
                             ProgressStatus::Skip => unreachable!(),
                         };
                         if verbose {
-                            progress_bar.println(format!("{}: {}", msg, verb));
+                            progress_bar.println(format!("{msg}: {verb}"));
                         }
                     }
                 }
@@ -960,9 +956,6 @@ struct CrashCheckContext<'a> {
     /// Cached `Context`, to prevent repeated allocation.
     context: Context,
 
-    /// Cached code memory, to prevent repeated allocation.
-    code_memory: Vec<u8>,
-
     /// The target isa to compile for.
     isa: &'a dyn TargetIsa,
 }
@@ -992,15 +985,13 @@ impl<'a> CrashCheckContext<'a> {
     fn new(isa: &'a dyn TargetIsa) -> Self {
         CrashCheckContext {
             context: Context::new(),
-            code_memory: Vec::new(),
             isa,
         }
     }
 
-    #[cfg_attr(test, allow(unreachable_code))]
+    #[cfg_attr(test, expect(unreachable_code, reason = "test-specific code"))]
     fn check_for_crash(&mut self, func: &Function) -> CheckResult {
         self.context.clear();
-        self.code_memory.clear();
 
         self.context.func = func.clone();
 
@@ -1041,9 +1032,7 @@ impl<'a> CrashCheckContext<'a> {
         std::panic::set_hook(Box::new(|_| {})); // silence panics
 
         let res = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = self
-                .context
-                .compile_and_emit(self.isa, &mut self.code_memory);
+            let _ = self.context.compile(self.isa, &mut Default::default());
         })) {
             Ok(()) => CheckResult::Succeed,
             Err(err) => CheckResult::Crash(get_panic_string(err)),
@@ -1058,7 +1047,6 @@ impl<'a> CrashCheckContext<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cranelift_reader::ParseOptions;
 
     fn run_test(test_str: &str, expected_str: &str) {
         let test_file = parse_test(test_str, ParseOptions::default()).unwrap();
@@ -1087,13 +1075,11 @@ mod tests {
                 "reduction wasn't maximal for insts"
             );
 
-            let actual_ir = format!("{}", reduced_func);
+            let actual_ir = format!("{reduced_func}");
             let expected_ir = expected_str.replace("\r\n", "\n");
             assert!(
                 expected_ir == actual_ir,
-                "Expected:\n{}\nGot:\n{}",
-                expected_ir,
-                actual_ir,
+                "Expected:\n{expected_ir}\nGot:\n{actual_ir}",
             );
         }
     }

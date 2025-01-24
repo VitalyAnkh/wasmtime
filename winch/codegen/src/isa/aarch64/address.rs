@@ -98,13 +98,13 @@ impl TryFrom<Address> for PairAMode {
         match addr {
             IndexedSPOffset { offset, indexing } => {
                 let simm7 = SImm7Scaled::maybe_from_i64(offset, types::I64).with_context(|| {
-                    format!("Failed to convert {} to signed scaled 7 bit offset", offset)
+                    format!("Failed to convert {offset} to signed scaled 7 bit offset")
                 })?;
 
                 if indexing == Pre {
-                    Ok(PairAMode::SPPreIndexed(simm7))
+                    Ok(PairAMode::SPPreIndexed { simm7 })
                 } else {
-                    Ok(PairAMode::SPPostIndexed(simm7))
+                    Ok(PairAMode::SPPostIndexed { simm7 })
                 }
             }
             other => Err(anyhow!(
@@ -137,7 +137,6 @@ impl TryFrom<Address> for AMode {
             Offset { base, offset } => Ok(AMode::RegOffset {
                 rn: base.into(),
                 off: offset,
-                ty: types::I64,
             }),
         }
     }

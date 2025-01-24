@@ -1,7 +1,7 @@
 //! Encodes VEX instructions. These instructions are those added by the Advanced Vector Extensions
 //! (AVX).
 
-use super::evex::Register;
+use super::evex::{Register, RegisterOrAmode};
 use super::rex::{LegacyPrefixes, OpcodeMap};
 use super::ByteSink;
 use crate::isa::x64::args::Amode;
@@ -22,24 +22,6 @@ pub struct VexInstruction {
     rm: RegisterOrAmode,
     vvvv: Option<Register>,
     imm: Option<u8>,
-}
-
-#[allow(missing_docs)]
-pub enum RegisterOrAmode {
-    Register(Register),
-    Amode(Amode),
-}
-
-impl From<u8> for RegisterOrAmode {
-    fn from(reg: u8) -> Self {
-        RegisterOrAmode::Register(reg.into())
-    }
-}
-
-impl From<Amode> for RegisterOrAmode {
-    fn from(amode: Amode) -> Self {
-        RegisterOrAmode::Amode(amode)
-    }
 }
 
 impl Default for VexInstruction {
@@ -267,6 +249,12 @@ impl VexInstruction {
 
     /// Emit the VEX-encoded instruction to the provided buffer.
     pub fn encode(&self, sink: &mut MachBuffer<Inst>) {
+        if let RegisterOrAmode::Amode(amode) = &self.rm {
+            if let Some(trap_code) = amode.get_flags().trap_code() {
+                sink.add_trap(trap_code);
+            }
+        }
+
         // 2/3 byte prefix
         if self.use_2byte_prefix() {
             self.encode_2byte_prefix(sink);
@@ -289,7 +277,7 @@ impl VexInstruction {
             // encoding.
             RegisterOrAmode::Amode(amode) => {
                 let bytes_at_end = if self.imm.is_some() { 1 } else { 0 };
-                rex::emit_modrm_sib_disp(sink, self.reg & 7, amode, bytes_at_end);
+                rex::emit_modrm_sib_disp(sink, self.reg & 7, amode, bytes_at_end, None);
             }
         }
 
@@ -350,7 +338,9 @@ mod tests {
             .imm(0x17)
             .encode(&mut sink);
 
-        let bytes = sink.finish().data;
+        let bytes = sink
+            .finish(&Default::default(), &mut Default::default())
+            .data;
         assert_eq!(bytes.as_slice(), [0xc5, 0xf1, 0x73, 0xfa, 0x17]);
     }
 
@@ -378,7 +368,9 @@ mod tests {
             .imm_reg(c)
             .encode(&mut sink);
 
-        let bytes = sink.finish().data;
+        let bytes = sink
+            .finish(&Default::default(), &mut Default::default())
+            .data;
         assert_eq!(bytes.as_slice(), [0xc4, 0xe3, 0x69, 0x4b, 0xcb, 0x40]);
     }
 
@@ -403,7 +395,9 @@ mod tests {
             .imm(4)
             .encode(&mut sink);
 
-        let bytes = sink.finish().data;
+        let bytes = sink
+            .finish(&Default::default(), &mut Default::default())
+            .data;
         assert_eq!(bytes.as_slice(), [0xc4, 0x41, 0x24, 0xc2, 0xd4, 0x04]);
     }
 
@@ -427,7 +421,9 @@ mod tests {
             .rm(src2)
             .encode(&mut sink);
 
-        let bytes = sink.finish().data;
+        let bytes = sink
+            .finish(&Default::default(), &mut Default::default())
+            .data;
         assert_eq!(bytes.as_slice(), [0xc5, 0xf0, 0x55, 0xd0]);
     }
 
@@ -455,7 +451,9 @@ mod tests {
             .rm(src2)
             .encode(&mut sink);
 
-        let bytes = sink.finish().data;
+        let bytes = sink
+            .finish(&Default::default(), &mut Default::default())
+            .data;
         assert_eq!(bytes.as_slice(), [0xc4, 0xc1, 0x70, 0x55, 0x55, 0x0a]);
     }
 
@@ -467,8 +465,8 @@ mod tests {
         let dst = regs::xmm2().to_real_reg().unwrap().hw_enc();
         let src1 = regs::xmm1().to_real_reg().unwrap().hw_enc();
         let src2 = Amode::ImmRegRegShift {
-            base: Gpr::new(regs::rax()).unwrap(),
-            index: Gpr::new(regs::r13()).unwrap(),
+            base: Gpr::unwrap_new(regs::rax()),
+            index: Gpr::unwrap_new(regs::r13()),
             flags: MemFlags::trusted(),
             simm32: 100,
             shift: 2,
@@ -485,7 +483,9 @@ mod tests {
             .rm(src2)
             .encode(&mut sink);
 
-        let bytes = sink.finish().data;
+        let bytes = sink
+            .finish(&Default::default(), &mut Default::default())
+            .data;
         assert_eq!(bytes.as_slice(), [0xc4, 0xa1, 0x70, 0x55, 0x54, 0xa8, 100]);
     }
 }

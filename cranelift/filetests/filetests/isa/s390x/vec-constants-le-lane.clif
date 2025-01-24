@@ -1,7 +1,7 @@
 test compile precise-output
 target s390x
 
-function %vconst_i64x2_zero() -> i64x2 wasmtime_system_v {
+function %vconst_i64x2_zero() -> i64x2 tail {
 block0:
   v1 = vconst.i64x2 [0 0]
   return v1
@@ -11,13 +11,13 @@ block0:
 ; block0:
 ;   vgbm %v24, 0
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vzero %v24
 ;   br %r14
 
-function %vconst_i64x2_splat1() -> i64x2 wasmtime_system_v {
+function %vconst_i64x2_splat1() -> i64x2 tail {
 block0:
   v1 = vconst.i64x2 [32767 32767]
   return v1
@@ -27,13 +27,13 @@ block0:
 ; block0:
 ;   vrepig %v24, 32767
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vrepig %v24, 0x7fff
 ;   br %r14
 
-function %vconst_i64x2_splat2() -> i64x2 wasmtime_system_v {
+function %vconst_i64x2_splat2() -> i64x2 tail {
 block0:
   v1 = vconst.i64x2 [-32768 -32768]
   return v1
@@ -43,13 +43,13 @@ block0:
 ; block0:
 ;   vrepig %v24, -32768
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vrepig %v24, -0x8000
 ;   br %r14
 
-function %vconst_i64x2_splat3() -> i64x2 wasmtime_system_v {
+function %vconst_i64x2_splat3() -> i64x2 tail {
 block0:
   v1 = vconst.i64x2 [32768 32768]
   return v1
@@ -59,7 +59,7 @@ block0:
 ; block0:
 ;   bras %r1, 12 ; data.u64 0x0000000000008000 ; vlrepg %v24, 0(%r1)
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   bras %r1, 0xc
@@ -71,7 +71,7 @@ block0:
 ;   ler %f0, %f5
 ;   br %r14
 
-function %vconst_i64x2_splat4() -> i64x2 wasmtime_system_v {
+function %vconst_i64x2_splat4() -> i64x2 tail {
 block0:
   v1 = vconst.i64x2 [-32769 -32769]
   return v1
@@ -81,7 +81,7 @@ block0:
 ; block0:
 ;   bras %r1, 12 ; data.u64 0xffffffffffff7fff ; vlrepg %v24, 0(%r1)
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   bras %r1, 0xc
@@ -93,7 +93,7 @@ block0:
 ;   ler %f0, %f5
 ;   br %r14
 
-function %vconst_i64x2_mixed() -> i64x2 wasmtime_system_v {
+function %vconst_i64x2_mixed() -> i64x2 tail {
 block0:
   v1 = vconst.i64x2 [1 2]
   return v1
@@ -103,7 +103,7 @@ block0:
 ; block0:
 ;   bras %r1, 20 ; data.u128 0x00000000000000020000000000000001 ; vl %v24, 0(%r1)
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   bras %r1, 0x14
@@ -118,7 +118,7 @@ block0:
 ;   vl %v24, 0(%r1)
 ;   br %r14
 
-function %vconst_i32x4_zero() -> i32x4 wasmtime_system_v {
+function %vconst_i32x4_zero() -> i32x4 tail {
 block0:
   v1 = vconst.i32x4 [0 0 0 0]
   return v1
@@ -128,13 +128,13 @@ block0:
 ; block0:
 ;   vgbm %v24, 0
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vzero %v24
 ;   br %r14
 
-function %vconst_i32x4_splat1() -> i32x4 wasmtime_system_v {
+function %vconst_i32x4_splat1() -> i32x4 tail {
 block0:
   v1 = vconst.i32x4 [32767 32767 32767 32767]
   return v1
@@ -144,13 +144,13 @@ block0:
 ; block0:
 ;   vrepif %v24, 32767
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vrepif %v24, 0x7fff
 ;   br %r14
 
-function %vconst_i32x4_splat2() -> i32x4 wasmtime_system_v {
+function %vconst_i32x4_splat2() -> i32x4 tail {
 block0:
   v1 = vconst.i32x4 [-32768 -32768 -32768 -32768]
   return v1
@@ -160,13 +160,13 @@ block0:
 ; block0:
 ;   vrepif %v24, -32768
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vrepif %v24, -0x8000
 ;   br %r14
 
-function %vconst_i32x4_splat3() -> i32x4 wasmtime_system_v {
+function %vconst_i32x4_splat3() -> i32x4 tail {
 block0:
   v1 = vconst.i32x4 [32768 32768 32768 32768]
   return v1
@@ -176,7 +176,7 @@ block0:
 ; block0:
 ;   bras %r1, 8 ; data.u32 0x00008000 ; vlrepf %v24, 0(%r1)
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   bras %r1, 8
@@ -186,7 +186,7 @@ block0:
 ;   ldr %f0, %f5
 ;   br %r14
 
-function %vconst_i32x4_splat4() -> i32x4 wasmtime_system_v {
+function %vconst_i32x4_splat4() -> i32x4 tail {
 block0:
   v1 = vconst.i32x4 [-32769 -32769 -32769 -32769]
   return v1
@@ -196,7 +196,7 @@ block0:
 ; block0:
 ;   bras %r1, 8 ; data.u32 0xffff7fff ; vlrepf %v24, 0(%r1)
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   bras %r1, 8
@@ -206,7 +206,7 @@ block0:
 ;   ldr %f0, %f5
 ;   br %r14
 
-function %vconst_i32x4_splat_i64() -> i32x4 wasmtime_system_v {
+function %vconst_i32x4_splat_i64() -> i32x4 tail {
 block0:
   v1 = vconst.i32x4 [1 2 1 2]
   return v1
@@ -216,7 +216,7 @@ block0:
 ; block0:
 ;   bras %r1, 12 ; data.u64 0x0000000200000001 ; vlrepg %v24, 0(%r1)
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   bras %r1, 0xc
@@ -227,7 +227,7 @@ block0:
 ;   vlrepg %v24, 0(%r1)
 ;   br %r14
 
-function %vconst_i32x4_mixed() -> i32x4 wasmtime_system_v {
+function %vconst_i32x4_mixed() -> i32x4 tail {
 block0:
   v1 = vconst.i32x4 [1 2 3 4]
   return v1
@@ -237,7 +237,7 @@ block0:
 ; block0:
 ;   bras %r1, 20 ; data.u128 0x00000004000000030000000200000001 ; vl %v24, 0(%r1)
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   bras %r1, 0x14
@@ -252,7 +252,7 @@ block0:
 ;   vl %v24, 0(%r1)
 ;   br %r14
 
-function %vconst_i16x8_zero() -> i16x8 wasmtime_system_v {
+function %vconst_i16x8_zero() -> i16x8 tail {
 block0:
   v1 = vconst.i16x8 [0 0 0 0 0 0 0 0]
   return v1
@@ -262,13 +262,13 @@ block0:
 ; block0:
 ;   vgbm %v24, 0
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vzero %v24
 ;   br %r14
 
-function %vconst_i16x8_splat1() -> i16x8 wasmtime_system_v {
+function %vconst_i16x8_splat1() -> i16x8 tail {
 block0:
   v1 = vconst.i16x8 [32767 32767 32767 32767 32767 32767 32767 32767]
   return v1
@@ -278,13 +278,13 @@ block0:
 ; block0:
 ;   vrepih %v24, 32767
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vrepih %v24, 0x7fff
 ;   br %r14
 
-function %vconst_i16x8_splat2() -> i16x8 wasmtime_system_v {
+function %vconst_i16x8_splat2() -> i16x8 tail {
 block0:
   v1 = vconst.i16x8 [-32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768]
   return v1
@@ -294,13 +294,13 @@ block0:
 ; block0:
 ;   vrepih %v24, -32768
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vrepih %v24, -0x8000
 ;   br %r14
 
-function %vconst_i16x8_mixed() -> i16x8 wasmtime_system_v {
+function %vconst_i16x8_mixed() -> i16x8 tail {
 block0:
   v1 = vconst.i16x8 [1 2 3 4 5 6 7 8]
   return v1
@@ -310,7 +310,7 @@ block0:
 ; block0:
 ;   bras %r1, 20 ; data.u128 0x00080007000600050004000300020001 ; vl %v24, 0(%r1)
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   bras %r1, 0x14
@@ -325,7 +325,7 @@ block0:
 ;   vl %v24, 0(%r1)
 ;   br %r14
 
-function %vconst_i8x16_zero() -> i8x16 wasmtime_system_v {
+function %vconst_i8x16_zero() -> i8x16 tail {
 block0:
   v1 = vconst.i8x16 [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
   return v1
@@ -335,13 +335,13 @@ block0:
 ; block0:
 ;   vgbm %v24, 0
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vzero %v24
 ;   br %r14
 
-function %vconst_i8x16_splat1() -> i8x16 wasmtime_system_v {
+function %vconst_i8x16_splat1() -> i8x16 tail {
 block0:
   v1 = vconst.i8x16 [127 127 127 127 127 127 127 127 127 127 127 127 127 127 127 127]
   return v1
@@ -351,13 +351,13 @@ block0:
 ; block0:
 ;   vrepib %v24, 127
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vrepib %v24, 0x7f
 ;   br %r14
 
-function %vconst_i8x16_splat2() -> i8x16 wasmtime_system_v {
+function %vconst_i8x16_splat2() -> i8x16 tail {
 block0:
   v1 = vconst.i8x16 [-128 -128 -128 -128 -128 -128 -128 -128 -128 -128 -128 -128 -128 -128 -128 -128]
   return v1
@@ -367,13 +367,13 @@ block0:
 ; block0:
 ;   vrepib %v24, 128
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vrepib %v24, 0x80
 ;   br %r14
 
-function %vconst_i8x16_mixed() -> i8x16 wasmtime_system_v {
+function %vconst_i8x16_mixed() -> i8x16 tail {
 block0:
   v1 = vconst.i8x16 [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]
   return v1
@@ -383,7 +383,7 @@ block0:
 ; block0:
 ;   bras %r1, 20 ; data.u128 0x100f0e0d0c0b0a090807060504030201 ; vl %v24, 0(%r1)
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   bras %r1, 0x14

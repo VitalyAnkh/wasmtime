@@ -9,6 +9,10 @@ documentation = "https://docs.rs/wasmtime-component-macro/"
 categories = ["wasm"]
 keywords = ["webassembly", "wasm"]
 edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 proc-macro = true
@@ -19,18 +23,23 @@ doctest = false
 anyhow = "1.0"
 proc-macro2 = "1.0"
 quote = "1.0"
-syn = { version = "1.0", features = ["extra-traits"] }
+syn = { workspace = true, features = ["extra-traits"] }
 wasmtime-component-util = { workspace = true }
 wasmtime-wit-bindgen = { workspace = true }
 wit-parser = { workspace = true }
 
-[badges]
-maintenance = { status = "actively-developed" }
-
 [dev-dependencies]
-wasmtime = { path = '../wasmtime', features = ['component-model'] }
+wasmtime = { path = '../wasmtime', features = ['component-model', 'component-model-async'] }
+wasmtime-wit-bindgen = { workspace = true, features = ['component-model-async'] }
 component-macro-test-helpers = { path = 'test-helpers' }
 tracing = { workspace = true }
+# For use with the custom attributes test
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+prettyplease = "0.2.19"
+similar = { workspace = true }
 
 [features]
 async = []
+std = ['wasmtime-wit-bindgen/std']
+component-model-async = ['std', 'async', 'wasmtime-wit-bindgen/component-model-async']

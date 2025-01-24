@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 pub struct Options {
     /// Specify input file(s) to be used. Use '-' for stdin.
-    #[clap(required = true)]
+    #[arg(required = true)]
     files: Vec<PathBuf>,
 }
 
@@ -36,7 +36,7 @@ fn cat_one(path: &Path) -> Result<()> {
         if idx != 0 {
             println!();
         }
-        print!("{}", func);
+        print!("{func}");
     }
 
     Ok(())

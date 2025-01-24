@@ -1,6 +1,7 @@
+use crate::component::Transcode;
 use crate::fact::core_types::CoreTypes;
+use crate::prelude::*;
 use crate::MemoryIndex;
-use serde::{Deserialize, Serialize};
 use wasm_encoder::{EntityType, ValType};
 
 #[derive(Copy, Clone, Hash, Eq, PartialEq)]
@@ -10,33 +11,6 @@ pub struct Transcoder {
     pub to_memory: MemoryIndex,
     pub to_memory64: bool,
     pub op: Transcode,
-}
-
-/// Possible transcoding operations that must be provided by the host.
-///
-/// Note that each transcoding operation may have a unique signature depending
-/// on the precise operation.
-#[allow(missing_docs)]
-#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
-pub enum Transcode {
-    Copy(FixedEncoding),
-    Latin1ToUtf16,
-    Latin1ToUtf8,
-    Utf16ToCompactProbablyUtf16,
-    Utf16ToCompactUtf16,
-    Utf16ToLatin1,
-    Utf16ToUtf8,
-    Utf8ToCompactUtf16,
-    Utf8ToLatin1,
-    Utf8ToUtf16,
-}
-
-#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
-#[allow(missing_docs)]
-pub enum FixedEncoding {
-    Utf8,
-    Utf16,
-    Latin1,
 }
 
 impl Transcoder {
@@ -93,7 +67,7 @@ impl Transcoder {
             }
 
             // The initial step of transcoding from a fixed format to a compact
-            // format. Takes the ptr/len of the source the the destination
+            // format. Takes the ptr/len of the source the destination
             // pointer. The destination length is implicitly the same. Returns
             // how many code units were consumed in the source, which is also
             // how many bytes were written to the destination.
@@ -112,35 +86,5 @@ impl Transcoder {
             }
         };
         EntityType::Function(ty)
-    }
-}
-
-impl Transcode {
-    /// Returns a human-readable description for this transcoding operation.
-    pub fn desc(&self) -> &'static str {
-        match self {
-            Transcode::Copy(FixedEncoding::Utf8) => "utf8-to-utf8",
-            Transcode::Copy(FixedEncoding::Utf16) => "utf16-to-utf16",
-            Transcode::Copy(FixedEncoding::Latin1) => "latin1-to-latin1",
-            Transcode::Latin1ToUtf16 => "latin1-to-utf16",
-            Transcode::Latin1ToUtf8 => "latin1-to-utf8",
-            Transcode::Utf16ToCompactProbablyUtf16 => "utf16-to-compact-probably-utf16",
-            Transcode::Utf16ToCompactUtf16 => "utf16-to-compact-utf16",
-            Transcode::Utf16ToLatin1 => "utf16-to-latin1",
-            Transcode::Utf16ToUtf8 => "utf16-to-utf8",
-            Transcode::Utf8ToCompactUtf16 => "utf8-to-compact-utf16",
-            Transcode::Utf8ToLatin1 => "utf8-to-latin1",
-            Transcode::Utf8ToUtf16 => "utf8-to-utf16",
-        }
-    }
-}
-
-impl FixedEncoding {
-    pub(crate) fn width(&self) -> u8 {
-        match self {
-            FixedEncoding::Utf8 => 1,
-            FixedEncoding::Utf16 => 2,
-            FixedEncoding::Latin1 => 1,
-        }
     }
 }

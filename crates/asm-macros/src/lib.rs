@@ -6,12 +6,14 @@
 //! function) and additionally handles visibility across platforms. All symbols
 //! should be visible to Rust but not visible externally outside of a `*.so`.
 
+#![no_std]
+
 cfg_if::cfg_if! {
-    if #[cfg(target_os = "macos")] {
+    if #[cfg(target_vendor = "apple")] {
         #[macro_export]
         macro_rules! asm_func {
             ($name:expr, $body:expr $(, $($args:tt)*)?) => {
-                std::arch::global_asm!(
+                core::arch::global_asm!(
                     concat!(
                         ".p2align 4\n",
                         ".private_extern _", $name, "\n",
@@ -27,7 +29,7 @@ cfg_if::cfg_if! {
         #[macro_export]
         macro_rules! asm_func {
             ($name:expr, $body:expr $(, $($args:tt)*)?) => {
-                std::arch::global_asm!(
+                core::arch::global_asm!(
                     concat!(
                         ".def ", $name, "\n",
                         ".scl 2\n",
@@ -63,7 +65,7 @@ cfg_if::cfg_if! {
         #[macro_export]
         macro_rules! asm_func {
             ($name:expr, $body:expr $(, $($args:tt)*)?) => {
-                std::arch::global_asm!(
+                core::arch::global_asm!(
                     concat!(
                         ".p2align 4\n",
                         ".hidden ", $name, "\n",

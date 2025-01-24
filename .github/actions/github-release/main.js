@@ -57,13 +57,11 @@ async function runOnce() {
         console.log("ERROR: ", JSON.stringify(e.data, null, 2));
         core.info(`creating dev tag`);
         try {
-          await octokit.git.createTag({
+          await octokit.rest.git.createRef({
             owner,
             repo,
-            tag: 'dev',
-            message: 'dev release',
-            object: sha,
-            type: 'commit',
+            ref: 'refs/tags/dev',
+            sha,
           });
         } catch (e) {
           // we might race with others, so assume someone else has created the
@@ -93,13 +91,25 @@ async function runOnce() {
   } catch (e) {
     console.log("ERROR: ", JSON.stringify(e, null, 2));
     core.info(`creating a release`);
+
+    const releaseNotes = fs.readFileSync('RELEASES.md').toString();
+    let notes = null;
+    const opts = {
+      owner,
+      repo,
+      tag_name: name,
+      prerelease: name === 'dev',
+    };
+    if (name !== 'dev') {
+      for (let x of releaseNotes.split(/^---+$/m)) {
+        if (x.indexOf(name.substring(1)) == -1)
+          continue;
+        opts.body = x;
+        break;
+      }
+    }
     try {
-      release = await octokit.rest.repos.createRelease({
-        owner,
-        repo,
-        tag_name: name,
-        prerelease: name === 'dev',
-      });
+      release = await octokit.rest.repos.createRelease(opts);
     } catch(e) {
       console.log("ERROR: ", JSON.stringify(e, null, 2));
       core.info(`fetching one more time`);

@@ -1,7 +1,7 @@
 use crate::{wasm_externtype_t, wasm_limits_t, CExternType};
-use once_cell::unsync::OnceCell;
+use std::cell::OnceCell;
 use std::convert::TryFrom;
-use wasmtime::MemoryType;
+use wasmtime::{MemoryType, MemoryTypeBuilder};
 
 #[repr(transparent)]
 #[derive(Clone)]
@@ -20,7 +20,7 @@ pub(crate) struct CMemoryType {
 impl wasm_memorytype_t {
     pub(crate) fn new(ty: MemoryType) -> wasm_memorytype_t {
         wasm_memorytype_t {
-            ext: wasm_externtype_t::new(ty.into()),
+            ext: wasm_externtype_t::from_extern_type(ty.into()),
         }
     }
 
@@ -48,7 +48,7 @@ impl CMemoryType {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasm_memorytype_new(limits: &wasm_limits_t) -> Box<wasm_memorytype_t> {
     Box::new(wasm_memorytype_t::new(MemoryType::new(
         limits.min,
@@ -56,7 +56,7 @@ pub extern "C" fn wasm_memorytype_new(limits: &wasm_limits_t) -> Box<wasm_memory
     )))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasm_memorytype_limits(mt: &wasm_memorytype_t) -> &wasm_limits_t {
     let mt = mt.ty();
     mt.limits_cache.get_or_init(|| wasm_limits_t {
@@ -65,34 +65,37 @@ pub extern "C" fn wasm_memorytype_limits(mt: &wasm_memorytype_t) -> &wasm_limits
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasmtime_memorytype_new(
     minimum: u64,
     maximum_specified: bool,
     maximum: u64,
     memory64: bool,
+    shared: bool,
 ) -> Box<wasm_memorytype_t> {
     let maximum = if maximum_specified {
         Some(maximum)
     } else {
         None
     };
-    Box::new(wasm_memorytype_t::new(if memory64 {
-        MemoryType::new64(minimum, maximum)
-    } else {
-        MemoryType::new(
-            u32::try_from(minimum).unwrap(),
-            maximum.map(|i| u32::try_from(i).unwrap()),
-        )
-    }))
+
+    Box::new(wasm_memorytype_t::new(
+        MemoryTypeBuilder::default()
+            .min(minimum)
+            .max(maximum)
+            .memory64(memory64)
+            .shared(shared)
+            .build()
+            .unwrap(),
+    ))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasmtime_memorytype_minimum(mt: &wasm_memorytype_t) -> u64 {
     mt.ty().ty.minimum()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasmtime_memorytype_maximum(mt: &wasm_memorytype_t, out: &mut u64) -> bool {
     match mt.ty().ty.maximum() {
         Some(max) => {
@@ -103,17 +106,22 @@ pub extern "C" fn wasmtime_memorytype_maximum(mt: &wasm_memorytype_t, out: &mut 
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasmtime_memorytype_is64(mt: &wasm_memorytype_t) -> bool {
     mt.ty().ty.is_64()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_memorytype_isshared(mt: &wasm_memorytype_t) -> bool {
+    mt.ty().ty.is_shared()
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn wasm_memorytype_as_externtype(ty: &wasm_memorytype_t) -> &wasm_externtype_t {
     &ty.ext
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasm_memorytype_as_externtype_const(
     ty: &wasm_memorytype_t,
 ) -> &wasm_externtype_t {

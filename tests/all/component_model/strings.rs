@@ -1,3 +1,5 @@
+#![cfg(not(miri))]
+
 use super::REALLOC_AND_FREE;
 use anyhow::Result;
 use wasmtime::component::{Component, Linker};
@@ -114,7 +116,7 @@ fn test_roundtrip(engine: &Engine, src: &str, dst: &str) -> Result<()> {
         (with "libc" (instance $libc))
         (with "" (instance (export "echo" (func $echo))))
     ))
-    (func (export "echo") (param "a" string) (result string)
+    (func (export "echo2") (param "a" string) (result string)
         (canon lift
             (core func $echo "echo")
             (memory $libc "memory")
@@ -163,8 +165,8 @@ fn test_roundtrip(engine: &Engine, src: &str, dst: &str) -> Result<()> {
     {dst}
 
     (instance $dst (instantiate $dst (with "echo" (func $host))))
-    (instance $src (instantiate $src (with "echo" (func $dst "echo"))))
-    (export "echo" (func $src "echo"))
+    (instance $src (instantiate $src (with "echo" (func $dst "echo2"))))
+    (export "echo" (func $src "echo2"))
 )
 "#
     );
@@ -498,9 +500,8 @@ fn test_invalid_string_encoding(
     let trap = test_raw_when_encoded(engine, src, dst, bytes, len)?.unwrap();
     let src = src.replace("latin1+", "");
     assert!(
-        format!("{:?}", trap).contains(&format!("invalid {src} encoding")),
-        "bad error: {:?}",
-        trap,
+        format!("{trap:?}").contains(&format!("invalid {src} encoding")),
+        "bad error: {trap:?}",
     );
     Ok(())
 }

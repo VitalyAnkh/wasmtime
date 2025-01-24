@@ -21,13 +21,13 @@ instructions. For example:
 
 - An `iadd` (integer add) operator can always be lowered to an x86
   `ADD` instruction with two register sources.
-  
+
 - An `iadd` operator with one `iconst` (integer-constant) argument can
   be lowered to an x86 `ADD` instruction with a register and an
   immediate.
-  
+
 One could write something like the following in ISLE (simplified from
-the real code [here](../codegen/src/isa/x64/lower.isle)):
+the real code [here](https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/codegen/src/isa/x64/lower.isle)):
 
 ```lisp
 ;; Add two registers.
@@ -43,7 +43,7 @@ the real code [here](../codegen/src/isa/x64/lower.isle)):
                    ;; `y` is a `RegMemImm.Imm`.
                    y)))
 ```
-  
+
 ISLE lets the compiler backend developer express this information in a
 declarative way -- i.e., just write down a list of patterns, without
 worrying how the compilation process tries them out -- and the ISLE
@@ -68,16 +68,16 @@ This document is organized into the following sections:
   systems work, how to think about nested terms, patterns and rewrite
   rules, how they provide a general mechanism for computation, and how
   term-rewriting is often used in a compiler-implementation context.
-  
+
 * Core ISLE: the foundational concepts of the ISLE DSL, building upon
   a general-purpose term-rewriting base. Covers the type system (typed
   terms) and how rules are written.
-  
+
 * ISLE with Rust: covers how ISLE provides an "FFI" (foreign function
   interface) of sorts to allow interaction with Rust code, and
   describes the scheme by which ISLE execution is mapped onto Rust
   (data structures and control flow).[^1]
-  
+
 * ISLE Internals: describes how the ISLE compiler works. Provides
   insight into how an unordered collection of rewrite rules are
   combined into executable Rust code that efficiently traverses the
@@ -161,7 +161,7 @@ form, or at least can be interpreted that way.[^3]
       structure that is present in those symbols in any well-formed
       sequence. For example, we can define a TRS that only operates on
       terms with balanced parentheses; then we have our tree.
-      
+
 In ISLE and hence in this document, we operate on terms that are
 written in an
 [S-expression](https://en.wikipedia.org/wiki/S-expression) syntax,
@@ -239,9 +239,9 @@ right-hand nomenclature comes from a common way of writing rules as:
 
 ```plain
     A -> B              ;; any term "A" is rewritten to "B"
-    
+
     (A x) -> (B (C x))  ;; any term (A x), for some x, is rewritten to (B (C x)).
-    
+
     (A _) -> (D)        ;; any term (A _), where `_` is a wildcard (any subterm),
                         ;; is rewritten to (D).
 ```
@@ -254,16 +254,16 @@ subterms:
 
 * `(A pat1 pat2 ...)` matches a constructor `A` with patterms for each
   of its arguments.
-  
+
 * `x` matches any subterm and captures its value in a variable
   binding, which can be used later when we specify the right-hand side
   (so that the rewrite contains parts of the original term).
-  
+
 * `_` is a wildcard and matches anything, without capturing it.
 
 * Primitive constant values, such as `42` or `$Symbol`, match only if
   the term is exactly equal to this constant.
-  
+
 These pattern-matching operators can be combined, so we could write,
 for example, `(A (B x _) z)`. This pattern would match the term `(A (B
 1 2) 3)` but not `(A (C 4 5) 6)`.
@@ -388,7 +388,7 @@ clarity.
       separate Rust functions, so factoring rules to use intermediate
       terms can provide code-size and compile-time benefits for the
       ISLE-generated Rust code as well.
-      
+
 [^6]: The [lambda calculus' reduction
       rules](https://en.wikipedia.org/wiki/Lambda_calculus#Reduction)
       are a good example of this.
@@ -415,9 +415,9 @@ rewrites it into a machine-*dependent* instruction term. For example:
 
 ```plain
     (iadd a b) -> (isa.add_reg_reg a b)
-    
+
     (iadd a (iconst 0)) -> a
-    
+
     (iadd a (iconst n)) (isa.add_reg_imm a n)
 ```
 
@@ -494,8 +494,11 @@ The pattern (left-hand side) is made up of the following match
 operators:
 
 * Wildcards (`_`).
-* Integer constants (decimal/hex, positive/negative: `1`, `-1`,
-  `0x80`, `-0x80`) and boolean constants (`#t`, `#f`).
+* Integer constants (decimal/hex/binary/octal, positive/negative: `1`, `-1`,
+  `0x80`, `-0x80`). Hex constants can start with either `0x` or `0X`.
+  Binary constants start with `0b`. Octal constants start with `0o`.
+  Integers can also be interspersed with `_` as a separator, for example
+  `1_000` or `0x1234_5678`, for readability.
 * constants imported from the embedding, of arbitrary type
   (`$MyConst`).
 * Variable captures and matches (bare identifiers like `x`; an
@@ -515,12 +518,11 @@ operators:
   defined term (type variant or constructor) and the subpatterns are
   applied to each argument value in turn. Note that `term` cannot be a
   wildcard; it must be a specific, concrete term.
-  
+
 The expression (right-hand side) is made up of the following
 expression operators:
 
 * Integer and symbolic constants, as above.
-* Boolean constants `#t` and `#f` (following Scheme syntax).
 * Variable uses (bare `x` identifier).
 * Term constructors (`(term EXPR1 EXPR2 ...)`, where each
   subexpression is evaluated first and then the term is constructed).
@@ -530,7 +532,7 @@ expression operators:
   to the immediately previous variable bindings (i.e., this is like a
   `let*` in Scheme). `let`s are lexically-scoped, meaning that bound
   variables are available only within the body of the `let`.
-  
+
 When multiple rules are applicable to rewrite a particular term, ISLE
 will choose the "more specific" rule according to a particular
 heuristic: in the lowered sequence of matching steps, when one
@@ -565,7 +567,7 @@ functions).
 
 The universe of types is very simple: there are *primitives*, which
 can be integers or symbolic constants (imported from the Rust
-embedding), and *enums*, which correspond direclty to Rust enums with
+embedding), and *enums*, which correspond directly to Rust enums with
 variants that have named fields. There is no subtyping. Some examples
 of type definitions are:
 
@@ -573,14 +575,14 @@ of type definitions are:
 
     (type u32 (primitive u32))  ;; u32 is a primitive, and is
                                 ;; spelled `u32` in the generated Rust code.
-                                
+
     (type MyType (enum
                    (A (x u32) (y u32))
                    (B (z u32))
                    (C)))        ;; MyType is an enum, with variants
                                 ;; `MyType::A { x, y }`, `MyType::B { z }`,
                                 ;; and `MyType::C`.
-                                
+
     (type MyType2 extern (enum (A)))
                                 ;; MyType2 is an enum with variant `MyType2::A`.
                                 ;; Its type definition is not included in the
@@ -611,11 +613,11 @@ automatically have the following constructors:
     ;; These definitions are implicit and do not need to be written (doing
     ;; so is a compile-time error, actually). We write them here just to
     ;; show what they would look like.
-    
+
     (decl MyType.A (u32 u32) MyType)
     (decl MyType.B (u32) MyType)
     (decl MyType.C () MyType)
-    
+
     (decl MyType2.A () MyType2)
 ```
 
@@ -671,39 +673,39 @@ The typing rules for patterns in ISLE are:
   constant, etc.). This is because compilation and dispatch into rules
   is organized by the top-level constructor of the term being
   rewritten.
-  
+
 * At each part of the pattern except the root, there is an "expected
   type" that is inferred from the surrounding context. We check that
   this matches the actual type of the pattern.
-  
+
 * A constructor pattern `(C x y z)`, given a constructor `(decl C (T1
   T2 T2) R)`, has type `R` and provides expected types `T1`, `T2`, and
   `T3` to its subpatterns.
-  
+
 * A variable capture pattern `x` is compatible with any expected type
   the first time it appears, and captures this expected type under the
   variable identifier `x` in the type environment. Subsequent
   appearances of `x` check that the expected type matches the
   already-captured type.
-  
+
 * A conjunction `(and PAT1 PAT2 ...)` checks that each subpattern is
   compatible with the expected type.
-  
+
 * Integer constants are compatible with any primitive expected
   type. (This may change in the future if we add non-numeric
   primitives, such as strings.)
-  
+
 If we are able to typecheck the pattern, we have a type environment
 that is a map from variable bindings to types: e.g., `{ x: MyType, y:
 MyType2, z: u32 }`. We then typecheck the rewrite expression.
 
 * Every expression also has an expected type, from the surrounding
   context. We check that the provided expression matches this type.
-  
+
 * The top-level rewrite expression must have the same type as the
   top-level constructor in the pattern. (In other words, a term can
   only be rewritten to another term of the same type.)
-  
+
 * Constructors check their return values against the expected type,
   and typecheck their argument expressions against their parameter
   types.
@@ -712,7 +714,7 @@ MyType2, z: u32 }`. We then typecheck the rewrite expression.
   these are added to the type environment while typechecking the
   body. The expected type for the body is the same as the expected
   type for the `let` itself.
-  
+
 ### A Note on Heterogeneous Types
 
 We should illuminate one particular aspect of the ISLE type system
@@ -726,9 +728,9 @@ a `T2`. Concretely:
 ```lisp
     (type T1 ...)
     (type T2 ...)
-    
+
     (decl Translate (T1) T2)
-    
+
     (rule (Translate (T1.A ...))
           (T2.X ...))
     (rule (Translate (T1.B ...))
@@ -760,10 +762,10 @@ one could have:
     (type IR ...)
     (type Machine1 ...)
     (type Machine2 ...)
-    
+
     (decl TranslateToMachine1 (IR) Machine1)
     (decl TranslateToMachine2 (IR) Machine2)
-    
+
     (rule (TranslateToMachine1 (IR.add a b)) (Machine1.add a b))
     (rule (TranslateToMachine2 (IR.add a b)) (Machine2.weird_inst a b))
 ```
@@ -872,7 +874,7 @@ For example, if one is writing a rule such as
 ```lisp
     (decl u_to_v (U) V)
     (rule ...)
-    
+
     (decl MyTerm (T) V)
     (rule (MyTerm t)
           (u_to_v t))
@@ -885,7 +887,7 @@ its argument but `t` has type `T`. However, if we define
 
 ```lisp
     (convert T U t_to_u)
-    
+
     ;; For the above to be valid, `t_to_u` should be declared with the
     ;; signature:
     (decl t_to_u (T) U)
@@ -903,13 +905,13 @@ This also works in the extractor position: for example, if one writes
 
 ```lisp
     (decl defining_instruction (Inst) Value)
-    (extern extractor definining_instruction ...)
-    
+    (extern extractor defining_instruction ...)
+
     (decl iadd (Value Value) Inst)
-    
+
     (rule (lower (iadd (iadd a b) c))
           ...)
-          
+
     (convert Inst Value defining_instruction)
 ```
 
@@ -933,12 +935,12 @@ A term can have:
 
 1. A single internal extractor body, via a toplevel `(extractor ...)`
    form, OR
-   
+
 2. A single external extractor binding (see next section); AND
-   
+
 3. One or more `(rule (Term ...) ...)` toplevel forms, which together
    make up an internal constructor definition, OR
-   
+
 4. A single external constructor binding (see next section).
 
 ### If-Let Clauses
@@ -984,7 +986,7 @@ evaluate the expression (`EXPR2` or `EXPR3` above) first. An
 expression in an if-let context is allowed to be "fallible": the
 constructors return `Option<T>` at the Rust level and can return
 `None`, in which case the whole rule application fails and we move on
-to the next rule as if the main pattern had failed to match. (MOre on
+to the next rule as if the main pattern had failed to match. (More on
 the fallible constructors below.) If the expression evaluation
 succeeds, we match the associated pattern (`PAT2` or `PAT3` above)
 against the resulting value. This too can fail, causing the whole rule
@@ -1027,6 +1029,24 @@ When an internal constructor body is generated for a term that is pure
 after the above declaration instead of the `extern`), the right-hand
 side expression of each rule that rewrites the term is also checked
 for purity.
+
+#### `partial` Expressions
+
+ISLE's `partial` keyword on a term indicates that the term's
+constructors may fail to match, otherwise, the ISLE compiler assumes
+the term's constructors are infallible.
+
+For example, the following term's constructor only matches if the value
+is zero:
+
+```
+;; Match any zero value.
+(decl pure partial is_zero_value (Value) Value)
+(extern constructor is_zero_value is_zero_value)
+```
+
+Internal constructors without the `partial` keyword can
+only use other constructors that also do not have the `partial` keyword.
 
 #### `if` Shorthand
 
@@ -1086,7 +1106,7 @@ Rust. The basic principles are:
    side expression; this can invoke further constructors for its
    subparts, kicking off more rewrites, until eventually a value is
    returned.
-   
+
 4. This design means that "intermediate terms" -- constructed terms
    that are then further rewritten -- are never actually built as
    in-memory data-structures. Rather, they exist only as ephemeral
@@ -1094,7 +1114,7 @@ Rust. The basic principles are:
    means that there is very little or no performance penalty to
    factoring code into many sub-rules (subject only to function-call
    overhead and/or the effectiveness of the Rust inliner).
-   
+
 5. Backtracking -- attempting to match rules, and backing up to follow
    a different path when a match fails -- exists, but is entirely
    internal to the generated Rust function for rewriting one
@@ -1105,16 +1125,16 @@ Rust. The basic principles are:
    sides, trying to find a matching rule, and once we find one, we
    commit and start to invoke constructors to build the right-hand
    side.
-   
-   Said another way, the principle is that left-hand sides are
+
+   Said another way, the principle is that left-hand sides can be
    fallible, and have no side-effects as they execute; right-hand
    sides, in contrast, are infallible. This simplifies the control
    flow and makes reasoning about side-effects (especially with
    respect to external Rust actions) easier.
-   
+
 This will become more clear as we look at how Rust interfaces are
 defined, and how the generated code appears, below.
-  
+
 ### Extern Constructors and Extractors
 
 ISLE programs interact with the surrounding Rust code in which they
@@ -1162,13 +1182,12 @@ and returns a `U`.
 
 External constructors are infallible: that is, they must succeed, and
 always return their return type. In contrast, internal constructors
-are fallible because they are implemented by a list of rules whose
-patterns may not cover the entire domain. If fallible behavior is
-needed when invoking external Rust code, that behavior should occur in
-an extractor (see below) instead: only pattern left-hand sides are
-meant to be fallible. Note, incidentally, that fallibility in a
-constructor does not backtrack to try other rules; instead it just
-trickles the `None` failure all the way up.
+can be fallible because they are implemented by a list of rules whose
+patterns may not cover the entire domain (in which case, the term
+should be marked `partial`). If fallible behavior is needed when
+invoking external Rust code, that behavior should occur in an extractor
+(see below) instead: only pattern left-hand sides are meant to be
+fallible.
 
 #### Extractors
 
@@ -1248,7 +1267,7 @@ This allows code to refer to `$I32` whenever a value of type `Type` is
 needed, in either a pattern (LHS) or an expression (RHS). These
 constants are pulled in via the same `use super::*` that imports all
 external types.
-  
+
 ### Exported Interface: Functions and Context Trait
 
 The generated ISLE code provides an interface that is designed to be
@@ -1293,7 +1312,7 @@ we have the following terms and declarations:
 ```lisp
     (decl A (u32 u32) T)
     (extern constructor A build_a)
-    
+
     (decl B (T) U)
     (external extractor B disassemble_b)
 ```
@@ -1411,69 +1430,163 @@ for more information regarding the trie construction algorithm.
 
 ## Reference: ISLE Language Grammar
 
-Baseline: allow arbitrary whitespace, and Lisp-style comments (`;` to
-newline). The grammar accepted by the parser is as follows:
+Baseline: allow arbitrary whitespace, and wasm-style comments (`;` to
+newline, or nested block-comments with `(;` and `;)`).
+
+The grammar accepted by the parser is as follows:
 
 ```bnf
+<skip> ::= <whitespace> | <comment>
+
+<whitespace> ::= " "
+               | "\t"
+               | "\n"
+               | "\r"
+
+<comment> ::= <line-comment> | <block-comment>
+
+<line-comment> ::= ";" <line-char>* (<newline> | eof)
+<line-char> ::= <any character other than "\n" or "\r">
+<newline> ::= "\n" | "\r"
+
+<block-comment> ::= "(;" <block-char>* ";)"
+<block-char> ::= <any character other than ";" or "(">
+               | ";" if the next character is not ")"
+               | "(" if the next character is not ";"
+               | <block-comment>
 
 <ISLE> ::= <def>*
 
-<def> ::= "(" "type" <typedecl> ")"
+<def> ::= "(" "pragma" <pragma> ")"
+        | "(" "type" <typedecl> ")"
         | "(" "decl" <decl> ")"
         | "(" "rule" <rule> ")"
-        | "(" "extractor" <etor> ")"
+        | "(" "extractor" <extractor> ")"
         | "(" "extern" <extern> ")"
-        
-<typedecl> ::= <ident> [ "extern" ] <typevalue>
+        | "(" "convert" <converter> ")"
 
-<ident> ::= ( "A".."Z" | "a".."z" | "_" | "$" )
-            ( "A".."Z" | "a".."z" | "_" | "$" | "0".."9" | "." )*
-<const-ident> ::= "$" ( "A".."Z" | "a".."z" | "_" | "$" | "0".."9" | "." )*
+;; No pragmas are defined yet
+<pragma> ::= <ident>
 
-<int> ::= [ "-" ] ( "0".."9" )+
-        | [ "-" ] "0x" ( "0".."9" "A".."F" "a".."f" )+
+<typedecl> ::= <ident> [ "extern" | "nodebug" ] <type-body>
 
-<typevalue> ::= "(" "primitive" <ident> ")"
-              | "(" "enum" <enumvariant>* ")"
+<ident> ::= <ident-start> <ident-cont>*
+<const-ident> ::= "$" <ident-cont>*
+<ident-start> ::= <any non-whitespace character other than "-", "0".."9", "(", ")", ";", "#" or "$">
+<ident-cont>  ::= <any non-whitespace character other than "(", ")", ";" or "@">
 
-<enumvariant> ::= <ident>
-                | "(" <ident> <enumfield>* ")"
+<type-body> ::= "(" "primitive" <ident> ")"
+              | "(" "enum" <enum-variant>* ")"
 
-<enumfield> ::= "(" <ident> <ty> ")"
+<enum-variant> ::= <ident>
+                 | "(" <ident> <variant-field>* ")"
+
+<variant-field> ::= "(" <ident> <ty> ")"
 
 <ty> ::= <ident>
 
-<decl> ::= <ident> "(" <ty>* ")" <ty>
+<decl> ::= [ "pure" ] [ "multi" ] [ "partial" ] <ident> "(" <ty>* ")" <ty>
 
-<rule> ::= <pattern> <expr>
-         | <prio> <pattern> <expr>
-         
+<rule> ::= [ <ident> ] [ <prio> ] <pattern> <stmt>* <expr>
+
 <prio> ::= <int>
 
-<etor> ::= "(" <ident> <ident>* ")" <pattern>
+<int> ::= [ "-" ] ( "0".."9" ) ( "0".."9" | "_" )*
+        | [ "-" ] "0" ("x" | "X") ( "0".."9" | "A".."F" | "a".."f" | "_" )+
+        | [ "-" ] "0" ("o" | "O") ( "0".."7" | "_" )+
+        | [ "-" ] "0" ("b" | "B") ( "0".."1" | "_" )+
 
 <pattern> ::= <int>
+            | "true" | "false"
             | <const-ident>
             | "_"
             | <ident>
             | <ident> "@" <pattern>
             | "(" "and" <pattern>* ")"
-            | "(" <ident> <pattern-arg>* ")"
+            | "(" <ident> <pattern>* ")"
 
-<pattern-arg> ::= <pattern>
-                | "<" <expr>  ;; in-argument to an extractor
+<stmt> ::= "(" "if-let" <pattern> <expr> ")"
+         | "(" "if" <expr> ")"
 
 <expr> ::= <int>
+         | "true" | "false"
          | <const-ident>
-         | "#t"               ;; Scheme-like "true": shorthand for 1
-         | "#f"               ;; Scheme-like "false": shorthand for 0
          | <ident>
          | "(" "let" "(" <let-binding>* ")" <expr> ")"
          | "(" <ident> <expr>* ")"
-         
+
 <let-binding> ::= "(" <ident> <ty> <expr> ")"
+
+<extractor> ::= "(" <ident> <ident>* ")" <pattern>
 
 <extern> ::= "constructor" <ident> <ident>
            | "extractor" [ "infallible" ] <ident> <ident>
-           | "const" <const-ident> <ident> <ty>
+           | "const" <const-ident> <ty>
+
+<converter> ::= <ty> <ty> <ident>
+```
+
+## Reference: ISLE Language Grammar verification extensions
+
+```bnf
+<def> += "(" "spec" <spec> ")"
+       | "(" "model" <model> ")"
+       | "(" "form" <form> ")"
+       | "(" "instantiate" <instantiation> ")"
+
+<spec> ::= "(" <ident> <ident>* ")" <provide> [ <require> ]
+<provide> ::= "(" "provide" <spec-expr>* ")"
+<require> ::= "(" "require" <spec-expr>* ")"
+
+<model> ::= <ty> "(" "type" <model-ty> ")"
+          | <ty> "(" "enum" <model-variant>* ")"
+
+<model-ty> ::= "Bool"
+             | "Int"
+             | "Unit"
+             | "(" "bv" [ <int> ] ")"
+
+<model-variant> ::= "(" <ident> [ <spec-expr> ] ")"
+
+<form> ::= <ident> <signature>*
+
+<instantiation> ::= <ident> <signature>*
+                  | <ident> <ident>
+
+<spec-expr> ::= <int>
+              | <spec-bv>
+              | "true" | "false"
+              | <ident>
+              | "(" "switch" <spec-expr> <spec-pair>* ")"
+              | "(" <spec-op> <spec-expr>* ")"
+              | "(" <ident> ")"
+              | "(" ")"
+
+<spec-bv> ::= "#b" [ "+" | "-" ] ("0".."1")+
+            | "#x" [ "+" | "-" ] ("0".."9" | "A".."F" | "a".."f")+
+
+<spec-pair> ::= "(" <spec-expr> <spec-expr> ")"
+
+<spec-op> ::= "and" | "not" | "or" | "=>"
+            | "=" | "<=" | "<" | ">=" | ">"
+            | "bvnot" | "bvand" | "bvor" | "bvxor"
+            | "bvneg" | "bvadd" | "bvsub" | "bvmul"
+            | "bvudiv" | "bvurem" | "bvsdiv" | "bvsrem"
+            | "bvshl" | "bvlshr" | "bvashr"
+            | "bvsaddo" | "subs"
+            | "bvule" | "bvult" | "bvugt" | "bvuge"
+            | "bvsle" | "bvslt" | "bvsgt" | "bvsge"
+            | "rotr" | "rotl"
+            | "extract" | "concat" | "conv_to"
+            | "zero_ext" | "sign_ext"
+            | "int2bv" | "bv2int"
+            | "widthof"
+            | "if" | "switch"
+            | "popcnt" | "rev" | "cls" | "clz"
+            | "load_effect" | "store_effect"
+
+<signature>  ::= "(" <sig-args> <sig-ret> <sig-canon> ")"
+<sig-args>   ::= "(" "args" <model-ty>* ")"
+<sig-ret>    ::= "(" "ret" <model-ty>* ")"
+<sig-canon>  ::= "(" "canon" <model-ty>* ")"
 ```

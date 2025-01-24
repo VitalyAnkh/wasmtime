@@ -14,6 +14,21 @@ impl From<Error> for wasmtime_error_t {
     }
 }
 
+impl Into<Error> for wasmtime_error_t {
+    fn into(self) -> Error {
+        self.error
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_error_new(
+    msg: *const std::ffi::c_char,
+) -> Option<Box<wasmtime_error_t>> {
+    let msg_bytes = unsafe { std::ffi::CStr::from_ptr(msg).to_bytes() };
+    let msg_string = String::from_utf8_lossy(msg_bytes).into_owned();
+    Some(Box::new(wasmtime_error_t::from(anyhow!(msg_string))))
+}
+
 pub(crate) fn handle_result<T>(
     result: Result<T>,
     ok: impl FnOnce(T),
@@ -33,12 +48,12 @@ pub(crate) fn bad_utf8() -> Option<Box<wasmtime_error_t>> {
     }))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasmtime_error_message(error: &wasmtime_error_t, message: &mut wasm_name_t) {
     message.set_buffer(format!("{:?}", error.error).into_bytes());
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasmtime_error_exit_status(raw: &wasmtime_error_t, status: &mut i32) -> bool {
     #[cfg(feature = "wasi")]
     if let Some(exit) = raw.error.downcast_ref::<wasmtime_wasi::I32Exit>() {
@@ -52,7 +67,7 @@ pub extern "C" fn wasmtime_error_exit_status(raw: &wasmtime_error_t, status: &mu
     false
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasmtime_error_wasm_trace<'a>(
     raw: &'a wasmtime_error_t,
     out: &mut wasm_frame_vec_t<'a>,

@@ -141,10 +141,9 @@ use clap::Parser;
 use std::os::raw::{c_int, c_void};
 use std::slice;
 use std::{env, path::PathBuf};
-use target_lexicon::Triple;
+use wasi_common::{sync::WasiCtxBuilder, I32Exit, WasiCtx};
 use wasmtime::{Engine, Instance, Linker, Module, Store};
-use wasmtime_cli_flags::{CommonOptions, WasiModules};
-use wasmtime_wasi::{sync::WasiCtxBuilder, I32Exit, WasiCtx};
+use wasmtime_cli_flags::CommonOptions;
 
 pub type ExitCode = c_int;
 pub const OK: ExitCode = 0;
@@ -266,7 +265,7 @@ impl WasmBenchConfig {
 /// that contains the engine's initialized state, and `0` is returned. On
 /// failure, a non-zero status code is returned and `out_bench_ptr` is left
 /// untouched.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasm_bench_create(
     config: WasmBenchConfig,
     out_bench_ptr: *mut *mut c_void,
@@ -304,31 +303,31 @@ pub extern "C" fn wasm_bench_create(
                 let stdout = std::fs::File::create(&stdout_path)
                     .with_context(|| format!("failed to create {}", stdout_path.display()))?;
                 let stdout = cap_std::fs::File::from_std(stdout);
-                let stdout = wasi_cap_std_sync::file::File::from_cap_std(stdout);
-                cx = cx.stdout(Box::new(stdout));
+                let stdout = wasi_common::sync::file::File::from_cap_std(stdout);
+                cx.stdout(Box::new(stdout));
 
                 let stderr = std::fs::File::create(&stderr_path)
                     .with_context(|| format!("failed to create {}", stderr_path.display()))?;
                 let stderr = cap_std::fs::File::from_std(stderr);
-                let stderr = wasi_cap_std_sync::file::File::from_cap_std(stderr);
-                cx = cx.stderr(Box::new(stderr));
+                let stderr = wasi_common::sync::file::File::from_cap_std(stderr);
+                cx.stderr(Box::new(stderr));
 
                 if let Some(stdin_path) = &stdin_path {
                     let stdin = std::fs::File::open(stdin_path)
                         .with_context(|| format!("failed to open {}", stdin_path.display()))?;
                     let stdin = cap_std::fs::File::from_std(stdin);
-                    let stdin = wasi_cap_std_sync::file::File::from_cap_std(stdin);
-                    cx = cx.stdin(Box::new(stdin));
+                    let stdin = wasi_common::sync::file::File::from_cap_std(stdin);
+                    cx.stdin(Box::new(stdin));
                 }
 
                 // Allow access to the working directory so that the benchmark can read
                 // its input workload(s).
-                cx = cx.preopened_dir(working_dir.try_clone()?, ".")?;
+                cx.preopened_dir(working_dir.try_clone()?, ".")?;
 
                 // Pass this env var along so that the benchmark program can use smaller
                 // input workload(s) if it has them and that has been requested.
                 if let Ok(val) = env::var("WASM_BENCH_USE_SMALL_WORKLOAD") {
-                    cx = cx.env("WASM_BENCH_USE_SMALL_WORKLOAD", &val)?;
+                    cx.env("WASM_BENCH_USE_SMALL_WORKLOAD", &val)?;
                 }
 
                 Ok(cx.build())
@@ -348,7 +347,7 @@ pub extern "C" fn wasm_bench_create(
 }
 
 /// Free the engine state allocated by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasm_bench_free(state: *mut c_void) {
     assert!(!state.is_null());
     unsafe {
@@ -357,7 +356,7 @@ pub extern "C" fn wasm_bench_free(state: *mut c_void) {
 }
 
 /// Compile the Wasm benchmark module.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasm_bench_compile(
     state: *mut c_void,
     wasm_bytes: *const u8,
@@ -370,7 +369,7 @@ pub extern "C" fn wasm_bench_compile(
 }
 
 /// Instantiate the Wasm benchmark module.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasm_bench_instantiate(state: *mut c_void) -> ExitCode {
     let state = unsafe { (state as *mut BenchState).as_mut().unwrap() };
     let result = state.instantiate().context("failed to instantiate");
@@ -378,7 +377,7 @@ pub extern "C" fn wasm_bench_instantiate(state: *mut c_void) -> ExitCode {
 }
 
 /// Execute the Wasm benchmark module.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasm_bench_execute(state: *mut c_void) -> ExitCode {
     let state = unsafe { (state as *mut BenchState).as_mut().unwrap() };
     let result = state.execute().context("failed to execute");
@@ -392,7 +391,7 @@ fn to_exit_code<T>(result: impl Into<Result<T>>) -> ExitCode {
     match result.into() {
         Ok(_) => OK,
         Err(error) => {
-            eprintln!("{:?}", error);
+            eprintln!("{error:?}");
             ERR
         }
     }
@@ -418,14 +417,12 @@ struct BenchState {
 struct HostState {
     wasi: WasiCtx,
     #[cfg(feature = "wasi-nn")]
-    wasi_nn: wasmtime_wasi_nn::WasiNnCtx,
-    #[cfg(feature = "wasi-crypto")]
-    wasi_crypto: wasmtime_wasi_crypto::WasiCryptoCtx,
+    wasi_nn: wasmtime_wasi_nn::witx::WasiNnCtx,
 }
 
 impl BenchState {
     fn new(
-        options: CommonOptions,
+        mut options: CommonOptions,
         compilation_timer: *mut u8,
         compilation_start: extern "C" fn(*mut u8),
         compilation_end: extern "C" fn(*mut u8),
@@ -437,7 +434,7 @@ impl BenchState {
         execution_end: extern "C" fn(*mut u8),
         make_wasi_cx: impl FnMut() -> Result<WasiCtx> + 'static,
     ) -> Result<Self> {
-        let mut config = options.config(Some(&Triple::host().to_string()))?;
+        let mut config = options.config(None)?;
         // NB: always disable the compilation cache.
         config.disable_cache();
         let engine = Engine::new(&config)?;
@@ -458,23 +455,16 @@ impl BenchState {
             Ok(())
         })?;
 
-        let epoch_interruption = options.epoch_interruption;
-        let fuel = options.fuel;
+        let epoch_interruption = options.wasm.epoch_interruption.unwrap_or(false);
+        let fuel = options.wasm.fuel;
 
-        let wasi_modules = options.wasi_modules.unwrap_or(WasiModules::default());
-
-        if wasi_modules.wasi_common {
-            wasmtime_wasi::add_to_linker(&mut linker, |cx| &mut cx.wasi)?;
+        if options.wasi.common != Some(false) {
+            wasi_common::sync::add_to_linker(&mut linker, |cx| &mut cx.wasi)?;
         }
 
         #[cfg(feature = "wasi-nn")]
-        if wasi_modules.wasi_nn {
-            wasmtime_wasi_nn::add_to_linker(&mut linker, |cx| &mut cx.wasi_nn)?;
-        }
-
-        #[cfg(feature = "wasi-crypto")]
-        if wasi_modules.wasi_crypto {
-            wasmtime_wasi_crypto::add_to_linker(&mut linker, |cx| &mut cx.wasi_crypto)?;
+        if options.wasi.nn == Some(true) {
+            wasmtime_wasi_nn::witx::add_to_linker(&mut linker, |cx| &mut cx.wasi_nn)?;
         }
 
         Ok(Self {
@@ -494,10 +484,7 @@ impl BenchState {
     }
 
     fn compile(&mut self, bytes: &[u8]) -> Result<()> {
-        assert!(
-            self.module.is_none(),
-            "create a new engine to repeat compilation"
-        );
+        self.module = None;
 
         (self.compilation_start)(self.compilation_timer);
         let module = Module::from_binary(self.linker.engine(), bytes)?;
@@ -508,6 +495,8 @@ impl BenchState {
     }
 
     fn instantiate(&mut self) -> Result<()> {
+        self.store_and_instance = None;
+
         let module = self
             .module
             .as_ref()
@@ -516,9 +505,10 @@ impl BenchState {
         let host = HostState {
             wasi: (self.make_wasi_cx)().context("failed to create a WASI context")?,
             #[cfg(feature = "wasi-nn")]
-            wasi_nn: wasmtime_wasi_nn::WasiNnCtx::new()?,
-            #[cfg(feature = "wasi-crypto")]
-            wasi_crypto: wasmtime_wasi_nn::WasiCryptoCtx::new(),
+            wasi_nn: {
+                let (backends, registry) = wasmtime_wasi_nn::preload(&[])?;
+                wasmtime_wasi_nn::witx::WasiNnCtx::new(backends, registry)
+            },
         };
 
         // NB: Start measuring instantiation time *after* we've created the WASI
@@ -530,7 +520,7 @@ impl BenchState {
             store.set_epoch_deadline(1);
         }
         if let Some(fuel) = self.fuel {
-            store.add_fuel(fuel).unwrap();
+            store.set_fuel(fuel).unwrap();
         }
 
         let instance = self.linker.instantiate(&mut store, &module)?;

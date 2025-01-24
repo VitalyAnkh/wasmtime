@@ -3,8 +3,6 @@
 use crate::error::Location;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{Block, Value};
-#[allow(unused_imports, deprecated)]
-use std::ascii::AsciiExt;
 use std::str::CharIndices;
 use std::u16;
 
@@ -28,11 +26,12 @@ pub enum Token<'a> {
     Dot,                   // '.'
     Colon,                 // ':'
     Equal,                 // '='
-    Not,                   // '!'
+    Bang,                  // '!'
+    At,                    // '@'
     Arrow,                 // '->'
     Float(&'a str),        // Floating point immediate
     Integer(&'a str),      // Integer immediate
-    Type(types::Type),     // i32, f32, b32x4, ...
+    Type(types::Type),     // i32, f32, i32x4, ...
     DynamicType(u32),      // dt5
     Value(Value),          // v12, v7
     Block(Block),          // block3
@@ -40,7 +39,7 @@ pub enum Token<'a> {
     StackSlot(u32),        // ss3
     DynamicStackSlot(u32), // dss4
     GlobalValue(u32),      // gv3
-    Table(u32),            // table2
+    MemoryType(u32),       // mt0
     Constant(u32),         // const2
     FuncRef(u32),          // fn2
     SigRef(u32),           // sig2
@@ -344,7 +343,7 @@ impl<'a> Lexer<'a> {
             "dss" => Some(Token::DynamicStackSlot(number)),
             "dt" => Some(Token::DynamicType(number)),
             "gv" => Some(Token::GlobalValue(number)),
-            "table" => Some(Token::Table(number)),
+            "mt" => Some(Token::MemoryType(number)),
             "const" => Some(Token::Constant(number)),
             "fn" => Some(Token::FuncRef(number)),
             "sig" => Some(Token::SigRef(number)),
@@ -368,10 +367,10 @@ impl<'a> Lexer<'a> {
             "i32" => types::I32,
             "i64" => types::I64,
             "i128" => types::I128,
+            "f16" => types::F16,
             "f32" => types::F32,
             "f64" => types::F64,
-            "r32" => types::R32,
-            "r64" => types::R64,
+            "f128" => types::F128,
             _ => return None,
         };
         if is_vector {
@@ -439,12 +438,17 @@ impl<'a> Lexer<'a> {
         token(Token::HexSequence(&self.source[begin..end]), loc)
     }
 
-    fn scan_srcloc(&mut self) -> Result<LocatedToken<'a>, LocatedError> {
-        let loc = self.loc();
-        let begin = self.pos + 1;
+    /// Given that we've consumed an `@` character, are we looking at a source
+    /// location?
+    fn looking_at_srcloc(&self) -> bool {
+        match self.lookahead {
+            Some(c) => char::is_digit(c, 16),
+            _ => false,
+        }
+    }
 
-        assert_eq!(self.lookahead, Some('@'));
-
+    fn scan_srcloc(&mut self, pos: usize, loc: Location) -> Result<LocatedToken<'a>, LocatedError> {
+        let begin = pos + 1;
         while let Some(c) = self.next_ch() {
             if !char::is_digit(c, 16) {
                 break;
@@ -458,7 +462,6 @@ impl<'a> Lexer<'a> {
     /// Get the next token or a lexical error.
     ///
     /// Return None when the end of the source is encountered.
-    #[allow(clippy::cognitive_complexity)]
     pub fn next(&mut self) -> Option<Result<LocatedToken<'a>, LocatedError>> {
         loop {
             let loc = self.loc();
@@ -475,7 +478,7 @@ impl<'a> Lexer<'a> {
                 Some('.') => Some(self.scan_char(Token::Dot)),
                 Some(':') => Some(self.scan_char(Token::Colon)),
                 Some('=') => Some(self.scan_char(Token::Equal)),
-                Some('!') => Some(self.scan_char(Token::Not)),
+                Some('!') => Some(self.scan_char(Token::Bang)),
                 Some('+') => Some(self.scan_number()),
                 Some('*') => Some(self.scan_char(Token::Multiply)),
                 Some('-') => {
@@ -496,7 +499,16 @@ impl<'a> Lexer<'a> {
                 Some('%') => Some(self.scan_name()),
                 Some('"') => Some(self.scan_string()),
                 Some('#') => Some(self.scan_hex_sequence()),
-                Some('@') => Some(self.scan_srcloc()),
+                Some('@') => {
+                    let pos = self.pos;
+                    let loc = self.loc();
+                    self.next_ch();
+                    if self.looking_at_srcloc() {
+                        Some(self.scan_srcloc(pos, loc))
+                    } else {
+                        Some(token(Token::At, loc))
+                    }
+                }
                 // all ascii whitespace
                 Some(' ') | Some('\x09'..='\x0d') => {
                     self.next_ch();
@@ -514,11 +526,7 @@ impl<'a> Lexer<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::trailing_digits;
     use super::*;
-    use crate::error::Location;
-    use cranelift_codegen::ir::types;
-    use cranelift_codegen::ir::{Block, Value};
 
     #[test]
     fn digits() {
@@ -616,7 +624,7 @@ mod tests {
     fn lex_identifiers() {
         let mut lex = Lexer::new(
             "v0 v00 vx01 block1234567890 block5234567890 v1x vx1 vxvx4 \
-             function0 function i8 i32x4 f32x5",
+             function0 function i8 i32x4 f32x5 f16 f128",
         );
         assert_eq!(
             lex.next(),
@@ -637,6 +645,8 @@ mod tests {
         assert_eq!(lex.next(), token(Token::Type(types::I8), 1));
         assert_eq!(lex.next(), token(Token::Type(types::I32X4), 1));
         assert_eq!(lex.next(), token(Token::Identifier("f32x5"), 1));
+        assert_eq!(lex.next(), token(Token::Type(types::F16), 1));
+        assert_eq!(lex.next(), token(Token::Type(types::F128), 1));
         assert_eq!(lex.next(), None);
     }
 

@@ -4,8 +4,8 @@ use arbitrary::{Arbitrary, Result, Unstructured};
 use std::ops::RangeInclusive;
 use wasm_encoder::{
     CodeSection, ConstExpr, EntityType, ExportKind, ExportSection, Function, FunctionSection,
-    GlobalSection, ImportSection, Instruction, Module, TableSection, TableType, TypeSection,
-    ValType,
+    GlobalSection, ImportSection, Instruction, Module, RefType, TableSection, TableType,
+    TypeSection, ValType,
 };
 
 /// A description of a Wasm module that makes a series of `externref` table
@@ -42,7 +42,7 @@ impl TableOps {
         let mut types = TypeSection::new();
 
         // 0: "gc"
-        types.function(
+        types.ty().function(
             vec![],
             // Return a bunch of stuff from `gc` so that we exercise GCing when
             // there is return pointer space allocated on the stack. This is
@@ -50,27 +50,27 @@ impl TableOps {
             // dynamically adjusts the stack pointer for each call that uses
             // return pointers rather than statically allocating space in the
             // stack frame.
-            vec![ValType::ExternRef, ValType::ExternRef, ValType::ExternRef],
+            vec![ValType::EXTERNREF, ValType::EXTERNREF, ValType::EXTERNREF],
         );
 
         // 1: "run"
         let mut params: Vec<ValType> = Vec::with_capacity(self.num_params as usize);
         for _i in 0..self.num_params {
-            params.push(ValType::ExternRef);
+            params.push(ValType::EXTERNREF);
         }
         let results = vec![];
-        types.function(params, results);
+        types.ty().function(params, results);
 
         // 2: `take_refs`
-        types.function(
-            vec![ValType::ExternRef, ValType::ExternRef, ValType::ExternRef],
+        types.ty().function(
+            vec![ValType::EXTERNREF, ValType::EXTERNREF, ValType::EXTERNREF],
             vec![],
         );
 
         // 3: `make_refs`
-        types.function(
+        types.ty().function(
             vec![],
-            vec![ValType::ExternRef, ValType::ExternRef, ValType::ExternRef],
+            vec![ValType::EXTERNREF, ValType::EXTERNREF, ValType::EXTERNREF],
         );
 
         // Import the GC function.
@@ -82,9 +82,11 @@ impl TableOps {
         // Define our table.
         let mut tables = TableSection::new();
         tables.table(TableType {
-            element_type: ValType::ExternRef,
-            minimum: self.table_size as u32,
+            element_type: RefType::EXTERNREF,
+            minimum: self.table_size as u64,
             maximum: None,
+            table64: false,
+            shared: false,
         });
 
         // Define our globals.
@@ -92,10 +94,11 @@ impl TableOps {
         for _ in 0..self.num_globals {
             globals.global(
                 wasm_encoder::GlobalType {
-                    val_type: wasm_encoder::ValType::ExternRef,
+                    val_type: wasm_encoder::ValType::EXTERNREF,
                     mutable: true,
+                    shared: false,
                 },
-                &ConstExpr::ref_null(wasm_encoder::ValType::ExternRef),
+                &ConstExpr::ref_null(wasm_encoder::HeapType::EXTERN),
             );
         }
 
@@ -108,11 +111,11 @@ impl TableOps {
 
         // Give ourselves one scratch local that we can use in various `TableOp`
         // implementations.
-        let mut func = Function::new(vec![(1, ValType::ExternRef)]);
+        let mut func = Function::new(vec![(1, ValType::EXTERNREF)]);
 
         func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
         for op in &self.ops {
-            op.insert(&mut func, self.num_params as u32);
+            op.insert(&mut func, self.num_params);
         }
         func.instruction(&Instruction::Br(0));
         func.instruction(&Instruction::End);
@@ -171,6 +174,7 @@ macro_rules! define_table_ops {
             )*
         }
 
+        #[expect(unused_comparisons, reason = "macro-generated code")]
         fn add_table_op(
             ops: &mut TableOps,
             u: &mut Unstructured,
@@ -181,7 +185,6 @@ macro_rules! define_table_ops {
 
             // Add all the choices of valid `TableOp`s we could generate.
             $(
-                #[allow(unused_comparisons)]
                 if $( $(($limit as fn(&TableOps) -> $ty)(&*ops) > 0 &&)* )? *stack >= $params {
                     choices.push(|_ops, _u, stack| {
                         *stack = *stack - $params + $results;
@@ -261,7 +264,7 @@ impl TableOp {
                 func.instruction(&Instruction::Drop);
             }
             Self::Null => {
-                func.instruction(&Instruction::RefNull(wasm_encoder::ValType::ExternRef));
+                func.instruction(&Instruction::RefNull(wasm_encoder::HeapType::EXTERN));
             }
         }
     }
@@ -282,11 +285,7 @@ mod tests {
             let u = Unstructured::new(&buf);
             if let Ok(ops) = TableOps::arbitrary_take_rest(u) {
                 let wasm = ops.to_wasm_binary();
-                let mut validator =
-                    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures {
-                        reference_types: true,
-                        ..Default::default()
-                    });
+                let mut validator = wasmparser::Validator::new();
                 let result = validator.validate_all(&wasm);
                 assert!(result.is_ok());
             }
@@ -323,6 +322,18 @@ mod tests {
   (import "" "gc" (func (;0;) (type 0)))
   (import "" "take_refs" (func (;1;) (type 2)))
   (import "" "make_refs" (func (;2;) (type 3)))
+  (table (;0;) 20 externref)
+  (global (;0;) (mut externref) ref.null extern)
+  (global (;1;) (mut externref) ref.null extern)
+  (global (;2;) (mut externref) ref.null extern)
+  (global (;3;) (mut externref) ref.null extern)
+  (global (;4;) (mut externref) ref.null extern)
+  (global (;5;) (mut externref) ref.null extern)
+  (global (;6;) (mut externref) ref.null extern)
+  (global (;7;) (mut externref) ref.null extern)
+  (global (;8;) (mut externref) ref.null extern)
+  (global (;9;) (mut externref) ref.null extern)
+  (export "run" (func 3))
   (func (;3;) (type 1) (param externref externref externref externref externref externref externref externref externref externref)
     (local externref)
     loop ;; label = @1
@@ -344,29 +355,17 @@ mod tests {
       br 0 (;@1;)
     end
   )
-  (table (;0;) 20 externref)
-  (global (;0;) (mut externref) ref.null extern)
-  (global (;1;) (mut externref) ref.null extern)
-  (global (;2;) (mut externref) ref.null extern)
-  (global (;3;) (mut externref) ref.null extern)
-  (global (;4;) (mut externref) ref.null extern)
-  (global (;5;) (mut externref) ref.null extern)
-  (global (;6;) (mut externref) ref.null extern)
-  (global (;7;) (mut externref) ref.null extern)
-  (global (;8;) (mut externref) ref.null extern)
-  (global (;9;) (mut externref) ref.null extern)
-  (export "run" (func 3))
 )
 "#;
-        eprintln!("expected WAT = {}", expected);
+        eprintln!("expected WAT = {expected}");
 
         let actual = ops.to_wasm_binary();
         if let Err(e) = wasmparser::validate(&actual) {
-            panic!("TableOps should generate valid Wasm; got error: {}", e);
+            panic!("TableOps should generate valid Wasm; got error: {e}");
         }
 
         let actual = wasmprinter::print_bytes(&actual).unwrap();
-        eprintln!("actual WAT = {}", actual);
+        eprintln!("actual WAT = {actual}");
 
         assert_eq!(actual.trim(), expected.trim());
     }

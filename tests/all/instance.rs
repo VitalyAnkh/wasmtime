@@ -1,18 +1,19 @@
-use anyhow::Result;
 use wasmtime::*;
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn wrong_import_numbers() -> Result<()> {
     let mut store = Store::<()>::default();
     let module = Module::new(store.engine(), r#"(module (import "" "" (func)))"#)?;
 
     assert!(Instance::new(&mut store, &module, &[]).is_err());
     let func = Func::wrap(&mut store, || {});
-    assert!(Instance::new(&mut store, &module, &[func.clone().into(), func.into()]).is_err());
+    assert!(Instance::new(&mut store, &module, &[func.into(), func.into()]).is_err());
     Ok(())
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn initializes_linear_memory() -> Result<()> {
     // Test for https://github.com/bytecodealliance/wasmtime/issues/2784
     let wat = r#"
@@ -33,6 +34,8 @@ fn initializes_linear_memory() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
+#[cfg(target_pointer_width = "64")]
 fn linear_memory_limits() -> Result<()> {
     // this test will allocate 4GB of virtual memory space, and may not work in
     // situations like CI QEMU emulation where it triggers SIGKILL.
@@ -40,8 +43,8 @@ fn linear_memory_limits() -> Result<()> {
         return Ok(());
     }
     test(&Engine::default())?;
-    let mut pool = PoolingAllocationConfig::default();
-    pool.instance_memory_pages(65536);
+    let mut pool = crate::small_pool_config();
+    pool.max_memory_size(1 << 32);
     test(&Engine::new(Config::new().allocation_strategy(
         InstanceAllocationStrategy::Pooling(pool),
     ))?)?;

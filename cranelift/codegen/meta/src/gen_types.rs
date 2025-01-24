@@ -53,21 +53,16 @@ fn emit_types(fmt: &mut srcgen::Formatter) {
         emit_type(&ty, fmt);
     }
 
-    // Emit all reference types.
-    for ty in cdsl_types::ValueType::all_reference_types().map(cdsl_types::ValueType::from) {
-        emit_type(&ty, fmt);
-    }
-
     // Emit vector definitions for common SIMD sizes.
     // Emit dynamic vector definitions.
-    for vec_size in &[64_u64, 128, 256, 512] {
+    for vec_size in &[16_u64, 32, 64, 128, 256, 512] {
         emit_vectors(*vec_size, fmt);
         emit_dynamic_vectors(*vec_size, fmt);
     }
 }
 
 /// Generate the types file.
-pub(crate) fn generate(filename: &str, out_dir: &str) -> Result<(), error::Error> {
+pub(crate) fn generate(filename: &str, out_dir: &std::path::Path) -> Result<(), error::Error> {
     let mut fmt = srcgen::Formatter::new();
     emit_types(&mut fmt);
     fmt.update_file(filename, out_dir)?;

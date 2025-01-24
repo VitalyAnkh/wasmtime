@@ -2,27 +2,23 @@
 name = "test-programs"
 version = "0.0.0"
 authors = ["The Wasmtime Project Developers"]
-readme = "README.md"
 edition.workspace = true
+rust-version.workspace = true
 publish = false
 license = "Apache-2.0 WITH LLVM-exception"
 
-[build-dependencies]
-cfg-if = "1.0"
+[lints]
+workspace = true
 
-[dev-dependencies]
-wasi-common = { workspace = true }
-wasi-cap-std-sync = { workspace = true }
-wasmtime = { workspace = true }
-wasmtime-wasi = { workspace = true, features = ["tokio"] }
-target-lexicon = { workspace = true }
-tracing-subscriber = { version = "0.3.1", default-features = false, features = ['fmt'] }
-tempfile = "3.1.0"
-os_pipe = "0.9"
-anyhow = { workspace = true }
-wat = { workspace = true }
-cap-std = { workspace = true }
-tokio = { version = "1.8.0", features = ["rt-multi-thread"] }
-
-[features]
-test_programs = []
+[dependencies]
+anyhow = { workspace = true, features = ['std'] }
+wasi = "0.11.0"
+wasi-nn = "0.6.0"
+wit-bindgen = { workspace = true, features = ['default'] }
+libc = { workspace = true }
+getrandom = "0.2.9"
+futures = { workspace = true, default-features = false, features = ['alloc'] }
+url = { workspace = true }
+sha2 = "0.10.2"
+base64 = "0.21.0"
+wasip2 = { version = "0.14.0", package = 'wasi' }

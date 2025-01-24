@@ -24,6 +24,16 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
+        fn u16_as_i16(&mut self, x: u16) -> i16 {
+            x as i16
+        }
+
+        #[inline]
+        fn u16_as_u32(&mut self, x: u16) -> u32 {
+            x.into()
+        }
+
+        #[inline]
         fn u16_as_u64(&mut self, x: u16) -> u64 {
             x.into()
         }
@@ -36,6 +46,31 @@ macro_rules! isle_common_prelude_methods {
         #[inline]
         fn i64_as_u64(&mut self, x: i64) -> u64 {
             x as u64
+        }
+
+        #[inline]
+        fn u64_as_i32(&mut self, x: u64) -> i32 {
+            x as i32
+        }
+
+        #[inline]
+        fn u64_as_i64(&mut self, x: u64) -> i64 {
+            x as i64
+        }
+
+        #[inline]
+        fn i32_as_i64(&mut self, x: i32) -> i64 {
+            x.into()
+        }
+
+        #[inline]
+        fn i64_neg(&mut self, x: i64) -> i64 {
+            x.wrapping_neg()
+        }
+
+        #[inline]
+        fn i8_neg(&mut self, x: i8) -> i8 {
+            x.wrapping_neg()
         }
 
         #[inline]
@@ -78,6 +113,11 @@ macro_rules! isle_common_prelude_methods {
         #[inline]
         fn u64_xor(&mut self, x: u64, y: u64) -> u64 {
             x ^ y
+        }
+
+        #[inline]
+        fn u64_shl(&mut self, x: u64, y: u64) -> u64 {
+            x << y
         }
 
         #[inline]
@@ -130,7 +170,21 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
+        fn u64_le(&mut self, x: u64, y: u64) -> bool {
+            x <= y
+        }
+
+        #[inline]
+        fn u64_lt(&mut self, x: u64, y: u64) -> bool {
+            x < y
+        }
+
+        #[inline]
         fn u64_is_zero(&mut self, value: u64) -> bool {
+            0 == value
+        }
+
+        fn i64_is_zero(&mut self, value: i64) -> bool {
             0 == value
         }
 
@@ -139,10 +193,23 @@ macro_rules! isle_common_prelude_methods {
             x & 1 == 1
         }
 
+        fn i64_shr(&mut self, a: i64, b: i64) -> i64 {
+            a >> b
+        }
+
+        fn i64_ctz(&mut self, a: i64) -> i64 {
+            a.trailing_zeros().into()
+        }
+
         #[inline]
-        fn i64_sextend_imm64(&mut self, ty: Type, mut x: Imm64) -> i64 {
-            x.sign_extend_from_width(ty.bits());
-            x.bits()
+        fn i64_sextend_u64(&mut self, ty: Type, x: u64) -> i64 {
+            let shift_amt = std::cmp::max(0, 64 - ty.bits());
+            ((x as i64) << shift_amt) >> shift_amt
+        }
+
+        #[inline]
+        fn i64_sextend_imm64(&mut self, ty: Type, x: Imm64) -> i64 {
+            x.sign_extend_from_width(ty.bits()).bits()
         }
 
         #[inline]
@@ -202,6 +269,51 @@ macro_rules! isle_common_prelude_methods {
             u64::MAX >> shift
         }
 
+        #[inline]
+        fn ty_lane_mask(&mut self, ty: Type) -> u64 {
+            let ty_lane_count = ty.lane_count();
+            debug_assert_ne!(ty_lane_count, 0);
+            let shift = 64_u64
+                .checked_sub(ty_lane_count.into())
+                .expect("unimplemented for > 64 bits");
+            u64::MAX >> shift
+        }
+
+        #[inline]
+        fn ty_lane_count(&mut self, ty: Type) -> u64 {
+            ty.lane_count() as u64
+        }
+
+        #[inline]
+        fn ty_umin(&mut self, _ty: Type) -> u64 {
+            0
+        }
+
+        #[inline]
+        fn ty_umax(&mut self, ty: Type) -> u64 {
+            self.ty_mask(ty)
+        }
+
+        #[inline]
+        fn ty_smin(&mut self, ty: Type) -> u64 {
+            let ty_bits = ty.bits();
+            debug_assert_ne!(ty_bits, 0);
+            let shift = 64_u64
+                .checked_sub(ty_bits.into())
+                .expect("unimplemented for > 64 bits");
+            (i64::MIN as u64) >> shift
+        }
+
+        #[inline]
+        fn ty_smax(&mut self, ty: Type) -> u64 {
+            let ty_bits = ty.bits();
+            debug_assert_ne!(ty_bits, 0);
+            let shift = 64_u64
+                .checked_sub(ty_bits.into())
+                .expect("unimplemented for > 64 bits");
+            (i64::MAX as u64) >> shift
+        }
+
         fn fits_in_16(&mut self, ty: Type) -> Option<Type> {
             if ty.bits() <= 16 && !ty.is_dynamic_vector() {
                 Some(ty)
@@ -249,6 +361,11 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
+        fn ty_int_ref_scalar_64_extract(&mut self, ty: Type) -> Option<Type> {
+            self.ty_int_ref_scalar_64(ty)
+        }
+
+        #[inline]
         fn ty_32(&mut self, ty: Type) -> Option<Type> {
             if ty.bits() == 32 {
                 Some(ty)
@@ -285,6 +402,15 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
+        fn ty_16_or_32(&mut self, ty: Type) -> Option<Type> {
+            if ty.bits() == 16 || ty.bits() == 32 {
+                Some(ty)
+            } else {
+                None
+            }
+        }
+
+        #[inline]
         fn int_fits_in_32(&mut self, ty: Type) -> Option<Type> {
             match ty {
                 I8 | I16 | I32 => Some(ty),
@@ -295,7 +421,15 @@ macro_rules! isle_common_prelude_methods {
         #[inline]
         fn ty_int_ref_64(&mut self, ty: Type) -> Option<Type> {
             match ty {
-                I64 | R64 => Some(ty),
+                I64 => Some(ty),
+                _ => None,
+            }
+        }
+
+        #[inline]
+        fn ty_int_ref_16_to_64(&mut self, ty: Type) -> Option<Type> {
+            match ty {
+                I16 | I32 | I64 => Some(ty),
                 _ => None,
             }
         }
@@ -306,19 +440,29 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
+        fn ty_scalar(&mut self, ty: Type) -> Option<Type> {
+            if ty.lane_count() == 1 {
+                Some(ty)
+            } else {
+                None
+            }
+        }
+
+        #[inline]
         fn ty_scalar_float(&mut self, ty: Type) -> Option<Type> {
-            match ty {
-                F32 | F64 => Some(ty),
-                _ => None,
+            if ty.is_float() {
+                Some(ty)
+            } else {
+                None
             }
         }
 
         #[inline]
         fn ty_float_or_vec(&mut self, ty: Type) -> Option<Type> {
-            match ty {
-                F32 | F64 => Some(ty),
-                ty if ty.is_vector() => Some(ty),
-                _ => None,
+            if ty.is_float() || ty.is_vector() {
+                Some(ty)
+            } else {
+                None
             }
         }
 
@@ -403,6 +547,14 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
+        fn ty_addr64(&mut self, ty: Type) -> Option<Type> {
+            match ty {
+                I64 => Some(ty),
+                _ => None,
+            }
+        }
+
+        #[inline]
         fn u64_from_imm64(&mut self, imm: Imm64) -> u64 {
             imm.bits() as u64
         }
@@ -446,27 +598,6 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
-        fn dynamic_int_lane(&mut self, ty: Type) -> Option<u32> {
-            if ty.is_dynamic_vector() && crate::machinst::ty_has_int_representation(ty.lane_type())
-            {
-                Some(ty.lane_bits())
-            } else {
-                None
-            }
-        }
-
-        #[inline]
-        fn dynamic_fp_lane(&mut self, ty: Type) -> Option<u32> {
-            if ty.is_dynamic_vector()
-                && crate::machinst::ty_has_float_or_vec_representation(ty.lane_type())
-            {
-                Some(ty.lane_bits())
-            } else {
-                None
-            }
-        }
-
-        #[inline]
         fn ty_dyn64_int(&mut self, ty: Type) -> Option<Type> {
             if ty.is_dynamic_vector() && ty.min_bits() == 64 && ty.lane_type().is_int() {
                 Some(ty)
@@ -484,8 +615,12 @@ macro_rules! isle_common_prelude_methods {
             }
         }
 
-        fn u64_from_ieee32(&mut self, val: Ieee32) -> u64 {
-            val.bits().into()
+        fn u16_from_ieee16(&mut self, val: Ieee16) -> u16 {
+            val.bits()
+        }
+
+        fn u32_from_ieee32(&mut self, val: Ieee32) -> u32 {
+            val.bits()
         }
 
         fn u64_from_ieee64(&mut self, val: Ieee64) -> u64 {
@@ -513,15 +648,15 @@ macro_rules! isle_common_prelude_methods {
         }
 
         fn trap_code_division_by_zero(&mut self) -> TrapCode {
-            TrapCode::IntegerDivisionByZero
+            TrapCode::INTEGER_DIVISION_BY_ZERO
         }
 
         fn trap_code_integer_overflow(&mut self) -> TrapCode {
-            TrapCode::IntegerOverflow
+            TrapCode::INTEGER_OVERFLOW
         }
 
         fn trap_code_bad_conversion_to_integer(&mut self) -> TrapCode {
-            TrapCode::BadConversionToInteger
+            TrapCode::BAD_CONVERSION_TO_INTEGER
         }
 
         fn nonzero_u64_from_imm64(&mut self, val: Imm64) -> Option<u64> {
@@ -537,10 +672,23 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
-        fn s32_add_fallible(&mut self, a: u32, b: u32) -> Option<u32> {
-            let a = a as i32;
-            let b = b as i32;
-            a.checked_add(b).map(|sum| sum as u32)
+        fn u32_sub(&mut self, a: u32, b: u32) -> u32 {
+            a.wrapping_sub(b)
+        }
+
+        #[inline]
+        fn u32_and(&mut self, a: u32, b: u32) -> u32 {
+            a & b
+        }
+
+        #[inline]
+        fn u32_shl(&mut self, x: u32, y: u32) -> u32 {
+            x << y
+        }
+
+        #[inline]
+        fn s32_add_fallible(&mut self, a: i32, b: i32) -> Option<i32> {
+            a.checked_add(b)
         }
 
         #[inline]
@@ -590,23 +738,8 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
-        fn simm32(&mut self, x: Imm64) -> Option<u32> {
-            let x64: i64 = x.into();
-            let x32: i32 = x64.try_into().ok()?;
-            Some(x32 as u32)
-        }
-
-        #[inline]
-        fn uimm8(&mut self, x: Imm64) -> Option<u8> {
-            let x64: i64 = x.into();
-            let x8: u8 = x64.try_into().ok()?;
-            Some(x8)
-        }
-
-        #[inline]
-        fn offset32(&mut self, x: Offset32) -> u32 {
-            let x: i32 = x.into();
-            x as u32
+        fn offset32(&mut self, x: Offset32) -> i32 {
+            x.into()
         }
 
         #[inline]
@@ -615,14 +748,52 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
+        fn u8_shl(&mut self, a: u8, b: u8) -> u8 {
+            a << b
+        }
+
+        #[inline]
+        fn u8_shr(&mut self, a: u8, b: u8) -> u8 {
+            a >> b
+        }
+
+        #[inline]
+        fn u8_sub(&mut self, a: u8, b: u8) -> u8 {
+            a.wrapping_sub(b)
+        }
+
+        #[inline]
         fn lane_type(&mut self, ty: Type) -> Type {
             ty.lane_type()
         }
 
         #[inline]
-        fn offset32_to_u32(&mut self, offset: Offset32) -> u32 {
-            let offset: i32 = offset.into();
-            offset as u32
+        fn ty_half_lanes(&mut self, ty: Type) -> Option<Type> {
+            if ty.lane_count() == 1 {
+                None
+            } else {
+                ty.lane_type().by(ty.lane_count() / 2)
+            }
+        }
+
+        #[inline]
+        fn ty_half_width(&mut self, ty: Type) -> Option<Type> {
+            ty.half_width()
+        }
+
+        #[inline]
+        fn ty_equal(&mut self, lhs: Type, rhs: Type) -> bool {
+            lhs == rhs
+        }
+
+        #[inline]
+        fn offset32_to_i32(&mut self, offset: Offset32) -> i32 {
+            offset.into()
+        }
+
+        #[inline]
+        fn i32_to_offset32(&mut self, offset: i32) -> Offset32 {
+            Offset32::new(offset)
         }
 
         fn range(&mut self, start: usize, end: usize) -> Range {
@@ -651,7 +822,7 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
-        fn signed_cond_code(&mut self, cc: &condcodes::IntCC) -> Option<condcodes::IntCC> {
+        fn signed_cond_code(&mut self, cc: &IntCC) -> Option<IntCC> {
             match cc {
                 IntCC::Equal
                 | IntCC::UnsignedGreaterThanOrEqual
@@ -667,23 +838,28 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
-        fn intcc_reverse(&mut self, cc: &IntCC) -> IntCC {
-            cc.reverse()
+        fn intcc_swap_args(&mut self, cc: &IntCC) -> IntCC {
+            cc.swap_args()
         }
 
         #[inline]
-        fn intcc_inverse(&mut self, cc: &IntCC) -> IntCC {
-            cc.inverse()
+        fn intcc_complement(&mut self, cc: &IntCC) -> IntCC {
+            cc.complement()
         }
 
         #[inline]
-        fn floatcc_reverse(&mut self, cc: &FloatCC) -> FloatCC {
-            cc.reverse()
+        fn intcc_without_eq(&mut self, x: &IntCC) -> IntCC {
+            x.without_equal()
         }
 
         #[inline]
-        fn floatcc_inverse(&mut self, cc: &FloatCC) -> FloatCC {
-            cc.inverse()
+        fn floatcc_swap_args(&mut self, cc: &FloatCC) -> FloatCC {
+            cc.swap_args()
+        }
+
+        #[inline]
+        fn floatcc_complement(&mut self, cc: &FloatCC) -> FloatCC {
+            cc.complement()
         }
 
         fn floatcc_unordered(&mut self, cc: &FloatCC) -> bool {
@@ -729,6 +905,256 @@ macro_rules! isle_common_prelude_methods {
         #[inline]
         fn pack_block_array_2(&mut self, a: BlockCall, b: BlockCall) -> BlockArray2 {
             [a, b]
+        }
+
+        fn u128_as_u64(&mut self, val: u128) -> Option<u64> {
+            u64::try_from(val).ok()
+        }
+
+        fn u64_as_u32(&mut self, val: u64) -> Option<u32> {
+            u32::try_from(val).ok()
+        }
+
+        fn u32_as_u16(&mut self, val: u32) -> Option<u16> {
+            val.try_into().ok()
+        }
+
+        fn i32_as_i8(&mut self, val: i32) -> Option<i8> {
+            val.try_into().ok()
+        }
+
+        fn u8_as_i8(&mut self, val: u8) -> i8 {
+            val as i8
+        }
+
+        fn u64_as_u8(&mut self, val: u64) -> u8 {
+            val as u8
+        }
+
+        fn u64_as_u16(&mut self, val: u64) -> u16 {
+            val as u16
+        }
+
+        fn u8_try_from_u64(&mut self, val: u64) -> Option<u8> {
+            u8::try_from(val).ok()
+        }
+
+        fn u8_try_from_i32(&mut self, val: i32) -> Option<u8> {
+            u8::try_from(val).ok()
+        }
+
+        fn u64_try_from_i64(&mut self, val: i64) -> Option<u64> {
+            u64::try_from(val).ok()
+        }
+
+        fn u16_try_from_u64(&mut self, val: u64) -> Option<u16> {
+            u16::try_from(val).ok()
+        }
+
+        fn u32_try_from_u64(&mut self, val: u64) -> Option<u32> {
+            u32::try_from(val).ok()
+        }
+
+        fn i8_try_from_u64(&mut self, val: u64) -> Option<i8> {
+            i8::try_from(val).ok()
+        }
+
+        fn i16_try_from_u64(&mut self, val: u64) -> Option<i16> {
+            i16::try_from(val).ok()
+        }
+
+        fn i32_try_from_u64(&mut self, val: u64) -> Option<i32> {
+            i32::try_from(val).ok()
+        }
+
+        fn u128_replicated_u64(&mut self, val: u128) -> Option<u64> {
+            let low64 = val as u64 as u128;
+            if (low64 | (low64 << 64)) == val {
+                Some(low64 as u64)
+            } else {
+                None
+            }
+        }
+
+        fn u64_replicated_u32(&mut self, val: u64) -> Option<u64> {
+            let low32 = val as u32 as u64;
+            if (low32 | (low32 << 32)) == val {
+                Some(low32)
+            } else {
+                None
+            }
+        }
+
+        fn u32_replicated_u16(&mut self, val: u64) -> Option<u64> {
+            let val = val as u32;
+            let low16 = val as u16 as u32;
+            if (low16 | (low16 << 16)) == val {
+                Some(low16.into())
+            } else {
+                None
+            }
+        }
+
+        fn u16_replicated_u8(&mut self, val: u64) -> Option<u8> {
+            let val = val as u16;
+            let low8 = val as u8 as u16;
+            if (low8 | (low8 << 8)) == val {
+                Some(low8 as u8)
+            } else {
+                None
+            }
+        }
+
+        fn f16_min(&mut self, a: Ieee16, b: Ieee16) -> Option<Ieee16> {
+            a.minimum(b).non_nan()
+        }
+
+        fn f16_max(&mut self, a: Ieee16, b: Ieee16) -> Option<Ieee16> {
+            a.maximum(b).non_nan()
+        }
+
+        fn f16_neg(&mut self, n: Ieee16) -> Ieee16 {
+            -n
+        }
+
+        fn f16_abs(&mut self, n: Ieee16) -> Ieee16 {
+            n.abs()
+        }
+
+        fn f16_copysign(&mut self, a: Ieee16, b: Ieee16) -> Ieee16 {
+            a.copysign(b)
+        }
+
+        fn f32_add(&mut self, lhs: Ieee32, rhs: Ieee32) -> Option<Ieee32> {
+            (lhs + rhs).non_nan()
+        }
+
+        fn f32_sub(&mut self, lhs: Ieee32, rhs: Ieee32) -> Option<Ieee32> {
+            (lhs - rhs).non_nan()
+        }
+
+        fn f32_mul(&mut self, lhs: Ieee32, rhs: Ieee32) -> Option<Ieee32> {
+            (lhs * rhs).non_nan()
+        }
+
+        fn f32_div(&mut self, lhs: Ieee32, rhs: Ieee32) -> Option<Ieee32> {
+            (lhs / rhs).non_nan()
+        }
+
+        fn f32_sqrt(&mut self, n: Ieee32) -> Option<Ieee32> {
+            n.sqrt().non_nan()
+        }
+
+        fn f32_ceil(&mut self, n: Ieee32) -> Option<Ieee32> {
+            n.ceil().non_nan()
+        }
+
+        fn f32_floor(&mut self, n: Ieee32) -> Option<Ieee32> {
+            n.floor().non_nan()
+        }
+
+        fn f32_trunc(&mut self, n: Ieee32) -> Option<Ieee32> {
+            n.trunc().non_nan()
+        }
+
+        fn f32_nearest(&mut self, n: Ieee32) -> Option<Ieee32> {
+            n.round_ties_even().non_nan()
+        }
+
+        fn f32_min(&mut self, a: Ieee32, b: Ieee32) -> Option<Ieee32> {
+            a.minimum(b).non_nan()
+        }
+
+        fn f32_max(&mut self, a: Ieee32, b: Ieee32) -> Option<Ieee32> {
+            a.maximum(b).non_nan()
+        }
+
+        fn f32_neg(&mut self, n: Ieee32) -> Ieee32 {
+            -n
+        }
+
+        fn f32_abs(&mut self, n: Ieee32) -> Ieee32 {
+            n.abs()
+        }
+
+        fn f32_copysign(&mut self, a: Ieee32, b: Ieee32) -> Ieee32 {
+            a.copysign(b)
+        }
+
+        fn f64_add(&mut self, lhs: Ieee64, rhs: Ieee64) -> Option<Ieee64> {
+            (lhs + rhs).non_nan()
+        }
+
+        fn f64_sub(&mut self, lhs: Ieee64, rhs: Ieee64) -> Option<Ieee64> {
+            (lhs - rhs).non_nan()
+        }
+
+        fn f64_mul(&mut self, lhs: Ieee64, rhs: Ieee64) -> Option<Ieee64> {
+            (lhs * rhs).non_nan()
+        }
+
+        fn f64_div(&mut self, lhs: Ieee64, rhs: Ieee64) -> Option<Ieee64> {
+            (lhs / rhs).non_nan()
+        }
+
+        fn f64_sqrt(&mut self, n: Ieee64) -> Option<Ieee64> {
+            n.sqrt().non_nan()
+        }
+
+        fn f64_ceil(&mut self, n: Ieee64) -> Option<Ieee64> {
+            n.ceil().non_nan()
+        }
+
+        fn f64_floor(&mut self, n: Ieee64) -> Option<Ieee64> {
+            n.floor().non_nan()
+        }
+
+        fn f64_trunc(&mut self, n: Ieee64) -> Option<Ieee64> {
+            n.trunc().non_nan()
+        }
+
+        fn f64_nearest(&mut self, n: Ieee64) -> Option<Ieee64> {
+            n.round_ties_even().non_nan()
+        }
+
+        fn f64_min(&mut self, a: Ieee64, b: Ieee64) -> Option<Ieee64> {
+            a.minimum(b).non_nan()
+        }
+
+        fn f64_max(&mut self, a: Ieee64, b: Ieee64) -> Option<Ieee64> {
+            a.maximum(b).non_nan()
+        }
+
+        fn f64_neg(&mut self, n: Ieee64) -> Ieee64 {
+            -n
+        }
+
+        fn f64_abs(&mut self, n: Ieee64) -> Ieee64 {
+            n.abs()
+        }
+
+        fn f64_copysign(&mut self, a: Ieee64, b: Ieee64) -> Ieee64 {
+            a.copysign(b)
+        }
+
+        fn f128_min(&mut self, a: Ieee128, b: Ieee128) -> Option<Ieee128> {
+            a.minimum(b).non_nan()
+        }
+
+        fn f128_max(&mut self, a: Ieee128, b: Ieee128) -> Option<Ieee128> {
+            a.maximum(b).non_nan()
+        }
+
+        fn f128_neg(&mut self, n: Ieee128) -> Ieee128 {
+            -n
+        }
+
+        fn f128_abs(&mut self, n: Ieee128) -> Ieee128 {
+            n.abs()
+        }
+
+        fn f128_copysign(&mut self, a: Ieee128, b: Ieee128) -> Ieee128 {
+            a.copysign(b)
         }
     };
 }

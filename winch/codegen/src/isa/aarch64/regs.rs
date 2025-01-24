@@ -3,15 +3,20 @@
 use crate::isa::reg::Reg;
 use regalloc2::{PReg, RegClass};
 
+/// FPR index bound.
+pub(crate) const MAX_FPR: u32 = 32;
+/// FPR index bound.
+pub(crate) const MAX_GPR: u32 = 32;
+
 /// Construct a X-register from an index.
 pub(crate) const fn xreg(num: u8) -> Reg {
-    assert!(num < 32);
+    assert!((num as u32) < MAX_GPR);
     Reg::new(PReg::new(num as usize, RegClass::Int))
 }
 
 /// Construct a V-register from an index.
 pub(crate) const fn vreg(num: u8) -> Reg {
-    assert!(num < 32);
+    assert!((num as u32) < MAX_FPR);
     Reg::new(PReg::new(num as usize, RegClass::Float))
 }
 
@@ -24,6 +29,11 @@ pub(crate) const fn ip0() -> Reg {
 /// Alias to the IP0 register.
 pub(crate) const fn scratch() -> Reg {
     ip0()
+}
+
+// Alias to register v31.
+pub(crate) const fn float_scratch() -> Reg {
+    vreg(31)
 }
 
 /// Scratch register.
@@ -50,6 +60,11 @@ pub(crate) const fn lr() -> Reg {
 /// Zero register.
 pub(crate) const fn zero() -> Reg {
     xreg(31)
+}
+
+/// The VM context register.
+pub(crate) const fn vmctx() -> Reg {
+    xreg(9)
 }
 
 /// Stack pointer register.
@@ -82,7 +97,7 @@ pub(crate) const fn sp() -> Reg {
 /// [MacroAssembler::move_sp_to_shadow_sp] function.
 ///
 /// This approach, requires copying the real stack pointer value into
-/// x28 everytime the real stack pointer moves, which involves
+/// x28 every time the real stack pointer moves, which involves
 /// emitting one more instruction. For example, this is generally how
 /// the real stack pointer and x28 will look like during a function:
 ///
@@ -125,13 +140,22 @@ pub(crate) const fn shadow_sp() -> Reg {
     xreg(28)
 }
 
-const NON_ALLOCATABLE_GPR: u32 = (1 << ip0().hw_enc())
+/// Bitmask for non-allocatable GPR.
+pub(crate) const NON_ALLOCATABLE_GPR: u32 = (1 << ip0().hw_enc())
     | (1 << ip1().hw_enc())
     | (1 << platform().hw_enc())
     | (1 << fp().hw_enc())
     | (1 << lr().hw_enc())
     | (1 << zero().hw_enc())
-    | (1 << shadow_sp().hw_enc());
+    | (1 << shadow_sp().hw_enc())
+    | (1 << vmctx().hw_enc());
 
 /// Bitmask to represent the available general purpose registers.
 pub(crate) const ALL_GPR: u32 = u32::MAX & !NON_ALLOCATABLE_GPR;
+
+/// Bitmask for non-allocatable FPR.
+/// All FPRs are allocatable, v0..=v7 are generally used for params and results.
+pub(crate) const NON_ALLOCATABLE_FPR: u32 = 1 << float_scratch().hw_enc();
+
+/// Bitmask to represent the available floating point registers.
+pub(crate) const ALL_FPR: u32 = u32::MAX & !NON_ALLOCATABLE_FPR;

@@ -2,8 +2,8 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::{fs::File, path::Path, time::Instant};
+use wasi_common::{sync::WasiCtxBuilder, WasiCtx};
 use wasmtime::{Engine, Linker, Module, Store, TypedFunc};
-use wasmtime_wasi::{sync::WasiCtxBuilder, WasiCtx};
 
 criterion_group!(benches, bench_wasi);
 criterion_main!(benches);
@@ -53,7 +53,7 @@ fn instantiate(wat: &[u8]) -> (Store<WasiCtx>, TypedFunc<u64, u64>) {
     let mut store = Store::new(&engine, wasi);
     let module = Module::new(&engine, wat).unwrap();
     let mut linker = Linker::new(&engine);
-    wasmtime_wasi::add_to_linker(&mut linker, |cx| cx).unwrap();
+    wasi_common::sync::add_to_linker(&mut linker, |cx| cx).unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let run = instance.get_typed_func(&mut store, "run").unwrap();
     (store, run)
@@ -61,26 +61,29 @@ fn instantiate(wat: &[u8]) -> (Store<WasiCtx>, TypedFunc<u64, u64>) {
 
 /// Build a WASI context with some actual data to retrieve.
 fn wasi_context() -> WasiCtx {
-    let wasi = WasiCtxBuilder::new();
-    wasi.envs(&[
-        ("a".to_string(), "b".to_string()),
-        ("b".to_string(), "c".to_string()),
-        ("c".to_string(), "d".to_string()),
-    ])
-    .unwrap()
-    .args(&[
-        "exe".to_string(),
-        "--flag1".to_string(),
-        "--flag2".to_string(),
-        "--flag3".to_string(),
-        "--flag4".to_string(),
-    ])
-    .unwrap()
-    .preopened_dir(
-        wasmtime_wasi::Dir::open_ambient_dir("benches/wasi", wasmtime_wasi::ambient_authority())
+    WasiCtxBuilder::new()
+        .envs(&[
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "c".to_string()),
+            ("c".to_string(), "d".to_string()),
+        ])
+        .unwrap()
+        .args(&[
+            "exe".to_string(),
+            "--flag1".to_string(),
+            "--flag2".to_string(),
+            "--flag3".to_string(),
+            "--flag4".to_string(),
+        ])
+        .unwrap()
+        .preopened_dir(
+            wasi_common::sync::Dir::open_ambient_dir(
+                "benches/wasi",
+                wasi_common::sync::ambient_authority(),
+            )
             .unwrap(),
-        "/",
-    )
-    .unwrap()
-    .build()
+            "/",
+        )
+        .unwrap()
+        .build()
 }

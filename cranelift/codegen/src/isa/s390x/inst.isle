@@ -372,12 +372,6 @@
       (rd Reg)
       (mem MemArg))
 
-    ;; A memory copy of 1-256 bytes.
-    (Mvc
-      (dst MemArgPair)
-      (src MemArgPair)
-      (len_minus_one u8))
-
     ;; A load-multiple instruction.
     (LoadMultiple64
       (rt WritableReg)
@@ -887,6 +881,10 @@
       (rn Reg)
       (lane_imm u8))
 
+    ;; Allocate stack space for outgoing tail-call arguments.
+    (AllocateArgs
+      (size u32))
+
     ;; A machine call instruction.
     (Call
       (link WritableReg)
@@ -896,17 +894,28 @@
     (CallInd
       (link WritableReg)
       (info BoxCallIndInfo))
-    
+
+    ;; A machine tail call instruction.
+    (ReturnCall
+      (info BoxReturnCallInfo))
+
+    ;; A machine indirect tail call instruction.
+    (ReturnCallInd
+      (info BoxReturnCallIndInfo))
+
     ;; A pseudo-instruction that captures register arguments in vregs.
     (Args
       (args VecArgPair))
+
+    ;; A pseudo-instruction that moves vregs to return registers.
+    (Rets
+      (rets VecRetPair))
 
     ;; ---- branches (exactly one must appear at end of BB) ----
 
     ;; A machine return instruction.
     (Ret
-      (link Reg)
-      (rets VecRetPair))
+      (link Reg))
 
     ;; An unconditional branch.
     (Jump
@@ -933,21 +942,6 @@
       (cond Cond)
       (trap_code TrapCode))
 
-    ;; A one-way conditional branch, invisible to the CFG processing; used *only* as part of
-    ;; straight-line sequences in code to be emitted.
-    ;;
-    ;; In more detail:
-    ;; - This branch is lowered to a branch at the machine-code level, but does not end a basic
-    ;;   block, and does not create edges in the CFG seen by regalloc.
-    ;; - Thus, it is *only* valid to use as part of a single-in, single-out sequence that is
-    ;;   lowered from a single CLIF instruction. For example, certain arithmetic operations may
-    ;;   use these branches to handle certain conditions, such as overflows, traps, etc.
-    ;;
-    ;; See, e.g., the lowering of `trapif` (conditional trap) for an example.
-    (OneWayCondBr
-      (target MachLabel)
-      (cond Cond))
-
     ;; An indirect branch through a register, augmented with set of all
     ;; possible successors.
     (IndirectBr
@@ -965,8 +959,20 @@
     ;; Jump-table sequence, as one compound instruction (see note in lower.rs
     ;; for rationale).
     (JTSequence
+      ;; The index into the list of targets.
       (ridx Reg)
-      (targets VecMachLabel))
+      ;; The default target.
+      (default MachLabel)
+      ;; The condition for taking the default target, based on flags
+      ;; when this instruction executes.
+      (default_cond Cond)
+      ;; All other targets.
+      (targets BoxVecMachLabel))
+
+    ;; Stack probe loop sequence, as one compound instruction.
+    (StackProbeLoop
+      (probe_count WritableReg)
+      (guard_size i16))
 
     ;; Load an inline symbol reference with relocation.
     (LoadSymbolReloc
@@ -991,11 +997,6 @@
     (CondBreak
       (cond Cond))
 
-    ;; Marker, no-op in generated code SP "virtual offset" is adjusted. This
-    ;; controls how MemArg::NominalSPOffset args are lowered.
-    (VirtualSPOffsetAdj
-      (offset i64))
-
     ;; Pseudoinstruction to keep a value alive.
     (DummyUse
      (reg Reg))
@@ -1004,12 +1005,22 @@
     ;; machine at this program point.
     (Unwind
       (inst UnwindInst))
+
+    ;; Pseudo-instruction used for `tls_value` to call the libcall of the same
+    ;; name.
+    (ElfTlsGetOffset
+      (tls_offset WritableReg)
+      (got Reg)
+      (got_offset Reg)
+      (symbol BoxSymbolReloc))
 ))
 
 ;; Primitive types used in instruction formats.
 
 (type BoxCallInfo (primitive BoxCallInfo))
 (type BoxCallIndInfo (primitive BoxCallIndInfo))
+(type BoxReturnCallInfo (primitive BoxReturnCallInfo))
+(type BoxReturnCallIndInfo (primitive BoxReturnCallIndInfo))
 (type BoxJTSequenceInfo (primitive BoxJTSequenceInfo))
 (type VecMachLabel extern (enum))
 
@@ -1446,10 +1457,6 @@
 (decl vxrs_ext2_disabled () Type)
 (extern extractor vxrs_ext2_disabled vxrs_ext2_disabled)
 
-(decl allow_div_traps () Type)
-(extern extractor allow_div_traps allow_div_traps)
-
-
 ;; Helpers for SIMD lane number operations ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; There are two ways to map vector types onto the SIMD vector registers
@@ -1481,10 +1488,10 @@
 
 ;; Check whether two lane order values are equal.
 (decl pure lane_order_equal (LaneOrder LaneOrder) bool)
-(rule (lane_order_equal (LaneOrder.LittleEndian) (LaneOrder.LittleEndian)) $true)
-(rule (lane_order_equal (LaneOrder.LittleEndian) (LaneOrder.BigEndian)) $false)
-(rule (lane_order_equal (LaneOrder.BigEndian) (LaneOrder.LittleEndian)) $false)
-(rule (lane_order_equal (LaneOrder.BigEndian) (LaneOrder.BigEndian)) $true)
+(rule (lane_order_equal (LaneOrder.LittleEndian) (LaneOrder.LittleEndian)) true)
+(rule (lane_order_equal (LaneOrder.LittleEndian) (LaneOrder.BigEndian)) false)
+(rule (lane_order_equal (LaneOrder.BigEndian) (LaneOrder.LittleEndian)) false)
+(rule (lane_order_equal (LaneOrder.BigEndian) (LaneOrder.BigEndian)) true)
 
 ;; Return lane order matching memory byte order.
 (decl pure lane_order_from_memflags (MemFlags) LaneOrder)
@@ -1523,7 +1530,7 @@
 (extern extractor vr128_ty vr128_ty)
 
 
-;; Helpers for various immmediate constants ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Helpers for various immediate constants ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Special integer types and their constructors
 
@@ -1540,11 +1547,6 @@
 (decl pure partial i64_nonequal (i64 i64) i64)
 (extern constructor i64_nonequal i64_nonequal)
 
-(decl pure partial i64_nonzero (i64) i64)
-(rule (i64_nonzero x)
-      (if (i64_nonequal x 0))
-      x)
-
 (decl pure partial i64_not_neg1 (i64) i64)
 (rule (i64_not_neg1 x)
       (if (i64_nonequal x -1))
@@ -1555,8 +1557,8 @@
 (decl u8_as_u16 (u8) u16)
 (extern constructor u8_as_u16 u8_as_u16)
 
-(decl u64_as_u32 (u64) u32)
-(extern constructor u64_as_u32 u64_as_u32)
+(decl u64_truncate_to_u32 (u64) u32)
+(extern constructor u64_truncate_to_u32 u64_truncate_to_u32)
 
 (decl u64_as_i16 (u64) i16)
 (extern constructor u64_as_i16 u64_as_i16)
@@ -1739,15 +1741,6 @@
 (extern extractor unsigned unsigned)
 
 
-;; Helpers for machine label vectors ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(decl vec_length_minus1 (VecMachLabel) u32)
-(extern constructor vec_length_minus1 vec_length_minus1)
-
-(decl vec_element (VecMachLabel u8) MachLabel)
-(extern constructor vec_element vec_element)
-
-
 ;; Helpers for memory arguments ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Accessors for `Offset32`.
@@ -1788,14 +1781,9 @@
 (decl memarg_got () MemArg)
 (extern constructor memarg_got memarg_got)
 
-;; Create a MemArg refering to a stack address formed by
-;; adding a base (relative to SP) and an offset.
-(decl memarg_stack_off (i64 i64) MemArg)
-(extern constructor memarg_stack_off memarg_stack_off)
-
-;; Create a `MemArg` referring to an offset from the initial SP.
-(decl memarg_initial_sp_offset (i64) MemArg)
-(extern constructor memarg_initial_sp_offset memarg_initial_sp_offset)
+;; Add an offset to a virtual MemArg.
+(decl memarg_offset (MemArg i64) MemArg)
+(extern constructor memarg_offset memarg_offset)
 
 ;; Form the sum of two offset values, and check that the result is
 ;; a valid `MemArg::Symbol` offset (i.e. is even and fits into i32).
@@ -1807,14 +1795,22 @@
 (rule (memarg_symbol_offset x)
       (memarg_symbol_offset_sum x 0))
 
+;; Create a MemArg referring to the saved frame pointer location.
+(decl memarg_frame_pointer_offset () MemArg)
+(extern constructor memarg_frame_pointer_offset memarg_frame_pointer_offset)
+
+;; Create a MemArg referring to the saved return address location.
+(decl memarg_return_address_offset () MemArg)
+(extern constructor memarg_return_address_offset memarg_return_address_offset)
+
 ;; Lower an address into a `MemArg`.
 
 (decl lower_address (MemFlags Value Offset32) MemArg)
 
-(rule (lower_address flags addr (i64_from_offset offset))
+(rule (lower_address flags addr @ (value_type (ty_addr64 _)) (i64_from_offset offset))
       (memarg_reg_plus_off addr offset 0 flags))
 
-(rule 1 (lower_address flags (iadd x y) (i64_from_offset 0))
+(rule 1 (lower_address flags (has_type (ty_addr64 _) (iadd x y)) (i64_from_offset 0))
       (memarg_reg_plus_reg x y 0 flags))
 
 (rule 1 (lower_address flags
@@ -1828,10 +1824,10 @@
 
 (decl lower_address_bias (MemFlags Value Offset32 u8) MemArg)
 
-(rule (lower_address_bias flags addr (i64_from_offset offset) bias)
+(rule (lower_address_bias flags addr @ (value_type $I64) (i64_from_offset offset) bias)
       (memarg_reg_plus_off addr offset bias flags))
 
-(rule 1 (lower_address_bias flags (iadd x y) (i64_from_offset 0) bias)
+(rule 1 (lower_address_bias flags (has_type $I64 (iadd x y)) (i64_from_offset 0) bias)
       (memarg_reg_plus_reg x y bias flags))
 
 
@@ -1852,25 +1848,6 @@
           inst)
       (if (memarg_symbol_offset_sum sym_offset load_offset))
       inst)
-
-
-;; Accessors for `MemArgPair`.
-
-(type MemArgPair extern (enum))
-
-;; Convert a MemArg to a MemArgPair, reloading the address if necessary.
-(decl memarg_pair (MemArg) MemArgPair)
-(rule 1 (memarg_pair (memarg_pair_from_memarg mem)) mem)
-(rule (memarg_pair mem) (memarg_pair_from_reg
-                          (load_addr mem) (memarg_flags mem)))
-
-;; Convert a MemArg to a MemArgPair if no reloading is necessary.
-(decl memarg_pair_from_memarg (MemArgPair) MemArg)
-(extern extractor memarg_pair_from_memarg memarg_pair_from_memarg)
-
-;; Create a MemArgPair from a single base register.
-(decl memarg_pair_from_reg (Reg MemFlags) MemArgPair)
-(extern constructor memarg_pair_from_reg memarg_pair_from_reg)
 
 
 ;; Helpers for stack-slot addresses ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -2314,11 +2291,6 @@
 (rule (storerev64 src addr)
       (SideEffectNoResult.Inst (MInst.StoreRev64 src addr)))
 
-;; Helper for emitting `MInst.Mvc` instructions.
-(decl mvc (MemArgPair MemArgPair u8) SideEffectNoResult)
-(rule (mvc dst src len_minus_one)
-      (SideEffectNoResult.Inst (MInst.Mvc dst src len_minus_one)))
-
 ;; Helper for emitting `MInst.LoadAR` instructions.
 (decl load_ar (u8) Reg)
 (rule (load_ar ar)
@@ -2702,6 +2674,16 @@
 (rule (call_ind_impl reg info)
       (SideEffectNoResult.Inst (MInst.CallInd reg info)))
 
+;; Helper for emitting `MInst.ReturnCall` instructions.
+(decl return_call_impl (BoxReturnCallInfo) SideEffectNoResult)
+(rule (return_call_impl info)
+      (SideEffectNoResult.Inst (MInst.ReturnCall info)))
+
+;; Helper for emitting `MInst.ReturnCallInd` instructions.
+(decl return_call_ind_impl (BoxReturnCallIndInfo) SideEffectNoResult)
+(rule (return_call_ind_impl info)
+      (SideEffectNoResult.Inst (MInst.ReturnCallInd info)))
+
 ;; Helper for emitting `MInst.Jump` instructions.
 (decl jump_impl (MachLabel) SideEffectNoResult)
 (rule (jump_impl target)
@@ -2712,16 +2694,18 @@
 (rule (cond_br taken not_taken cond)
       (ConsumesFlags.ConsumesFlagsSideEffect (MInst.CondBr taken not_taken cond)))
 
-;; Helper for emitting `MInst.OneWayCondBr` instructions.
-(decl oneway_cond_br (MachLabel Cond) ConsumesFlags)
-(rule (oneway_cond_br dest cond)
-      (ConsumesFlags.ConsumesFlagsSideEffect (MInst.OneWayCondBr dest cond)))
-
 ;; Helper for emitting `MInst.JTSequence` instructions.
-(decl jt_sequence (Reg VecMachLabel) SideEffectNoResult)
-(rule (jt_sequence ridx targets)
-      (SideEffectNoResult.Inst (MInst.JTSequence ridx targets)))
+(decl jt_sequence (Reg MachLabel Cond BoxVecMachLabel) ConsumesFlags)
+(rule (jt_sequence ridx default default_cond targets)
+      (ConsumesFlags.ConsumesFlagsSideEffect (MInst.JTSequence ridx default default_cond targets)))
 
+;; Emit a jump-table sequence based on a boolean condition for the
+;; default label.
+(decl jt_sequence_default_bool (Reg MachLabel ProducesBool BoxVecMachLabel) SideEffectNoResult)
+(rule (jt_sequence_default_bool ridx default (ProducesBool.ProducesBool default_producer default_cond) targets)
+      (with_flags_side_effect
+       default_producer
+       (jt_sequence ridx default default_cond targets)))
 
 ;; Helpers for instruction sequences ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -2858,7 +2842,6 @@
 (rule (arg_store $I16 reg mem) (store16 reg mem))
 (rule (arg_store $I32 reg mem) (store32 reg mem))
 (rule (arg_store $I64 reg mem) (store64 reg mem))
-(rule (arg_store $R64 reg mem) (store64 reg mem))
 (rule (arg_store $F32 reg mem) (vec_store_lane $F32X4 reg mem 0))
 (rule (arg_store $F64 reg mem) (vec_store_lane $F64X2 reg mem 0))
 (rule -1 (arg_store (vr128_ty ty) reg mem) (vec_store reg mem))
@@ -2868,7 +2851,6 @@
 (rule (arg_load $I16 mem) (zext32_mem $I16 mem))
 (rule (arg_load $I32 mem) (load32 mem))
 (rule (arg_load $I64 mem) (load64 mem))
-(rule (arg_load $R64 mem) (load64 mem))
 (rule (arg_load $F32 mem) (vec_load_lane_undef $F32X4 mem 0))
 (rule (arg_load $F64 mem) (vec_load_lane_undef $F64X2 mem 0))
 (rule -1 (arg_load (vr128_ty ty) mem) (vec_load ty mem))
@@ -2887,54 +2869,39 @@
       (let ((rev Reg (vec_permute_dw_imm $I64X2 reg 1 reg 0)))
         (vec_rot_imm $I16X8 (vec_rot_imm $I32X4 (vec_rot_imm $I64X2 rev 32) 16) 8)))
 
-;; When passing a vector value in register to a function whose ABI uses
-;; a different lane order than the current function, we need to swap lanes.
+;; When passing a vector value to a function whose ABI uses a different
+;; lane order than the current function, we need to swap lanes.
 ;; The first operand is the lane order used by the callee.
 (decl abi_vec_elt_rev (LaneOrder Type Reg) Reg)
-(rule 4 (abi_vec_elt_rev _ (gpr32_ty ty) reg) reg)
-(rule 3 (abi_vec_elt_rev _ (gpr64_ty ty) reg) reg)
+(rule 5 (abi_vec_elt_rev _ (gpr32_ty ty) reg) reg)
+(rule 4 (abi_vec_elt_rev _ (gpr64_ty ty) reg) reg)
+(rule 3 (abi_vec_elt_rev _ $I128 reg) reg)
 (rule 2 (abi_vec_elt_rev _ (ty_scalar_float ty) reg) reg)
 (rule 0 (abi_vec_elt_rev callee_lane_order _ reg)
-      (if-let $true (lane_order_equal callee_lane_order (lane_order)))
+      (if-let true (lane_order_equal callee_lane_order (lane_order)))
       reg)
-(rule 1 (abi_vec_elt_rev callee_lane_order (vr128_ty ty) reg)
-      (if-let $false (lane_order_equal callee_lane_order (lane_order)))
+(rule 1 (abi_vec_elt_rev callee_lane_order (ty_vec128 ty) reg)
+      (if-let false (lane_order_equal callee_lane_order (lane_order)))
       (vec_elt_rev ty reg))
 
-;; Helpers to emit a memory copy (MVC or memcpy libcall).
-(decl memcpy (MemArg MemArg u64) SideEffectNoResult)
-(rule 1 (memcpy dst src (len_minus_one len))
-      (mvc (memarg_pair dst) (memarg_pair src) len))
-(rule (memcpy dst src len)
-      (let ((libcall LibCallInfo (lib_call_info_memcpy (load_addr dst) (load_addr src) (imm $I64 len)))
-            (_ Unit (lib_accumulate_outgoing_args_size libcall)))
-        (lib_call libcall)))
-
 ;; Prepare a stack copy of a single (oversized) argument.
-(decl copy_to_buffer (i64 ABIArg Value) InstOutput)
+(decl copy_to_buffer (MemArg ABIArg Value) InstOutput)
 (rule 2 (copy_to_buffer base (abi_arg_only_slot slot) _) (output_none))
-(rule 1 (copy_to_buffer base (abi_arg_struct_pointer _ offset size) val)
-      (let ((dst MemArg (memarg_stack_off base offset))
-            (src MemArg (memarg_reg_plus_off val 0 0 (memflags_trusted))))
-        (side_effect (memcpy dst src size))))
 (rule 0 (copy_to_buffer base (abi_arg_implicit_pointer _ offset ty)
                       val @ (value_type ty))
-      (side_effect (arg_store ty val (memarg_stack_off base offset))))
+      (side_effect (arg_store ty val (memarg_offset base offset))))
 
 ;; Copy a single argument/return value to its slots.
 ;; For oversized arguments, set the slot to the buffer address.
-(decl copy_to_arg (CallArgListBuilder LaneOrder i64 ABIArg Value) InstOutput)
+(decl copy_to_arg (CallArgListBuilder LaneOrder MemArg ABIArg Value) InstOutput)
 (rule 2 (copy_to_arg uses lo base (abi_arg_only_slot slot) val)
       (copy_reg_to_arg_slot uses lo base slot (prepare_arg_val slot val)))
-(rule 1 (copy_to_arg uses lo base (abi_arg_struct_pointer slot offset _) _)
-      (let ((ptr Reg (load_addr (memarg_stack_off base offset))))
-        (copy_reg_to_arg_slot uses lo base slot ptr)))
 (rule 0 (copy_to_arg uses lo base (abi_arg_implicit_pointer slot offset _) _)
-      (let ((ptr Reg (load_addr (memarg_stack_off base offset))))
+      (let ((ptr Reg (load_addr (memarg_offset base offset))))
         (copy_reg_to_arg_slot uses lo base slot ptr)))
 
 ;; Copy a single argument/return value from its slots.
-(decl copy_from_arg (CallRetList LaneOrder i64 ABIArg) ValueRegs)
+(decl copy_from_arg (CallRetList LaneOrder MemArg ABIArg) ValueRegs)
 (rule (copy_from_arg defs lo base (abi_arg_only_slot slot))
       (value_reg (copy_reg_from_arg_slot defs lo base slot)))
 
@@ -2942,8 +2909,6 @@
 ;; Copy reference values into registers of integer type.
 ;; Zero- or sign-extend as required by the ABI.
 (decl prepare_arg_val (ABIArgSlot Value) Reg)
-(rule 1 (prepare_arg_val (ABIArgSlot.Reg _ $R64 (ArgumentExtension.None)) val)
-        (copy_reg $I64 val))
 (rule (prepare_arg_val (ABIArgSlot.Reg _ _ (ArgumentExtension.None)) val)
       val)
 (rule (prepare_arg_val (ABIArgSlot.Reg _ _ (ArgumentExtension.Uext)) val)
@@ -2959,19 +2924,21 @@
 
 ;; Copy one component of an argument/return value to its slot, where the
 ;; value is already extended and present in a register.
-(decl copy_reg_to_arg_slot (CallArgListBuilder LaneOrder i64 ABIArgSlot Reg) InstOutput)
+(decl copy_reg_to_arg_slot (CallArgListBuilder LaneOrder MemArg ABIArgSlot Reg) InstOutput)
 (rule (copy_reg_to_arg_slot uses lo _ (ABIArgSlot.Reg reg ty ext) src)
       (let ((_ Unit (args_builder_push uses (abi_vec_elt_rev lo ty src) reg)))
         (output_none)))
-(rule (copy_reg_to_arg_slot _ _ base (ABIArgSlot.Stack offset ty ext) src)
-      (side_effect (arg_store (abi_ext_ty ext ty) src (memarg_stack_off base offset))))
+(rule (copy_reg_to_arg_slot _ lo base (ABIArgSlot.Stack offset ty ext) src)
+      (side_effect (arg_store (abi_ext_ty ext ty) (abi_vec_elt_rev lo ty src)
+                              (memarg_offset base offset))))
 
 ;; Copy one component of an argument/return value from its slot.
-(decl copy_reg_from_arg_slot (CallRetList LaneOrder i64 ABIArgSlot) Reg)
+(decl copy_reg_from_arg_slot (CallRetList LaneOrder MemArg ABIArgSlot) Reg)
 (rule (copy_reg_from_arg_slot defs lo _ (ABIArgSlot.Reg reg ty ext))
       (abi_vec_elt_rev lo ty (defs_lookup defs reg)))
-(rule (copy_reg_from_arg_slot _ _ base (ABIArgSlot.Stack offset ty ext))
-      (arg_load (abi_ext_ty ext ty) (memarg_stack_off base offset)))
+(rule (copy_reg_from_arg_slot _ lo base (ABIArgSlot.Stack offset ty ext))
+      (abi_vec_elt_rev lo ty (arg_load (abi_ext_ty ext ty)
+                                       (memarg_offset base offset))))
 
 ;; Helper to compute the type of an implicitly extended argument/return value.
 (decl abi_ext_ty (ArgumentExtension Type) Type)
@@ -2992,7 +2959,7 @@
         dst))
 
 ;; 32-bit result type, value fits in i16
-(rule 6 (imm (gpr32_ty ty) (i16_from_u64 n))
+(rule 6 (imm (gpr32_ty ty) (u32_pair _ (i16_from_u32 n)))
       (let ((dst WritableReg (temp_writable_reg ty))
             (_ Unit (emit (MInst.Mov32SImm16 dst n))))
         dst))
@@ -3000,7 +2967,7 @@
 ;; 32-bit result type, any value
 (rule 5 (imm (gpr32_ty ty) n)
       (let ((dst WritableReg (temp_writable_reg ty))
-            (_ Unit (emit (MInst.Mov32Imm dst (u64_as_u32 n)))))
+            (_ Unit (emit (MInst.Mov32Imm dst (u64_truncate_to_u32 n)))))
         dst))
 
 ;; 64-bit result type, value fits in i16
@@ -3051,7 +3018,7 @@
 ;; TODO: use LZER to load 0.0
 (rule 8 (imm $F32 n)
       (let ((dst WritableReg (temp_writable_reg $F32))
-            (_ Unit (emit (MInst.LoadFpuConst32 dst (u64_as_u32 n)))))
+            (_ Unit (emit (MInst.LoadFpuConst32 dst (u64_truncate_to_u32 n)))))
         dst))
 
 ;; 64-bit floating-point type, any value.  Loaded from literal pool.
@@ -3120,28 +3087,28 @@
 (decl zext32_reg (Type Reg) Reg)
 (rule (zext32_reg ty src)
       (let ((dst WritableReg (temp_writable_reg $I32))
-            (_ Unit (emit (MInst.Extend dst src $false (ty_bits ty) 32))))
+            (_ Unit (emit (MInst.Extend dst src false (ty_bits ty) 32))))
         dst))
 
 ;; Sign-extend a register from a smaller `Type` into a 32-bit register.
 (decl sext32_reg (Type Reg) Reg)
 (rule (sext32_reg ty src)
       (let ((dst WritableReg (temp_writable_reg $I32))
-            (_ Unit (emit (MInst.Extend dst src $true (ty_bits ty) 32))))
+            (_ Unit (emit (MInst.Extend dst src true (ty_bits ty) 32))))
         dst))
 
 ;; Zero-extend a register from a smaller `Type` into a 64-bit register.
 (decl zext64_reg (Type Reg) Reg)
 (rule (zext64_reg ty src)
       (let ((dst WritableReg (temp_writable_reg $I64))
-            (_ Unit (emit (MInst.Extend dst src $false (ty_bits ty) 64))))
+            (_ Unit (emit (MInst.Extend dst src false (ty_bits ty) 64))))
         dst))
 
 ;; Sign-extend a register from a smaller `Type` into a 64-bit register.
 (decl sext64_reg (Type Reg) Reg)
 (rule (sext64_reg ty src)
       (let ((dst WritableReg (temp_writable_reg $I64))
-            (_ Unit (emit (MInst.Extend dst src $true (ty_bits ty) 64))))
+            (_ Unit (emit (MInst.Extend dst src true (ty_bits ty) 64))))
         dst))
 
 
@@ -3385,11 +3352,6 @@
 (rule (cond_br_bool (ProducesBool.ProducesBool producer cond) taken not_taken)
       (with_flags_side_effect producer (cond_br taken not_taken cond)))
 
-;; Emit a one-way conditional branch based on a boolean condition.
-(decl oneway_cond_br_bool (ProducesBool MachLabel) SideEffectNoResult)
-(rule (oneway_cond_br_bool (ProducesBool.ProducesBool producer cond) dest)
-      (with_flags_side_effect producer (oneway_cond_br dest cond)))
-
 ;; Emit a conditional trap based on a boolean condition.
 (decl trap_if_bool (ProducesBool TrapCode) SideEffectNoResult)
 (rule (trap_if_bool (ProducesBool.ProducesBool producer cond) trap_code)
@@ -3419,7 +3381,8 @@
 ;; subword loops) to "casloop_rotate_result".
 (decl casloop_emit (VecMInstBuilder Type MemFlags Reg Reg) PReg)
 (rule (casloop_emit ib ty flags aligned_addr val)
-      (let (;; Construct a memory argument for the aligned word.
+      (let (
+            ;; Construct a memory argument for the aligned word.
             (aligned_mem MemArg (memarg_reg_plus_off aligned_addr 0 0 flags))
             ;; Add the compare-and-swap instruction to the builder.
             (result Reg (push_atomic_cas ib (ty_ext32 ty)
@@ -3473,7 +3436,7 @@
 ;; Push an instruction sequence to rotate a value loaded from memory
 ;; to the well-defined location: the high bytes in case of a big-endian
 ;; memory operation, and the low bytes in the little-endian case.
-;; (This is somewhat arbitary but chosen to allow the most efficient
+;; (This is somewhat arbitrary but chosen to allow the most efficient
 ;; sequences to compute the various atomic operations.)
 ;; Note that $I8 accesses always use the big-endian case.
 (decl casloop_rotate_in (VecMInstBuilder Type MemFlags Reg Reg) Reg)
@@ -3521,9 +3484,6 @@
 
 ;; Helpers for generating `call` instructions ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; List of argument registers for a call instruction.
-(type CallArgList extern (enum))
-
 ;; Partial (mutable) argument list in the process of being created.
 (type CallArgListBuilder extern (enum))
 
@@ -3556,49 +3516,48 @@
 (decl abi_first_ret (SigRef Sig) usize)
 (extern constructor abi_first_ret abi_first_ret)
 
-(decl abi_call_info (Sig ExternalName CallArgList CallRetList Opcode) BoxCallInfo)
+(decl abi_call_info (Sig ExternalName CallArgList CallRetList) BoxCallInfo)
 (extern constructor abi_call_info abi_call_info)
 
-(decl abi_call_ind_info (Sig Reg CallArgList CallRetList Opcode) BoxCallIndInfo)
+(decl abi_call_ind_info (Sig Reg CallArgList CallRetList) BoxCallIndInfo)
 (extern constructor abi_call_ind_info abi_call_ind_info)
+
+(decl abi_return_call_info (Sig ExternalName CallArgList) BoxReturnCallInfo)
+(extern constructor abi_return_call_info abi_return_call_info)
+
+(decl abi_return_call_ind_info (Sig Reg CallArgList) BoxReturnCallIndInfo)
+(extern constructor abi_return_call_ind_info abi_return_call_ind_info)
+
+(decl abi_call_stack_args (Sig) MemArg)
+(extern constructor abi_call_stack_args abi_call_stack_args)
+
+(decl abi_call_stack_rets (Sig) MemArg)
+(extern constructor abi_call_stack_rets abi_call_stack_rets)
+
+(decl abi_return_call_stack_args (Sig) MemArg)
+(extern constructor abi_return_call_stack_args abi_return_call_stack_args)
 
 (decl writable_link_reg () WritableReg)
 (rule (writable_link_reg) (writable_gpr 14))
 
-(decl abi_call (Sig ExternalName CallArgList CallRetList Opcode) SideEffectNoResult)
-(rule (abi_call abi name uses defs opcode)
-      (call_impl (writable_link_reg) (abi_call_info abi name uses defs opcode)))
+(decl abi_call (Sig ExternalName CallArgList CallRetList) SideEffectNoResult)
+(rule (abi_call abi name uses defs)
+      (call_impl (writable_link_reg) (abi_call_info abi name uses defs)))
 
-(decl abi_call_ind (Sig Reg CallArgList CallRetList Opcode) SideEffectNoResult)
-(rule (abi_call_ind abi target uses defs opcode)
-      (call_ind_impl (writable_link_reg) (abi_call_ind_info abi target uses defs opcode)))
+(decl abi_call_ind (Sig Reg CallArgList CallRetList) SideEffectNoResult)
+(rule (abi_call_ind abi target uses defs)
+      (call_ind_impl (writable_link_reg) (abi_call_ind_info abi target uses defs)))
 
-(decl abi_accumulate_outgoing_args_size (Sig) Unit)
-(extern constructor abi_accumulate_outgoing_args_size abi_accumulate_outgoing_args_size)
+(decl abi_return_call (Sig ExternalName CallArgList) SideEffectNoResult)
+(rule (abi_return_call abi name uses)
+      (return_call_impl (abi_return_call_info abi name uses)))
+
+(decl abi_return_call_ind (Sig Reg CallArgList) SideEffectNoResult)
+(rule (abi_return_call_ind abi target uses)
+      (return_call_ind_impl (abi_return_call_ind_info abi target uses)))
 
 (decl abi_lane_order (Sig) LaneOrder)
 (extern constructor abi_lane_order abi_lane_order)
-
-
-;; Helpers for generating calls to library routines ;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(type LibCallInfo extern (enum))
-
-(decl lib_call_info_memcpy (Reg Reg Reg) LibCallInfo)
-(extern constructor lib_call_info_memcpy lib_call_info_memcpy)
-
-(decl lib_call_info_tls_get_offset (WritableReg Reg Reg SymbolReloc) LibCallInfo)
-(extern constructor lib_call_info_tls_get_offset lib_call_info_tls_get_offset)
-
-(decl lib_call_info (LibCallInfo) BoxCallInfo)
-(extern constructor lib_call_info lib_call_info)
-
-(decl lib_call (LibCallInfo) SideEffectNoResult)
-(rule (lib_call libcall)
-      (call_impl (writable_link_reg) (lib_call_info libcall)))
-
-(decl lib_accumulate_outgoing_args_size (LibCallInfo) Unit)
-(extern constructor lib_accumulate_outgoing_args_size lib_accumulate_outgoing_args_size)
 
 
 ;; Helpers for generating vector pack and unpack instructions ;;;;;;;;;;;;;;;;;;

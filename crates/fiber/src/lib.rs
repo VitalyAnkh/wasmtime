@@ -1,11 +1,22 @@
-use std::any::Any;
-use std::cell::Cell;
-use std::io;
-use std::marker::PhantomData;
-use std::panic::{self, AssertUnwindSafe};
+#![expect(clippy::allow_attributes, reason = "crate not migrated yet")]
+#![no_std]
+
+#[cfg(any(feature = "std", unix, windows))]
+#[macro_use]
+extern crate std;
+extern crate alloc;
+
+use alloc::boxed::Box;
+use anyhow::Error;
+use core::cell::Cell;
+use core::marker::PhantomData;
+use core::ops::Range;
 
 cfg_if::cfg_if! {
-    if #[cfg(windows)] {
+    if #[cfg(not(feature = "std"))] {
+        mod nostd;
+        use nostd as imp;
+    } else if #[cfg(windows)] {
         mod windows;
         use windows as imp;
     } else if #[cfg(unix)] {
@@ -16,38 +27,102 @@ cfg_if::cfg_if! {
     }
 }
 
+// Our own stack switcher routines are used on Unix and no_std
+// platforms, but not on Windows (it has its own fiber API).
+#[cfg(any(unix, not(feature = "std")))]
+pub(crate) mod stackswitch;
+
 /// Represents an execution stack to use for a fiber.
-#[derive(Debug)]
 pub struct FiberStack(imp::FiberStack);
+
+fn _assert_send_sync() {
+    fn _assert_send<T: Send>() {}
+    fn _assert_sync<T: Sync>() {}
+
+    _assert_send::<FiberStack>();
+    _assert_sync::<FiberStack>();
+}
+
+pub type Result<T, E = imp::Error> = core::result::Result<T, E>;
 
 impl FiberStack {
     /// Creates a new fiber stack of the given size.
-    pub fn new(size: usize) -> io::Result<Self> {
-        Ok(Self(imp::FiberStack::new(size)?))
+    pub fn new(size: usize, zeroed: bool) -> Result<Self> {
+        Ok(Self(imp::FiberStack::new(size, zeroed)?))
     }
 
-    /// Creates a new fiber stack with the given pointer to the top of the stack.
+    /// Creates a new fiber stack of the given size.
+    pub fn from_custom(custom: Box<dyn RuntimeFiberStack>) -> Result<Self> {
+        Ok(Self(imp::FiberStack::from_custom(custom)?))
+    }
+
+    /// Creates a new fiber stack with the given pointer to the bottom of the
+    /// stack plus how large the guard size and stack size are.
+    ///
+    /// The bytes from `bottom` to `bottom.add(guard_size)` should all be
+    /// guaranteed to be unmapped. The bytes from `bottom.add(guard_size)` to
+    /// `bottom.add(guard_size + len)` should be addressable.
     ///
     /// # Safety
     ///
-    /// This is unsafe because there is no validation of the given stack pointer.
+    /// This is unsafe because there is no validation of the given pointer.
     ///
     /// The caller must properly allocate the stack space with a guard page and
     /// make the pages accessible for correct behavior.
-    pub unsafe fn from_top_ptr(top: *mut u8) -> io::Result<Self> {
-        Ok(Self(imp::FiberStack::from_top_ptr(top)?))
+    pub unsafe fn from_raw_parts(bottom: *mut u8, guard_size: usize, len: usize) -> Result<Self> {
+        Ok(Self(imp::FiberStack::from_raw_parts(
+            bottom, guard_size, len,
+        )?))
     }
 
     /// Gets the top of the stack.
     ///
-    /// Returns `None` if the platform does not support getting the top of the stack.
+    /// Returns `None` if the platform does not support getting the top of the
+    /// stack.
     pub fn top(&self) -> Option<*mut u8> {
         self.0.top()
     }
+
+    /// Returns the range of where this stack resides in memory if the platform
+    /// supports it.
+    pub fn range(&self) -> Option<Range<usize>> {
+        self.0.range()
+    }
+
+    /// Is this a manually-managed stack created from raw parts? If so, it is up
+    /// to whoever created it to manage the stack's memory allocation.
+    pub fn is_from_raw_parts(&self) -> bool {
+        self.0.is_from_raw_parts()
+    }
+
+    /// Returns the range of memory that the guard page(s) reside in.
+    pub fn guard_range(&self) -> Option<Range<*mut u8>> {
+        self.0.guard_range()
+    }
+}
+
+/// A creator of RuntimeFiberStacks.
+pub unsafe trait RuntimeFiberStackCreator: Send + Sync {
+    /// Creates a new RuntimeFiberStack with the specified size, guard pages should be included,
+    /// memory should be zeroed.
+    ///
+    /// This is useful to plugin previously allocated memory instead of mmap'ing a new stack for
+    /// every instance.
+    fn new_stack(&self, size: usize, zeroed: bool) -> Result<Box<dyn RuntimeFiberStack>, Error>;
+}
+
+/// A fiber stack backed by custom memory.
+pub unsafe trait RuntimeFiberStack: Send + Sync {
+    /// The top of the allocated stack.
+    fn top(&self) -> *mut u8;
+    /// The valid range of the stack without guard pages.
+    fn range(&self) -> Range<usize>;
+    /// The range of the guard page(s)
+    fn guard_range(&self) -> Range<*mut u8>;
 }
 
 pub struct Fiber<'a, Resume, Yield, Return> {
-    stack: FiberStack,
+    stack: Option<FiberStack>,
     inner: imp::Fiber,
     done: Cell<bool>,
     _phantom: PhantomData<&'a (Resume, Yield, Return)>,
@@ -63,7 +138,8 @@ enum RunResult<Resume, Yield, Return> {
     Resuming(Resume),
     Yield(Yield),
     Returned(Return),
-    Panicked(Box<dyn Any + Send>),
+    #[cfg(feature = "std")]
+    Panicked(Box<dyn core::any::Any + Send>),
 }
 
 impl<'a, Resume, Yield, Return> Fiber<'a, Resume, Yield, Return> {
@@ -74,12 +150,12 @@ impl<'a, Resume, Yield, Return> Fiber<'a, Resume, Yield, Return> {
     /// `Fiber::suspend`.
     pub fn new(
         stack: FiberStack,
-        func: impl FnOnce(Resume, &Suspend<Resume, Yield, Return>) -> Return + 'a,
-    ) -> io::Result<Self> {
+        func: impl FnOnce(Resume, &mut Suspend<Resume, Yield, Return>) -> Return + 'a,
+    ) -> Result<Self> {
         let inner = imp::Fiber::new(&stack.0, func)?;
 
         Ok(Self {
-            stack,
+            stack: Some(stack),
             inner,
             done: Cell::new(false),
             _phantom: PhantomData,
@@ -104,7 +180,7 @@ impl<'a, Resume, Yield, Return> Fiber<'a, Resume, Yield, Return> {
     pub fn resume(&self, val: Resume) -> Result<Return, Yield> {
         assert!(!self.done.replace(true), "cannot resume a finished fiber");
         let result = Cell::new(RunResult::Resuming(val));
-        self.inner.resume(&self.stack.0, &result);
+        self.inner.resume(&self.stack().0, &result);
         match result.into_inner() {
             RunResult::Resuming(_) | RunResult::Executing => unreachable!(),
             RunResult::Yield(y) => {
@@ -112,7 +188,11 @@ impl<'a, Resume, Yield, Return> Fiber<'a, Resume, Yield, Return> {
                 Err(y)
             }
             RunResult::Returned(r) => Ok(r),
-            RunResult::Panicked(payload) => std::panic::resume_unwind(payload),
+            #[cfg(feature = "std")]
+            RunResult::Panicked(_payload) => {
+                use std::panic;
+                panic::resume_unwind(_payload);
+            }
         }
     }
 
@@ -123,7 +203,13 @@ impl<'a, Resume, Yield, Return> Fiber<'a, Resume, Yield, Return> {
 
     /// Gets the stack associated with this fiber.
     pub fn stack(&self) -> &FiberStack {
-        &self.stack
+        self.stack.as_ref().unwrap()
+    }
+
+    /// When this fiber has finished executing, reclaim its stack.
+    pub fn into_stack(mut self) -> FiberStack {
+        assert!(self.done());
+        self.stack.take().unwrap()
     }
 }
 
@@ -137,7 +223,7 @@ impl<Resume, Yield, Return> Suspend<Resume, Yield, Return> {
     /// # Panics
     ///
     /// Panics if the current thread is not executing a fiber from this library.
-    pub fn suspend(&self, value: Yield) -> Resume {
+    pub fn suspend(&mut self, value: Yield) -> Resume {
         self.inner
             .switch::<Resume, Yield, Return>(RunResult::Yield(value))
     }
@@ -145,17 +231,33 @@ impl<Resume, Yield, Return> Suspend<Resume, Yield, Return> {
     fn execute(
         inner: imp::Suspend,
         initial: Resume,
-        func: impl FnOnce(Resume, &Suspend<Resume, Yield, Return>) -> Return,
+        func: impl FnOnce(Resume, &mut Suspend<Resume, Yield, Return>) -> Return,
     ) {
-        let suspend = Suspend {
+        let mut suspend = Suspend {
             inner,
             _phantom: PhantomData,
         };
-        let result = panic::catch_unwind(AssertUnwindSafe(|| (func)(initial, &suspend)));
-        suspend.inner.switch::<Resume, Yield, Return>(match result {
-            Ok(result) => RunResult::Returned(result),
-            Err(panic) => RunResult::Panicked(panic),
-        });
+
+        #[cfg(feature = "std")]
+        {
+            use std::panic::{self, AssertUnwindSafe};
+            let result = panic::catch_unwind(AssertUnwindSafe(|| (func)(initial, &mut suspend)));
+            suspend.inner.switch::<Resume, Yield, Return>(match result {
+                Ok(result) => RunResult::Returned(result),
+                Err(panic) => RunResult::Panicked(panic),
+            });
+        }
+        // Note that it is sound to omit the `catch_unwind` here: it
+        // will not result in unwinding going off the top of the fiber
+        // stack, because the code on the fiber stack is invoked via
+        // an extern "C" boundary which will panic on unwinds.
+        #[cfg(not(feature = "std"))]
+        {
+            let result = (func)(initial, &mut suspend);
+            suspend
+                .inner
+                .switch::<Resume, Yield, Return>(RunResult::Returned(result));
+        }
     }
 }
 
@@ -165,20 +267,20 @@ impl<A, B, C> Drop for Fiber<'_, A, B, C> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test))]
 mod tests {
     use super::{Fiber, FiberStack};
+    use alloc::string::ToString;
     use std::cell::Cell;
-    use std::panic::{self, AssertUnwindSafe};
     use std::rc::Rc;
 
     #[test]
     fn small_stacks() {
-        Fiber::<(), (), ()>::new(FiberStack::new(0).unwrap(), |_, _| {})
+        Fiber::<(), (), ()>::new(FiberStack::new(0, false).unwrap(), |_, _| {})
             .unwrap()
             .resume(())
             .unwrap();
-        Fiber::<(), (), ()>::new(FiberStack::new(1).unwrap(), |_, _| {})
+        Fiber::<(), (), ()>::new(FiberStack::new(1, false).unwrap(), |_, _| {})
             .unwrap()
             .resume(())
             .unwrap();
@@ -188,10 +290,11 @@ mod tests {
     fn smoke() {
         let hit = Rc::new(Cell::new(false));
         let hit2 = hit.clone();
-        let fiber = Fiber::<(), (), ()>::new(FiberStack::new(1024 * 1024).unwrap(), move |_, _| {
-            hit2.set(true);
-        })
-        .unwrap();
+        let fiber =
+            Fiber::<(), (), ()>::new(FiberStack::new(1024 * 1024, false).unwrap(), move |_, _| {
+                hit2.set(true);
+            })
+            .unwrap();
         assert!(!hit.get());
         fiber.resume(()).unwrap();
         assert!(hit.get());
@@ -201,12 +304,13 @@ mod tests {
     fn suspend_and_resume() {
         let hit = Rc::new(Cell::new(false));
         let hit2 = hit.clone();
-        let fiber = Fiber::<(), (), ()>::new(FiberStack::new(1024 * 1024).unwrap(), move |_, s| {
-            s.suspend(());
-            hit2.set(true);
-            s.suspend(());
-        })
-        .unwrap();
+        let fiber =
+            Fiber::<(), (), ()>::new(FiberStack::new(1024 * 1024, false).unwrap(), move |_, s| {
+                s.suspend(());
+                hit2.set(true);
+                s.suspend(());
+            })
+            .unwrap();
         assert!(!hit.get());
         assert!(fiber.resume(()).is_err());
         assert!(!hit.get());
@@ -224,7 +328,7 @@ mod tests {
         }
         fn assert_contains_host() {
             let trace = backtrace::Backtrace::new();
-            println!("{:?}", trace);
+            println!("{trace:?}");
             assert!(
                 trace
                 .frames()
@@ -236,19 +340,24 @@ mod tests {
                 || cfg!(windows)
                 // TODO: the system libunwind is broken (#2808)
                 || cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                // TODO: see comments in `arm.rs` about how this seems to work
+                // in gdb but not at runtime, unsure why at this time.
+                || cfg!(target_arch = "arm")
             );
         }
 
         fn run_test() {
-            let fiber =
-                Fiber::<(), (), ()>::new(FiberStack::new(1024 * 1024).unwrap(), move |(), s| {
+            let fiber = Fiber::<(), (), ()>::new(
+                FiberStack::new(1024 * 1024, false).unwrap(),
+                move |(), s| {
                     assert_contains_host();
                     s.suspend(());
                     assert_contains_host();
                     s.suspend(());
                     assert_contains_host();
-                })
-                .unwrap();
+                },
+            )
+            .unwrap();
             assert!(fiber.resume(()).is_err());
             assert!(fiber.resume(()).is_err());
             assert!(fiber.resume(()).is_ok());
@@ -258,15 +367,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn panics_propagated() {
+        use std::panic::{self, AssertUnwindSafe};
+
         let a = Rc::new(Cell::new(false));
         let b = SetOnDrop(a.clone());
-        let fiber =
-            Fiber::<(), (), ()>::new(FiberStack::new(1024 * 1024).unwrap(), move |(), _s| {
-                drop(&b);
+        let fiber = Fiber::<(), (), ()>::new(
+            FiberStack::new(1024 * 1024, false).unwrap(),
+            move |(), _s| {
+                let _ = &b;
                 panic!();
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert!(panic::catch_unwind(AssertUnwindSafe(|| fiber.resume(()))).is_err());
         assert!(a.get());
 
@@ -281,11 +395,14 @@ mod tests {
 
     #[test]
     fn suspend_and_resume_values() {
-        let fiber = Fiber::new(FiberStack::new(1024 * 1024).unwrap(), move |first, s| {
-            assert_eq!(first, 2.0);
-            assert_eq!(s.suspend(4), 3.0);
-            "hello".to_string()
-        })
+        let fiber = Fiber::new(
+            FiberStack::new(1024 * 1024, false).unwrap(),
+            move |first, s| {
+                assert_eq!(first, 2.0);
+                assert_eq!(s.suspend(4), 3.0);
+                "hello".to_string()
+            },
+        )
         .unwrap();
         assert_eq!(fiber.resume(2.0), Err(4));
         assert_eq!(fiber.resume(3.0), Ok("hello".to_string()));

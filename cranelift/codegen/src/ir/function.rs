@@ -5,13 +5,12 @@
 
 use crate::entity::{PrimaryMap, SecondaryMap};
 use crate::ir::{
-    self, Block, DataFlowGraph, DynamicStackSlot, DynamicStackSlotData, DynamicStackSlots,
-    DynamicType, ExtFuncData, FuncRef, GlobalValue, GlobalValueData, Inst, JumpTable,
-    JumpTableData, Layout, Opcode, SigRef, Signature, SourceLocs, StackSlot, StackSlotData,
-    StackSlots, Table, TableData, Type,
+    self, pcc::Fact, Block, DataFlowGraph, DynamicStackSlot, DynamicStackSlotData,
+    DynamicStackSlots, DynamicType, ExtFuncData, FuncRef, GlobalValue, GlobalValueData, Inst,
+    JumpTable, JumpTableData, Layout, MemoryType, MemoryTypeData, SigRef, Signature, SourceLocs,
+    StackSlot, StackSlotData, StackSlots, Type,
 };
 use crate::isa::CallConv;
-use crate::value_label::ValueLabelsRanges;
 use crate::write::write_function;
 use crate::HashMap;
 #[cfg(feature = "enable-serde")]
@@ -31,7 +30,7 @@ use super::{RelSourceLoc, SourceLoc, UserExternalName};
 
 /// A version marker used to ensure that serialized clif ir is never deserialized with a
 /// different version of Cranelift.
-#[derive(Copy, Clone, Debug, PartialEq, Hash)]
+#[derive(Default, Copy, Clone, Debug, PartialEq, Hash)]
 pub struct VersionMarker;
 
 #[cfg(feature = "enable-serde")]
@@ -64,8 +63,11 @@ impl<'de> Deserialize<'de> for VersionMarker {
 
 /// Function parameters used when creating this function, and that will become applied after
 /// compilation to materialize the final `CompiledCode`.
-#[derive(Clone)]
-#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[derive(Clone, PartialEq)]
+#[cfg_attr(
+    feature = "enable-serde",
+    derive(serde_derive::Serialize, serde_derive::Deserialize)
+)]
 pub struct FunctionParameters {
     /// The first `SourceLoc` appearing in the function, serving as a base for every relative
     /// source loc in the function.
@@ -147,7 +149,10 @@ impl FunctionParameters {
 /// Additionally, these fields can be the same for two functions that would be compiled the same
 /// way, and finalized by applying `FunctionParameters` onto their `CompiledCodeStencil`.
 #[derive(Clone, PartialEq, Hash)]
-#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[cfg_attr(
+    feature = "enable-serde",
+    derive(serde_derive::Serialize, serde_derive::Deserialize)
+)]
 pub struct FunctionStencil {
     /// A version marker used to ensure that serialized clif ir is never deserialized with a
     /// different version of Cranelift.
@@ -167,8 +172,11 @@ pub struct FunctionStencil {
     /// Global values referenced.
     pub global_values: PrimaryMap<ir::GlobalValue, ir::GlobalValueData>,
 
-    /// Tables referenced.
-    pub tables: PrimaryMap<ir::Table, ir::TableData>,
+    /// Global value proof-carrying-code facts.
+    pub global_value_facts: SecondaryMap<ir::GlobalValue, Option<Fact>>,
+
+    /// Memory types for proof-carrying code.
+    pub memory_types: PrimaryMap<ir::MemoryType, ir::MemoryTypeData>,
 
     /// Data flow graph containing the primary definition of all instructions, blocks and values.
     pub dfg: DataFlowGraph,
@@ -196,7 +204,8 @@ impl FunctionStencil {
         self.sized_stack_slots.clear();
         self.dynamic_stack_slots.clear();
         self.global_values.clear();
-        self.tables.clear();
+        self.global_value_facts.clear();
+        self.memory_types.clear();
         self.dfg.clear();
         self.layout.clear();
         self.srclocs.clear();
@@ -230,7 +239,12 @@ impl FunctionStencil {
         self.global_values.push(data)
     }
 
-    /// Find the global dyn_scale value associated with given DynamicType
+    /// Declares a memory type for use by the function.
+    pub fn create_memory_type(&mut self, data: MemoryTypeData) -> MemoryType {
+        self.memory_types.push(data)
+    }
+
+    /// Find the global dyn_scale value associated with given DynamicType.
     pub fn get_dyn_scale(&self, ty: DynamicType) -> GlobalValue {
         self.dfg.dynamic_types.get(ty).unwrap().dynamic_scale
     }
@@ -246,13 +260,8 @@ impl FunctionStencil {
         self.dfg
             .dynamic_types
             .get(ty)
-            .unwrap_or_else(|| panic!("Undeclared dynamic vector type: {}", ty))
+            .unwrap_or_else(|| panic!("Undeclared dynamic vector type: {ty}"))
             .concrete()
-    }
-
-    /// Declares a table accessible to the function.
-    pub fn create_table(&mut self, data: TableData) -> Table {
-        self.tables.push(data)
     }
 
     /// Find a presumed unique special-purpose function parameter value.
@@ -290,18 +299,23 @@ impl FunctionStencil {
         // Ignore all instructions prior to the first branch.
         let mut inst_iter = inst_iter.skip_while(|&inst| !dfg.insts[inst].opcode().is_branch());
 
-        // A conditional branch is permitted in a basic block only when followed
-        // by a terminal jump instruction.
         if let Some(_branch) = inst_iter.next() {
             if let Some(next) = inst_iter.next() {
-                match dfg.insts[next].opcode() {
-                    Opcode::Jump => (),
-                    _ => return Err((next, "post-branch instruction not jump")),
-                }
+                return Err((next, "post-terminator instruction"));
             }
         }
 
         Ok(())
+    }
+
+    /// Returns an iterator over the blocks succeeding the given block.
+    pub fn block_successors(&self, block: Block) -> impl DoubleEndedIterator<Item = Block> + '_ {
+        self.layout.last_inst(block).into_iter().flat_map(|inst| {
+            self.dfg.insts[inst]
+                .branch_destination(&self.dfg.jump_tables)
+                .iter()
+                .map(|block| block.block(&self.dfg.value_lists))
+        })
     }
 
     /// Returns true if the function is function that doesn't call any other functions. This is not
@@ -309,7 +323,17 @@ impl FunctionStencil {
     pub fn is_leaf(&self) -> bool {
         // Conservative result: if there's at least one function signature referenced in this
         // function, assume it is not a leaf.
-        self.dfg.signatures.is_empty()
+        let has_signatures = !self.dfg.signatures.is_empty();
+
+        // Under some TLS models, retrieving the address of a TLS variable requires calling a
+        // function. Conservatively assume that any function that references a tls global value
+        // is not a leaf.
+        let has_tls = self.global_values.values().any(|gv| match gv {
+            GlobalValueData::Symbol { tls, .. } => *tls,
+            _ => false,
+        });
+
+        !has_signatures && !has_tls
     }
 
     /// Replace the `dst` instruction's data with the `src` instruction's data
@@ -351,7 +375,7 @@ impl FunctionStencil {
 
 /// Functions can be cloned, but it is not a very fast operation.
 /// The clone will have all the same entity numbers as the original.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 pub struct Function {
     /// Name of this function.
@@ -393,7 +417,8 @@ impl Function {
                 sized_stack_slots: StackSlots::new(),
                 dynamic_stack_slots: DynamicStackSlots::new(),
                 global_values: PrimaryMap::new(),
-                tables: PrimaryMap::new(),
+                global_value_facts: SecondaryMap::new(),
+                memory_types: PrimaryMap::new(),
                 dfg: DataFlowGraph::new(),
                 layout: Layout::new(),
                 srclocs: SecondaryMap::new(),
@@ -417,15 +442,7 @@ impl Function {
 
     /// Return an object that can display this function with correct ISA-specific annotations.
     pub fn display(&self) -> DisplayFunction<'_> {
-        DisplayFunction(self, Default::default())
-    }
-
-    /// Return an object that can display this function with correct ISA-specific annotations.
-    pub fn display_with<'a>(
-        &'a self,
-        annotations: DisplayFunctionAnnotations<'a>,
-    ) -> DisplayFunction<'a> {
-        DisplayFunction(self, annotations)
+        DisplayFunction(self)
     }
 
     /// Sets an absolute source location for the given instruction.
@@ -456,15 +473,8 @@ impl Function {
     }
 }
 
-/// Additional annotations for function display.
-#[derive(Default)]
-pub struct DisplayFunctionAnnotations<'a> {
-    /// Enable value labels annotations.
-    pub value_ranges: Option<&'a ValueLabelsRanges>,
-}
-
-/// Wrapper type capable of displaying a `Function` with correct ISA annotations.
-pub struct DisplayFunction<'a>(&'a Function, DisplayFunctionAnnotations<'a>);
+/// Wrapper type capable of displaying a `Function`.
+pub struct DisplayFunction<'a>(&'a Function);
 
 impl<'a> fmt::Display for DisplayFunction<'a> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {

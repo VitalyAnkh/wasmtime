@@ -31,6 +31,20 @@ pub(crate) fn define() -> SettingGroup {
     );
 
     settings.add_enum(
+        "regalloc_algorithm",
+        "Algorithm to use in register allocator.",
+        r#"
+            Supported options:
+
+            - `backtracking`: A backtracking allocator with range splitting; more expensive
+                              but generates better code.
+            - `single_pass`: A single-pass algorithm that yields quick compilation but
+                             results in code with more register spills and moves.
+        "#,
+        vec!["backtracking", "single_pass"],
+    );
+
+    settings.add_enum(
         "opt_level",
         "Optimization level for generated code.",
         r#"
@@ -54,19 +68,6 @@ pub(crate) fn define() -> SettingGroup {
     );
 
     settings.add_bool(
-        "use_egraphs",
-        "Enable egraph-based optimization.",
-        r#"
-            This enables an optimization phase that converts CLIF to an egraph (equivalence graph)
-            representation, performs various rewrites, and then converts it back. This should result in
-            better optimization, but the traditional optimization pass structure is also still
-            available by setting this to `false`. The `false` setting will eventually be
-            deprecated and removed.
-        "#,
-        true,
-    );
-
-    settings.add_bool(
         "enable_verifier",
         "Run the Cranelift IR verifier at strategic times during compilation.",
         r#"
@@ -74,6 +75,20 @@ pub(crate) fn define() -> SettingGroup {
             default, which is useful during development.
         "#,
         true,
+    );
+
+    settings.add_bool(
+        "enable_pcc",
+        "Enable proof-carrying code translation validation.",
+        r#"
+            This adds a proof-carrying-code mode. Proof-carrying code (PCC) is a strategy to verify
+            that the compiler preserves certain properties or invariants in the compiled code.
+            For example, a frontend that translates WebAssembly to CLIF can embed PCC facts in
+            the CLIF, and Cranelift will verify that the final machine code satisfies the stated
+            facts at each intermediate computed value. Loads and stores can be marked as "checked"
+            and their memory effects can be verified as safe.
+        "#,
+        false,
     );
 
     // Note that Cranelift doesn't currently need an is_pie flag, because PIE is
@@ -93,19 +108,6 @@ pub(crate) fn define() -> SettingGroup {
             Generate code that assumes that libcalls can be declared "colocated",
             meaning they will be defined along with the current function, such that
             they can use more efficient addressing.
-        "#,
-        false,
-    );
-
-    settings.add_bool(
-        "avoid_div_traps",
-        "Generate explicit checks around native division instructions to avoid their trapping.",
-        r#"
-            Generate explicit checks around native division instructions to
-            avoid their trapping.
-
-            On ISAs like ARM where the native division instructions don't trap,
-            this setting has no effect - explicit checks are always inserted.
         "#,
         false,
     );
@@ -142,13 +144,6 @@ pub(crate) fn define() -> SettingGroup {
     );
 
     settings.add_bool(
-        "enable_simd",
-        "Enable the use of SIMD instructions.",
-        "",
-        false,
-    );
-
-    settings.add_bool(
         "enable_atomics",
         "Enable the use of atomic instructions",
         "",
@@ -171,6 +166,19 @@ pub(crate) fn define() -> SettingGroup {
         "Defines the model used to perform TLS accesses.",
         "",
         vec!["none", "elf_gd", "macho", "coff"],
+    );
+
+    settings.add_enum(
+        "stack_switch_model",
+        "Defines the model used to performing stack switching.",
+        r#"
+           This determines the compilation of `stack_switch` instructions. If
+           set to `basic`, we simply save all registers, update stack pointer
+           and frame pointer (if needed), and jump to the target IP.
+           If set to `update_windows_tib`, we *additionally* update information
+           about the active stack in Windows' Thread Information Block.
+        "#,
+        vec!["none", "basic", "update_windows_tib"],
     );
 
     settings.add_enum(
@@ -210,6 +218,35 @@ pub(crate) fn define() -> SettingGroup {
             registers. The Fastcall implementation otherwise does not support
             `i128` arguments, and will panic if they are present and this
             option is not set.
+        "#,
+        false,
+    );
+
+    settings.add_bool(
+        "enable_multi_ret_implicit_sret",
+        "Enable support for sret arg introduction when there are too many ret vals.",
+        r#"
+            When there are more returns than available return registers, the
+            return value has to be returned through the introduction of a
+            return area pointer. Normally this return area pointer has to be
+            introduced as `ArgumentPurpose::StructReturn` parameter, but for
+            backward compatibility reasons Cranelift also supports implicitly
+            introducing this parameter and writing the return values through it.
+
+            **This option currently does not conform to platform ABIs and the
+            used ABI should not be assumed to remain the same between Cranelift
+            versions.**
+
+            This option is **deprecated** and will be removed in the future.
+
+            Because of the above issues, and complexities of native ABI support
+            for the concept in general, Cranelift's support for multiple return
+            values may also be removed in the future (#9510). For the most
+            robust solution, it is recommended to build a convention on top of
+            Cranelift's primitives for passing multiple return values, for
+            example by allocating a stackslot in the caller, passing it as an
+            explicit StructReturn argument, storing return values in the callee,
+            and loading results in the caller.
         "#,
         false,
     );
@@ -259,13 +296,6 @@ pub(crate) fn define() -> SettingGroup {
     settings.add_bool(
         "enable_probestack",
         "Enable the use of stack probes for supported calling conventions.",
-        "",
-        false,
-    );
-
-    settings.add_bool(
-        "probestack_func_adjusts_sp",
-        "Enable if the stack probe adjusts the stack pointer.",
         "",
         false,
     );
@@ -349,6 +379,23 @@ pub(crate) fn define() -> SettingGroup {
             feature in cranelift-codegen.
         "#,
         false,
+    );
+
+    settings.add_num(
+        "bb_padding_log2_minus_one",
+        "The log2 of the size to insert dummy padding between basic blocks",
+        r#"
+            This is a debugging option for stressing various cases during code
+            generation without requiring large functions. This will insert
+            0-byte padding between basic blocks of the specified size.
+
+            The amount of padding inserted two raised to the power of this value
+            minus one. If this value is 0 then no padding is inserted.
+
+            The default for this option is 0 to insert no padding as it's only
+            intended for testing and development.
+        "#,
+        0,
     );
 
     // When adding new settings please check if they can also be added

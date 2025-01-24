@@ -1,24 +1,20 @@
 //! AArch64 ISA definitions: instruction arguments.
 
 use crate::ir::types::*;
-use crate::ir::Type;
 use crate::isa::aarch64::inst::*;
-use crate::machinst::{ty_bits, MachLabel, PrettyPrint, Reg};
-use core::convert::Into;
-use std::string::String;
 
 //=============================================================================
 // Instruction sub-components: shift and extend descriptors
 
 /// A shift operator for a register or immediate.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ShiftOp {
     /// Logical shift left.
     LSL = 0b00,
     /// Logical shift right.
     LSR = 0b01,
-    /// Arithmentic shift right.
+    /// Arithmetic shift right.
     ASR = 0b10,
     /// Rotate right.
     ROR = 0b11,
@@ -124,6 +120,9 @@ pub enum MemLabel {
     /// offset from this instruction. This form must be used at emission time;
     /// see `memlabel_finalize()` for how other forms are lowered to this one.
     PCRel(i32),
+    /// An address that refers to a label within a `MachBuffer`, for example a
+    /// constant that lives in the pool at the end of the function.
+    Mach(MachLabel),
 }
 
 impl AMode {
@@ -139,88 +138,16 @@ impl AMode {
 
     /// Memory reference using `reg1 + sizeof(ty) * reg2` as an address, with `reg2` sign- or
     /// zero-extended as per `op`.
-    pub fn reg_plus_reg_scaled_extended(reg1: Reg, reg2: Reg, ty: Type, op: ExtendOp) -> AMode {
+    pub fn reg_plus_reg_scaled_extended(reg1: Reg, reg2: Reg, op: ExtendOp) -> AMode {
         AMode::RegScaledExtended {
             rn: reg1,
             rm: reg2,
-            ty,
             extendop: op,
         }
     }
-
-    pub(crate) fn with_allocs(&self, allocs: &mut AllocationConsumer<'_>) -> Self {
-        // This should match `memarg_operands()`.
-        match self {
-            &AMode::Unscaled { rn, simm9 } => AMode::Unscaled {
-                rn: allocs.next(rn),
-                simm9,
-            },
-            &AMode::UnsignedOffset { rn, uimm12 } => AMode::UnsignedOffset {
-                rn: allocs.next(rn),
-                uimm12,
-            },
-            &AMode::RegReg { rn, rm } => AMode::RegReg {
-                rn: allocs.next(rn),
-                rm: allocs.next(rm),
-            },
-            &AMode::RegScaled { rn, rm, ty } => AMode::RegScaled {
-                rn: allocs.next(rn),
-                rm: allocs.next(rm),
-                ty,
-            },
-            &AMode::RegScaledExtended {
-                rn,
-                rm,
-                ty,
-                extendop,
-            } => AMode::RegScaledExtended {
-                rn: allocs.next(rn),
-                rm: allocs.next(rm),
-                ty,
-                extendop,
-            },
-            &AMode::RegExtended { rn, rm, extendop } => AMode::RegExtended {
-                rn: allocs.next(rn),
-                rm: allocs.next(rm),
-                extendop,
-            },
-            &AMode::RegOffset { rn, off, ty } => AMode::RegOffset {
-                rn: allocs.next(rn),
-                off,
-                ty,
-            },
-            &AMode::SPPreIndexed { .. }
-            | &AMode::SPPostIndexed { .. }
-            | &AMode::FPOffset { .. }
-            | &AMode::SPOffset { .. }
-            | &AMode::NominalSPOffset { .. }
-            | AMode::Label { .. } => self.clone(),
-        }
-    }
 }
 
-/// A memory argument to a load/store-pair.
-#[derive(Clone, Debug)]
-pub enum PairAMode {
-    /// Signed, scaled 7-bit offset from a register.
-    SignedOffset(Reg, SImm7Scaled),
-    /// Pre-increment register before address computation.
-    SPPreIndexed(SImm7Scaled),
-    /// Post-increment register after address computation.
-    SPPostIndexed(SImm7Scaled),
-}
-
-impl PairAMode {
-    pub(crate) fn with_allocs(&self, allocs: &mut AllocationConsumer<'_>) -> Self {
-        // Should match `pairmemarg_operands()`.
-        match self {
-            &PairAMode::SignedOffset(reg, simm7scaled) => {
-                PairAMode::SignedOffset(allocs.next(reg), simm7scaled)
-            }
-            &PairAMode::SPPreIndexed(..) | &PairAMode::SPPostIndexed(..) => self.clone(),
-        }
-    }
-}
+pub use crate::isa::aarch64::lower::isle::generated_code::PairAMode;
 
 //=============================================================================
 // Instruction sub-components (conditions, branches and branch targets):
@@ -306,9 +233,9 @@ impl Cond {
 #[derive(Clone, Copy, Debug)]
 pub enum CondBrKind {
     /// Condition: given register is zero.
-    Zero(Reg),
+    Zero(Reg, OperandSize),
     /// Condition: given register is nonzero.
-    NotZero(Reg),
+    NotZero(Reg, OperandSize),
     /// Condition: the given condition-code test is true.
     Cond(Cond),
 }
@@ -317,8 +244,8 @@ impl CondBrKind {
     /// Return the inverted branch condition.
     pub fn invert(self) -> CondBrKind {
         match self {
-            CondBrKind::Zero(reg) => CondBrKind::NotZero(reg),
-            CondBrKind::NotZero(reg) => CondBrKind::Zero(reg),
+            CondBrKind::Zero(reg, size) => CondBrKind::NotZero(reg, size),
+            CondBrKind::NotZero(reg, size) => CondBrKind::Zero(reg, size),
             CondBrKind::Cond(c) => CondBrKind::Cond(c.invert()),
         }
     }
@@ -345,174 +272,179 @@ impl BranchTarget {
     }
 
     /// Return the target's offset, if specified, or zero if label-based.
+    pub fn as_offset14_or_zero(self) -> u32 {
+        self.as_offset_bounded(14)
+    }
+
+    /// Return the target's offset, if specified, or zero if label-based.
     pub fn as_offset19_or_zero(self) -> u32 {
-        let off = match self {
-            BranchTarget::ResolvedOffset(off) => off >> 2,
-            _ => 0,
-        };
-        assert!(off <= 0x3ffff);
-        assert!(off >= -0x40000);
-        (off as u32) & 0x7ffff
+        self.as_offset_bounded(19)
     }
 
     /// Return the target's offset, if specified, or zero if label-based.
     pub fn as_offset26_or_zero(self) -> u32 {
+        self.as_offset_bounded(26)
+    }
+
+    fn as_offset_bounded(self, bits: u32) -> u32 {
         let off = match self {
             BranchTarget::ResolvedOffset(off) => off >> 2,
             _ => 0,
         };
-        assert!(off <= 0x1ffffff);
-        assert!(off >= -0x2000000);
-        (off as u32) & 0x3ffffff
+        let hi = (1 << (bits - 1)) - 1;
+        let lo = -(1 << bits - 1);
+        assert!(off <= hi);
+        assert!(off >= lo);
+        (off as u32) & ((1 << bits) - 1)
     }
 }
 
 impl PrettyPrint for ShiftOpAndAmt {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("{:?} {}", self.op(), self.amt().value())
     }
 }
 
 impl PrettyPrint for ExtendOp {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
-        format!("{:?}", self)
+    fn pretty_print(&self, _: u8) -> String {
+        format!("{self:?}")
     }
 }
 
 impl PrettyPrint for MemLabel {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         match self {
-            &MemLabel::PCRel(off) => format!("pc+{}", off),
+            MemLabel::PCRel(off) => format!("pc+{off}"),
+            MemLabel::Mach(off) => format!("label({})", off.get()),
         }
     }
 }
 
-fn shift_for_type(ty: Type) -> usize {
-    match ty.bytes() {
+fn shift_for_type(size_bytes: u8) -> usize {
+    match size_bytes {
         1 => 0,
         2 => 1,
         4 => 2,
         8 => 3,
         16 => 4,
-        _ => panic!("unknown type: {}", ty),
+        _ => panic!("unknown type size: {size_bytes}"),
     }
 }
 
 impl PrettyPrint for AMode {
-    fn pretty_print(&self, _: u8, allocs: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, size_bytes: u8) -> String {
+        debug_assert!(size_bytes != 0);
         match self {
             &AMode::Unscaled { rn, simm9 } => {
-                let reg = pretty_print_reg(rn, allocs);
+                let reg = pretty_print_reg(rn);
                 if simm9.value != 0 {
-                    let simm9 = simm9.pretty_print(8, allocs);
-                    format!("[{}, {}]", reg, simm9)
+                    let simm9 = simm9.pretty_print(8);
+                    format!("[{reg}, {simm9}]")
                 } else {
-                    format!("[{}]", reg)
+                    format!("[{reg}]")
                 }
             }
             &AMode::UnsignedOffset { rn, uimm12 } => {
-                let reg = pretty_print_reg(rn, allocs);
-                if uimm12.value != 0 {
-                    let uimm12 = uimm12.pretty_print(8, allocs);
-                    format!("[{}, {}]", reg, uimm12)
+                let reg = pretty_print_reg(rn);
+                if uimm12.value() != 0 {
+                    let uimm12 = uimm12.pretty_print(8);
+                    format!("[{reg}, {uimm12}]")
                 } else {
-                    format!("[{}]", reg)
+                    format!("[{reg}]")
                 }
             }
             &AMode::RegReg { rn, rm } => {
-                let r1 = pretty_print_reg(rn, allocs);
-                let r2 = pretty_print_reg(rm, allocs);
-                format!("[{}, {}]", r1, r2)
+                let r1 = pretty_print_reg(rn);
+                let r2 = pretty_print_reg(rm);
+                format!("[{r1}, {r2}]")
             }
-            &AMode::RegScaled { rn, rm, ty } => {
-                let r1 = pretty_print_reg(rn, allocs);
-                let r2 = pretty_print_reg(rm, allocs);
-                let shift = shift_for_type(ty);
-                format!("[{}, {}, LSL #{}]", r1, r2, shift)
+            &AMode::RegScaled { rn, rm } => {
+                let r1 = pretty_print_reg(rn);
+                let r2 = pretty_print_reg(rm);
+                let shift = shift_for_type(size_bytes);
+                format!("[{r1}, {r2}, LSL #{shift}]")
             }
-            &AMode::RegScaledExtended {
-                rn,
-                rm,
-                ty,
-                extendop,
-            } => {
-                let shift = shift_for_type(ty);
+            &AMode::RegScaledExtended { rn, rm, extendop } => {
+                let shift = shift_for_type(size_bytes);
                 let size = match extendop {
                     ExtendOp::SXTW | ExtendOp::UXTW => OperandSize::Size32,
                     _ => OperandSize::Size64,
                 };
-                let r1 = pretty_print_reg(rn, allocs);
-                let r2 = pretty_print_ireg(rm, size, allocs);
-                let op = extendop.pretty_print(0, allocs);
-                format!("[{}, {}, {} #{}]", r1, r2, op, shift)
+                let r1 = pretty_print_reg(rn);
+                let r2 = pretty_print_ireg(rm, size);
+                let op = extendop.pretty_print(0);
+                format!("[{r1}, {r2}, {op} #{shift}]")
             }
             &AMode::RegExtended { rn, rm, extendop } => {
                 let size = match extendop {
                     ExtendOp::SXTW | ExtendOp::UXTW => OperandSize::Size32,
                     _ => OperandSize::Size64,
                 };
-                let r1 = pretty_print_reg(rn, allocs);
-                let r2 = pretty_print_ireg(rm, size, allocs);
-                let op = extendop.pretty_print(0, allocs);
-                format!("[{}, {}, {}]", r1, r2, op)
+                let r1 = pretty_print_reg(rn);
+                let r2 = pretty_print_ireg(rm, size);
+                let op = extendop.pretty_print(0);
+                format!("[{r1}, {r2}, {op}]")
             }
-            &AMode::Label { ref label } => label.pretty_print(0, allocs),
+            &AMode::Label { ref label } => label.pretty_print(0),
             &AMode::SPPreIndexed { simm9 } => {
-                let simm9 = simm9.pretty_print(8, allocs);
-                format!("[sp, {}]!", simm9)
+                let simm9 = simm9.pretty_print(8);
+                format!("[sp, {simm9}]!")
             }
             &AMode::SPPostIndexed { simm9 } => {
-                let simm9 = simm9.pretty_print(8, allocs);
-                format!("[sp], {}", simm9)
+                let simm9 = simm9.pretty_print(8);
+                format!("[sp], {simm9}")
             }
+            AMode::Const { addr } => format!("[const({})]", addr.as_u32()),
+
             // Eliminated by `mem_finalize()`.
             &AMode::SPOffset { .. }
             | &AMode::FPOffset { .. }
-            | &AMode::NominalSPOffset { .. }
+            | &AMode::IncomingArg { .. }
+            | &AMode::SlotOffset { .. }
             | &AMode::RegOffset { .. } => {
-                panic!("Unexpected pseudo mem-arg mode: {:?}", self)
+                panic!("Unexpected pseudo mem-arg mode: {self:?}")
             }
         }
     }
 }
 
 impl PrettyPrint for PairAMode {
-    fn pretty_print(&self, _: u8, allocs: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         match self {
-            &PairAMode::SignedOffset(reg, simm7) => {
-                let reg = pretty_print_reg(reg, allocs);
+            &PairAMode::SignedOffset { reg, simm7 } => {
+                let reg = pretty_print_reg(reg);
                 if simm7.value != 0 {
-                    let simm7 = simm7.pretty_print(8, allocs);
-                    format!("[{}, {}]", reg, simm7)
+                    let simm7 = simm7.pretty_print(8);
+                    format!("[{reg}, {simm7}]")
                 } else {
-                    format!("[{}]", reg)
+                    format!("[{reg}]")
                 }
             }
-            &PairAMode::SPPreIndexed(simm7) => {
-                let simm7 = simm7.pretty_print(8, allocs);
-                format!("[sp, {}]!", simm7)
+            &PairAMode::SPPreIndexed { simm7 } => {
+                let simm7 = simm7.pretty_print(8);
+                format!("[sp, {simm7}]!")
             }
-            &PairAMode::SPPostIndexed(simm7) => {
-                let simm7 = simm7.pretty_print(8, allocs);
-                format!("[sp], {}", simm7)
+            &PairAMode::SPPostIndexed { simm7 } => {
+                let simm7 = simm7.pretty_print(8);
+                format!("[sp], {simm7}")
             }
         }
     }
 }
 
 impl PrettyPrint for Cond {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
-        let mut s = format!("{:?}", self);
+    fn pretty_print(&self, _: u8) -> String {
+        let mut s = format!("{self:?}");
         s.make_ascii_lowercase();
         s
     }
 }
 
 impl PrettyPrint for BranchTarget {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         match self {
             &BranchTarget::Label(label) => format!("label{:?}", label.get()),
-            &BranchTarget::ResolvedOffset(off) => format!("{}", off),
+            &BranchTarget::ResolvedOffset(off) => format!("{off}"),
         }
     }
 }
@@ -581,6 +513,14 @@ impl OperandSize {
             OperandSize::Size64 => 1,
         }
     }
+
+    /// The maximum unsigned value representable in a value of this size.
+    pub fn max_value(&self) -> u64 {
+        match self {
+            OperandSize::Size32 => u32::MAX as u64,
+            OperandSize::Size64 => u64::MAX,
+        }
+    }
 }
 
 /// Type used to communicate the size of a scalar SIMD & FP operand.
@@ -604,7 +544,7 @@ impl ScalarSize {
         match self {
             ScalarSize::Size8 | ScalarSize::Size16 | ScalarSize::Size32 => OperandSize::Size32,
             ScalarSize::Size64 => OperandSize::Size64,
-            _ => panic!("Unexpected operand_size request for: {:?}", self),
+            _ => panic!("Unexpected operand_size request for: {self:?}"),
         }
     }
 
@@ -615,7 +555,7 @@ impl ScalarSize {
             ScalarSize::Size16 => 0b11,
             ScalarSize::Size32 => 0b00,
             ScalarSize::Size64 => 0b01,
-            _ => panic!("Unexpected scalar FP operand size: {:?}", self),
+            _ => panic!("Unexpected scalar FP operand size: {self:?}"),
         }
     }
 
@@ -638,6 +578,17 @@ impl ScalarSize {
             ScalarSize::Size32 => ScalarSize::Size16,
             ScalarSize::Size64 => ScalarSize::Size32,
             ScalarSize::Size128 => ScalarSize::Size64,
+        }
+    }
+
+    /// Return a type with the same size as this scalar.
+    pub fn ty(&self) -> Type {
+        match self {
+            ScalarSize::Size8 => I8,
+            ScalarSize::Size16 => I16,
+            ScalarSize::Size32 => I32,
+            ScalarSize::Size64 => I64,
+            ScalarSize::Size128 => I128,
         }
     }
 }
@@ -672,7 +623,7 @@ impl VectorSize {
             (ScalarSize::Size32, false) => VectorSize::Size32x2,
             (ScalarSize::Size32, true) => VectorSize::Size32x4,
             (ScalarSize::Size64, true) => VectorSize::Size64x2,
-            _ => panic!("Unexpected scalar FP operand size: {:?}", size),
+            _ => panic!("Unexpected scalar FP operand size: {size:?}"),
         }
     }
 
@@ -728,7 +679,33 @@ impl VectorSize {
         match self.lane_size() {
             ScalarSize::Size32 => 0b0,
             ScalarSize::Size64 => 0b1,
-            size => panic!("Unsupported floating-point size for vector op: {:?}", size),
+            size => panic!("Unsupported floating-point size for vector op: {size:?}"),
+        }
+    }
+}
+
+impl APIKey {
+    /// Returns the encoding of the `auti{key}` instruction used to decrypt the
+    /// `lr` register.
+    pub fn enc_auti_hint(&self) -> u32 {
+        let (crm, op2) = match self {
+            APIKey::AZ => (0b0011, 0b100),
+            APIKey::ASP => (0b0011, 0b101),
+            APIKey::BZ => (0b0011, 0b110),
+            APIKey::BSP => (0b0011, 0b111),
+        };
+        0xd503201f | (crm << 8) | (op2 << 5)
+    }
+}
+
+pub use crate::isa::aarch64::lower::isle::generated_code::TestBitAndBranchKind;
+
+impl TestBitAndBranchKind {
+    /// Complements this branch condition to act on the opposite result.
+    pub fn complement(&self) -> TestBitAndBranchKind {
+        match self {
+            TestBitAndBranchKind::Z => TestBitAndBranchKind::NZ,
+            TestBitAndBranchKind::NZ => TestBitAndBranchKind::Z,
         }
     }
 }

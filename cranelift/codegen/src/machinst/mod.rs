@@ -39,26 +39,30 @@
 //!         |                          by instruction emission code.
 //!         |                        - prologue and epilogue(s) built and emitted
 //!         |                          directly during emission.
-//!         |                        - nominal-SP-relative offsets resolved
-//!         |                          by tracking EmitState.)
+//!         |                        - SP-relative offsets resolved by tracking
+//!         |                          EmitState.)
 //!
 //! ```
 
-use crate::binemit::{Addend, CodeInfo, CodeOffset, Reloc, StackMap};
-use crate::ir::function::FunctionParameters;
-use crate::ir::{DynamicStackSlot, RelSourceLoc, StackSlot, Type};
+use crate::binemit::{Addend, CodeInfo, CodeOffset, Reloc};
+use crate::ir::{
+    self, function::FunctionParameters, DynamicStackSlot, RelSourceLoc, StackSlot, Type,
+};
+use crate::isa::FunctionAlignment;
 use crate::result::CodegenResult;
+use crate::settings;
 use crate::settings::Flags;
 use crate::value_label::ValueLabelsRanges;
 use alloc::vec::Vec;
 use core::fmt::Debug;
+use cranelift_control::ControlPlane;
 use cranelift_entity::PrimaryMap;
-use regalloc2::{Allocation, VReg};
+use regalloc2::VReg;
 use smallvec::{smallvec, SmallVec};
 use std::string::String;
 
 #[cfg(feature = "enable-serde")]
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 
 #[macro_use]
 pub mod isle;
@@ -78,10 +82,12 @@ pub use buffer::*;
 pub mod helpers;
 pub use helpers::*;
 pub mod inst_common;
+#[allow(unused_imports)] // not used in all backends right now
 pub use inst_common::*;
 pub mod valueregs;
 pub use reg::*;
 pub use valueregs::*;
+pub mod pcc;
 pub mod reg;
 
 /// A machine instruction.
@@ -91,7 +97,7 @@ pub trait MachInst: Clone + Debug {
 
     /// Return the registers referenced by this machine instruction along with
     /// the modes of reference (use, def, modify).
-    fn get_operands<F: Fn(VReg) -> VReg>(&self, collector: &mut OperandCollector<'_, F>);
+    fn get_operands(&mut self, collector: &mut impl OperandVisitor);
 
     /// If this is a simple move, return the (source, destination) tuple of registers.
     fn is_move(&self) -> Option<(Writable<Reg>, Reg)>;
@@ -108,6 +114,9 @@ pub trait MachInst: Clone + Debug {
 
     /// Should this instruction be included in the clobber-set?
     fn is_included_in_clobbers(&self) -> bool;
+
+    /// Does this instruction access memory?
+    fn is_mem_access(&self) -> bool;
 
     /// Generate a move.
     fn gen_move(to_reg: Writable<Reg>, from_reg: Reg, ty: Type) -> Self;
@@ -140,6 +149,20 @@ pub trait MachInst: Clone + Debug {
     /// Generate a jump to another target. Used during lowering of
     /// control flow.
     fn gen_jump(target: MachLabel) -> Self;
+
+    /// Generate a store of an immediate 64-bit integer to a register. Used by
+    /// the control plane to generate random instructions.
+    fn gen_imm_u64(_value: u64, _dst: Writable<Reg>) -> Option<Self> {
+        None
+    }
+
+    /// Generate a store of an immediate 64-bit integer to a register. Used by
+    /// the control plane to generate random instructions. The tmp register may
+    /// be used by architectures which don't support writing immediate values to
+    /// floating point registers directly.
+    fn gen_imm_f64(_value: f64, _tmp: Writable<Reg>, _dst: Writable<Reg>) -> SmallVec<[Self; 2]> {
+        SmallVec::new()
+    }
 
     /// Generate a NOP. The `preferred_size` parameter allows the caller to
     /// request a NOP of that size, or as close to it as possible. The machine
@@ -174,9 +197,25 @@ pub trait MachInst: Clone + Debug {
         None
     }
 
+    /// Returns a description of the alignment required for functions for this
+    /// architecture.
+    fn function_alignment() -> FunctionAlignment;
+
+    /// Is this a low-level, one-way branch, not meant for use in a
+    /// VCode body? These instructions are meant to be used only when
+    /// directly emitted, i.e. when `MachInst` is used as an assembler
+    /// library.
+    fn is_low_level_branch(&self) -> bool {
+        false
+    }
+
     /// A label-use kind: a type that describes the types of label references that
     /// can occur in an instruction.
     type LabelUse: MachInstLabelUse;
+
+    /// Byte representation of a trap opcode which is inserted by `MachBuffer`
+    /// during its `defer_trap` method.
+    const TRAP_OPCODE: &'static [u8];
 }
 
 /// A descriptor of a label reference (use) in an instruction set.
@@ -209,6 +248,8 @@ pub trait MachInstLabelUse: Clone + Copy + Debug + Eq {
     fn supports_veneer(self) -> bool;
     /// How many bytes are needed for a veneer?
     fn veneer_size(self) -> CodeOffset;
+    /// What's the largest possible veneer that may be generated?
+    fn worst_case_veneer_size() -> CodeOffset;
     /// Generate a veneer. The given code-buffer slice is `self.veneer_size()`
     /// bytes long at offset `veneer_offset` in the buffer. The original
     /// label-use will be patched to refer to this veneer's offset.  A new
@@ -238,6 +279,8 @@ pub enum MachTerminator {
     None,
     /// A return instruction.
     Ret,
+    /// A tail call.
+    RetCall,
     /// An unconditional branch to another block.
     Uncond,
     /// A conditional branch to one of two other blocks.
@@ -250,31 +293,43 @@ pub enum MachTerminator {
 pub trait MachInstEmit: MachInst {
     /// Persistent state carried across `emit` invocations.
     type State: MachInstEmitState<Self>;
+
     /// Constant information used in `emit` invocations.
     type Info;
+
     /// Emit the instruction.
-    fn emit(
-        &self,
-        allocs: &[Allocation],
-        code: &mut MachBuffer<Self>,
-        info: &Self::Info,
-        state: &mut Self::State,
-    );
+    fn emit(&self, code: &mut MachBuffer<Self>, info: &Self::Info, state: &mut Self::State);
+
     /// Pretty-print the instruction.
-    fn pretty_print_inst(&self, allocs: &[Allocation], state: &mut Self::State) -> String;
+    fn pretty_print_inst(&self, state: &mut Self::State) -> String;
 }
 
 /// A trait describing the emission state carried between MachInsts when
 /// emitting a function body.
 pub trait MachInstEmitState<I: VCodeInst>: Default + Clone + Debug {
     /// Create a new emission state given the ABI object.
-    fn new(abi: &Callee<I::ABIMachineSpec>) -> Self;
+    fn new(abi: &Callee<I::ABIMachineSpec>, ctrl_plane: ControlPlane) -> Self;
+
     /// Update the emission state before emitting an instruction that is a
     /// safepoint.
-    fn pre_safepoint(&mut self, _stack_map: StackMap) {}
-    /// Update the emission state to indicate instructions are associated with a
-    /// particular RelSourceLoc.
-    fn pre_sourceloc(&mut self, _srcloc: RelSourceLoc) {}
+    fn pre_safepoint(&mut self, user_stack_map: Option<ir::UserStackMap>);
+
+    /// The emission state holds ownership of a control plane, so it doesn't
+    /// have to be passed around explicitly too much. `ctrl_plane_mut` may
+    /// be used if temporary access to the control plane is needed by some
+    /// other function that doesn't have access to the emission state.
+    fn ctrl_plane_mut(&mut self) -> &mut ControlPlane;
+
+    /// Used to continue using a control plane after the emission state is
+    /// not needed anymore.
+    fn take_ctrl_plane(self) -> ControlPlane;
+
+    /// A hook that triggers when first emitting a new block.
+    /// It is guaranteed to be called before any instructions are emitted.
+    fn on_new_block(&mut self) {}
+
+    /// The [`FrameLayout`] for the function currently being compiled.
+    fn frame_layout(&self) -> &FrameLayout;
 }
 
 /// The result of a `MachBackend::compile_function()` call. Contains machine
@@ -306,9 +361,6 @@ pub struct CompiledCodeBase<T: CompilePhase> {
     /// This info is generated only if the `machine_code_cfg_info`
     /// flag is set.
     pub bb_edges: Vec<(CodeOffset, CodeOffset)>,
-    /// Minimum alignment for the function, derived from the use of any
-    /// pc-relative loads.
-    pub alignment: u32,
 }
 
 impl CompiledCodeStencil {
@@ -323,7 +375,6 @@ impl CompiledCodeStencil {
             dynamic_stackslot_offsets: self.dynamic_stackslot_offsets,
             bb_starts: self.bb_starts,
             bb_edges: self.bb_edges,
-            alignment: self.alignment,
         }
     }
 }
@@ -369,7 +420,7 @@ impl<T: CompilePhase> CompiledCodeBase<T> {
             .zip(block_starts.iter().skip(1))
             .enumerate()
         {
-            writeln!(buf, "block{}: ; offset 0x{:x}", n, start)?;
+            writeln!(buf, "block{n}: ; offset 0x{start:x}")?;
 
             let buffer = &self.buffer.data()[start as usize..end as usize];
             let insns = cs.disasm_all(buffer, start as u64).map_err(map_caperr)?;
@@ -378,23 +429,23 @@ impl<T: CompilePhase> CompiledCodeBase<T> {
 
                 let op_str = i.op_str().unwrap_or("");
                 if let Some(s) = i.mnemonic() {
-                    write!(buf, "{}", s)?;
+                    write!(buf, "{s}")?;
                     if !op_str.is_empty() {
                         write!(buf, " ")?;
                     }
                 }
 
-                write!(buf, "{}", op_str)?;
+                write!(buf, "{op_str}")?;
 
                 let end = i.address() + i.bytes().len() as u64;
                 let contains = |off| i.address() <= off && off < end;
 
-                if let Some(reloc) = relocs.iter().find(|reloc| contains(reloc.offset as u64)) {
+                for reloc in relocs.iter().filter(|reloc| contains(reloc.offset as u64)) {
                     write!(
                         buf,
                         " ; reloc_external {} {} {}",
                         reloc.kind,
-                        reloc.name.display(params),
+                        reloc.target.display(params),
                         reloc.addend,
                     )?;
                 }
@@ -446,10 +497,24 @@ impl CompiledCode {
         &self,
         isa: &dyn crate::isa::TargetIsa,
     ) -> CodegenResult<Option<crate::isa::unwind::UnwindInfo>> {
+        use crate::isa::unwind::UnwindInfoKind;
         let unwind_info_kind = match isa.triple().operating_system {
             target_lexicon::OperatingSystem::Windows => UnwindInfoKind::Windows,
             _ => UnwindInfoKind::SystemV,
         };
+        self.create_unwind_info_of_kind(isa, unwind_info_kind)
+    }
+
+    /// Creates unwind information for the function using the supplied
+    /// "kind". Supports cross-OS (but not cross-arch) generation.
+    ///
+    /// Returns `None` if the function has no unwind information.
+    #[cfg(feature = "unwind")]
+    pub fn create_unwind_info_of_kind(
+        &self,
+        isa: &dyn crate::isa::TargetIsa,
+        unwind_info_kind: crate::isa::unwind::UnwindInfoKind,
+    ) -> CodegenResult<Option<crate::isa::unwind::UnwindInfo>> {
         isa.emit_unwind_info(self, unwind_info_kind)
     }
 }
@@ -470,7 +535,13 @@ pub trait TextSectionBuilder {
     ///
     /// This function returns the offset at which the data was placed in the
     /// text section.
-    fn append(&mut self, labeled: bool, data: &[u8], align: u32) -> u64;
+    fn append(
+        &mut self,
+        labeled: bool,
+        data: &[u8],
+        align: u32,
+        ctrl_plane: &mut ControlPlane,
+    ) -> u64;
 
     /// Attempts to resolve a relocation for this function.
     ///
@@ -491,21 +562,11 @@ pub trait TextSectionBuilder {
     /// A debug-only option which is used to for
     fn force_veneers(&mut self);
 
+    /// Write the `data` provided at `offset`, for example when resolving a
+    /// relocation.
+    fn write(&mut self, offset: u64, data: &[u8]);
+
     /// Completes this text section, filling out any final details, and returns
     /// the bytes of the text section.
-    fn finish(&mut self) -> Vec<u8>;
-}
-
-/// Expected unwind info type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum UnwindInfoKind {
-    /// No unwind info.
-    None,
-    /// SystemV CIE/FDE unwind info.
-    #[cfg(feature = "unwind")]
-    SystemV,
-    /// Windows X64 Unwind info
-    #[cfg(feature = "unwind")]
-    Windows,
+    fn finish(&mut self, ctrl_plane: &mut ControlPlane) -> Vec<u8>;
 }

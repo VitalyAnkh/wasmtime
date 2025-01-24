@@ -1,20 +1,20 @@
 //! risc-v 64-bit Instruction Set Architecture.
 
-use crate::ir;
-use crate::ir::condcodes::IntCC;
-use crate::ir::Function;
-
+use crate::dominator_tree::DominatorTree;
+use crate::ir::{Function, Type};
 use crate::isa::riscv64::settings as riscv_settings;
-use crate::isa::{Builder as IsaBuilder, TargetIsa};
+use crate::isa::{Builder as IsaBuilder, FunctionAlignment, OwnedTargetIsa, TargetIsa};
 use crate::machinst::{
-    compile, CompiledCode, CompiledCodeStencil, MachTextSectionBuilder, Reg, SigSet,
+    compile, CompiledCode, CompiledCodeStencil, MachInst, MachTextSectionBuilder, Reg, SigSet,
     TextSectionBuilder, VCode,
 };
 use crate::result::CodegenResult;
-use crate::settings as shared_settings;
+use crate::settings::{self as shared_settings, Flags};
+use crate::{ir, CodegenError};
 use alloc::{boxed::Box, vec::Vec};
 use core::fmt;
-use regalloc2::MachineEnv;
+use cranelift_control::ControlPlane;
+use std::string::String;
 use target_lexicon::{Architecture, Triple};
 mod abi;
 pub(crate) mod inst;
@@ -23,8 +23,6 @@ mod settings;
 #[cfg(feature = "unwind")]
 use crate::isa::unwind::systemv;
 
-use inst::crate_reg_eviroment;
-
 use self::inst::EmitInfo;
 
 /// An riscv64 backend.
@@ -32,7 +30,6 @@ pub struct Riscv64Backend {
     triple: Triple,
     flags: shared_settings::Flags,
     isa_flags: riscv_settings::Flags,
-    mach_env: MachineEnv,
 }
 
 impl Riscv64Backend {
@@ -42,12 +39,10 @@ impl Riscv64Backend {
         flags: shared_settings::Flags,
         isa_flags: riscv_settings::Flags,
     ) -> Riscv64Backend {
-        let mach_env = crate_reg_eviroment(&flags);
         Riscv64Backend {
             triple,
             flags,
             isa_flags,
-            mach_env,
         }
     }
 
@@ -56,11 +51,13 @@ impl Riscv64Backend {
     fn compile_vcode(
         &self,
         func: &Function,
+        domtree: &DominatorTree,
+        ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<(VCode<inst::Inst>, regalloc2::Output)> {
         let emit_info = EmitInfo::new(self.flags.clone(), self.isa_flags.clone());
         let sigs = SigSet::new::<abi::Riscv64MachineDeps>(func, &self.flags)?;
         let abi = abi::Riscv64Callee::new(func, self, &self.isa_flags, &sigs)?;
-        compile::compile::<Riscv64Backend>(func, self, abi, emit_info, sigs)
+        compile::compile::<Riscv64Backend>(func, domtree, self, abi, emit_info, sigs, ctrl_plane)
     }
 }
 
@@ -68,19 +65,17 @@ impl TargetIsa for Riscv64Backend {
     fn compile_function(
         &self,
         func: &Function,
+        domtree: &DominatorTree,
         want_disasm: bool,
+        ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<CompiledCodeStencil> {
-        let (vcode, regalloc_result) = self.compile_vcode(func)?;
+        let (vcode, regalloc_result) = self.compile_vcode(func, domtree, ctrl_plane)?;
 
         let want_disasm = want_disasm || log::log_enabled!(log::Level::Debug);
-        let emit_result = vcode.emit(
-            &regalloc_result,
-            want_disasm,
-            self.flags.machine_code_cfg_info(),
-        );
+        let emit_result = vcode.emit(&regalloc_result, want_disasm, &self.flags, ctrl_plane);
         let frame_size = emit_result.frame_size;
         let value_labels_ranges = emit_result.value_labels_ranges;
-        let buffer = emit_result.buffer.finish();
+        let buffer = emit_result.buffer;
         let sized_stackslot_offsets = emit_result.sized_stackslot_offsets;
         let dynamic_stackslot_offsets = emit_result.dynamic_stackslot_offsets;
 
@@ -97,7 +92,6 @@ impl TargetIsa for Riscv64Backend {
             dynamic_stackslot_offsets,
             bb_starts: emit_result.bb_offsets,
             bb_edges: emit_result.bb_edges,
-            alignment: emit_result.alignment,
         })
     }
 
@@ -116,26 +110,18 @@ impl TargetIsa for Riscv64Backend {
         &self.flags
     }
 
-    fn machine_env(&self) -> &MachineEnv {
-        &self.mach_env
-    }
-
     fn isa_flags(&self) -> Vec<shared_settings::Value> {
         self.isa_flags.iter().collect()
-    }
-
-    fn unsigned_add_overflow_condition(&self) -> IntCC {
-        IntCC::UnsignedGreaterThanOrEqual
     }
 
     #[cfg(feature = "unwind")]
     fn emit_unwind_info(
         &self,
         result: &CompiledCode,
-        kind: crate::machinst::UnwindInfoKind,
+        kind: crate::isa::unwind::UnwindInfoKind,
     ) -> CodegenResult<Option<crate::isa::unwind::UnwindInfo>> {
         use crate::isa::unwind::UnwindInfo;
-        use crate::machinst::UnwindInfoKind;
+        use crate::isa::unwind::UnwindInfoKind;
         Ok(match kind {
             UnwindInfoKind::SystemV => {
                 let mapper = self::inst::unwind::systemv::RegisterMapper;
@@ -166,22 +152,82 @@ impl TargetIsa for Riscv64Backend {
         inst::unwind::systemv::map_reg(reg).map(|reg| reg.0)
     }
 
-    fn function_alignment(&self) -> u32 {
-        4
+    fn function_alignment(&self) -> FunctionAlignment {
+        inst::Inst::function_alignment()
+    }
+
+    fn page_size_align_log2(&self) -> u8 {
+        debug_assert_eq!(1 << 12, 0x1000);
+        12
     }
 
     #[cfg(feature = "disas")]
     fn to_capstone(&self) -> Result<capstone::Capstone, capstone::Error> {
         use capstone::prelude::*;
-        let mut cs = Capstone::new()
-            .riscv()
-            .mode(arch::riscv::ArchMode::RiscV64)
-            .build()?;
+        let mut cs_builder = Capstone::new().riscv().mode(arch::riscv::ArchMode::RiscV64);
+
+        // Enable C instruction decoding if we have compressed instructions enabled.
+        //
+        // We can't enable this unconditionally because it will cause Capstone to
+        // emit weird instructions and generally mess up when it encounters unknown
+        // instructions, such as any Zba,Zbb,Zbc or Vector instructions.
+        //
+        // This causes the default disassembly to be quite unreadable, so enable
+        // it only when we are actually going to be using them.
+        let uses_compressed = self
+            .isa_flags()
+            .iter()
+            .filter(|f| ["has_zca", "has_zcb", "has_zcd"].contains(&f.name))
+            .any(|f| f.as_bool().unwrap_or(false));
+        if uses_compressed {
+            cs_builder = cs_builder.extra_mode([arch::riscv::ArchExtraMode::RiscVC].into_iter());
+        }
+
+        let mut cs = cs_builder.build()?;
+
         // Similar to AArch64, RISC-V uses inline constants rather than a separate
-        // constant pool. We want to skip dissasembly over inline constants instead
+        // constant pool. We want to skip disassembly over inline constants instead
         // of stopping on invalid bytes.
         cs.set_skipdata(true)?;
         Ok(cs)
+    }
+
+    fn pretty_print_reg(&self, reg: Reg, _size: u8) -> String {
+        // TODO-RISC-V: implement proper register pretty-printing.
+        format!("{reg:?}")
+    }
+
+    fn has_native_fma(&self) -> bool {
+        true
+    }
+
+    fn has_x86_blendv_lowering(&self, _: Type) -> bool {
+        false
+    }
+
+    fn has_x86_pshufb_lowering(&self) -> bool {
+        false
+    }
+
+    fn has_x86_pmulhrsw_lowering(&self) -> bool {
+        false
+    }
+
+    fn has_x86_pmaddubsw_lowering(&self) -> bool {
+        false
+    }
+
+    fn default_argument_extension(&self) -> ir::ArgumentExtension {
+        // According to https://riscv.org/wp-content/uploads/2024/12/riscv-calling.pdf
+        // it says:
+        //
+        // > In RV64, 32-bit types, such as int, are stored in integer
+        // > registers as proper sign extensions of their 32-bit values; that
+        // > is, bits 63..31 are all equal. This restriction holds even for
+        // > unsigned 32-bit types.
+        //
+        // leading to `sext` here.
+        ir::ArgumentExtension::Sext
     }
 }
 
@@ -204,67 +250,35 @@ pub fn isa_builder(triple: Triple) -> IsaBuilder {
     IsaBuilder {
         triple,
         setup: riscv_settings::builder(),
-        constructor: |triple, shared_flags, builder| {
-            let isa_flags = riscv_settings::Flags::new(&shared_flags, builder);
-            let backend = Riscv64Backend::new_with_flags(triple, shared_flags, isa_flags);
-            Ok(backend.wrapped())
-        },
+        constructor: isa_constructor,
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::cursor::{Cursor, FuncCursor};
-    use crate::ir::types::*;
-    use crate::ir::{AbiParam, Function, InstBuilder, Signature, UserFuncName};
-    use crate::isa::CallConv;
-    use crate::settings;
-    use crate::settings::Configurable;
-    use core::str::FromStr;
-    use target_lexicon::Triple;
+fn isa_constructor(
+    triple: Triple,
+    shared_flags: Flags,
+    builder: &shared_settings::Builder,
+) -> CodegenResult<OwnedTargetIsa> {
+    let isa_flags = riscv_settings::Flags::new(&shared_flags, builder);
 
-    #[test]
-    fn test_compile_function() {
-        let name = UserFuncName::testcase("test0");
-        let mut sig = Signature::new(CallConv::SystemV);
-        sig.params.push(AbiParam::new(I32));
-        sig.returns.push(AbiParam::new(I32));
-        let mut func = Function::with_name_signature(name, sig);
-
-        let bb0 = func.dfg.make_block();
-        let arg0 = func.dfg.append_block_param(bb0, I32);
-
-        let mut pos = FuncCursor::new(&mut func);
-        pos.insert_block(bb0);
-        let v0 = pos.ins().iconst(I32, 0x1234);
-        let v1 = pos.ins().iadd(arg0, v0);
-        pos.ins().return_(&[v1]);
-
-        let mut shared_flags_builder = settings::builder();
-        shared_flags_builder.set("opt_level", "none").unwrap();
-        let shared_flags = settings::Flags::new(shared_flags_builder);
-        let isa_flags = riscv_settings::Flags::new(&shared_flags, riscv_settings::builder());
-        let backend = Riscv64Backend::new_with_flags(
-            Triple::from_str("riscv64").unwrap(),
-            shared_flags,
-            isa_flags,
-        );
-        let buffer = backend.compile_function(&mut func, true).unwrap();
-        let code = buffer.buffer.data();
-
-        // To update this comment, write the golden bytes to a file, and run the following command
-        // on it to update:
-        // > riscv64-linux-gnu-objdump -b binary -D <file> -m riscv
-        //
-        // 0:   000015b7                lui     a1,0x1
-        // 4:   23458593                addi    a1,a1,564 # 0x1234
-        // 8:   00b5053b                .4byte  0xb5053b
-        // c:   00008067                ret
-
-        let golden = vec![
-            183, 21, 0, 0, 147, 133, 69, 35, 59, 5, 181, 0, 103, 128, 0, 0,
-        ];
-        assert_eq!(code, &golden[..]);
+    // The RISC-V backend does not work without at least the G extension enabled.
+    // The G extension is simply a combination of the following extensions:
+    // - I: Base Integer Instruction Set
+    // - M: Integer Multiplication and Division
+    // - A: Atomic Instructions
+    // - F: Single-Precision Floating-Point
+    // - D: Double-Precision Floating-Point
+    // - Zicsr: Control and Status Register Instructions
+    // - Zifencei: Instruction-Fetch Fence
+    //
+    // Ensure that those combination of features is enabled.
+    if !isa_flags.has_g() {
+        return Err(CodegenError::Unsupported(
+            "The RISC-V Backend currently requires all the features in the G Extension enabled"
+                .into(),
+        ));
     }
+
+    let backend = Riscv64Backend::new_with_flags(triple, shared_flags, isa_flags);
+    Ok(backend.wrapped())
 }

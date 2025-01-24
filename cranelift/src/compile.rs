@@ -17,30 +17,30 @@ use std::path::PathBuf;
 #[derive(Parser)]
 pub struct Options {
     /// Print the resulting Cranelift IR
-    #[clap(short)]
+    #[arg(short)]
     print: bool,
 
     /// Print pass timing report
-    #[clap(short = 'T')]
+    #[arg(short = 'T')]
     report_times: bool,
 
     /// Print machine code disassembly
-    #[clap(short = 'D', long)]
+    #[arg(short = 'D', long)]
     disasm: bool,
 
     /// Configure Cranelift settings
-    #[clap(long = "set")]
+    #[arg(long = "set")]
     settings: Vec<String>,
 
     /// Specify the Cranelift target
-    #[clap(long = "target")]
+    #[arg(long = "target")]
     target: String,
 
     /// Specify an input file to be used. Use '-' for stdin.
     files: Vec<PathBuf>,
 
     /// Output object file
-    #[clap(short = 'o', long = "output")]
+    #[arg(short = 'o', long = "output")]
     output: Option<PathBuf>,
 }
 
@@ -84,7 +84,7 @@ fn handle_module(
 ) -> Result<()> {
     let buffer = read_to_string(&path)?;
     let test_file = parse_test(&buffer, ParseOptions::default())
-        .with_context(|| format!("failed to parse {}", name))?;
+        .with_context(|| format!("failed to parse {name}"))?;
 
     // If we have an isa from the command-line, use that. Otherwise if the
     // file contains a unique isa, use that.
@@ -98,11 +98,10 @@ fn handle_module(
     for (func, _) in test_file.functions {
         let mut context = Context::new();
         context.func = func;
-        let mut mem = vec![];
 
         // Compile and encode the result to machine code.
         let compiled_code = context
-            .compile_and_emit(isa, &mut mem)
+            .compile(isa, &mut Default::default())
             .map_err(|err| anyhow::anyhow!("{}", pretty_error(&err.func, err.inner)))?;
         let code_info = compiled_code.code_info();
 
@@ -113,7 +112,11 @@ fn handle_module(
                 cranelift_module::Linkage::Export,
                 &context.func.signature,
             )?;
-            module.define_function(fid, &mut context)?;
+            module.define_function_with_control_plane(
+                fid,
+                &mut context,
+                &mut Default::default(),
+            )?;
         }
 
         if options.print {
@@ -124,13 +127,12 @@ fn handle_module(
             let result = context.compiled_code().unwrap();
             print_all(
                 isa,
-                &context.func.params,
-                &mem,
+                &context.func,
+                context.compiled_code().unwrap().code_buffer(),
                 code_info.total_size,
                 options.print,
                 result.buffer.relocs(),
                 result.buffer.traps(),
-                result.buffer.stack_maps(),
             )?;
         }
     }

@@ -30,13 +30,13 @@ pub(crate) struct Formats {
     pub(crate) dynamic_stack_store: Rc<InstructionFormat>,
     pub(crate) store: Rc<InstructionFormat>,
     pub(crate) store_no_offset: Rc<InstructionFormat>,
-    pub(crate) table_addr: Rc<InstructionFormat>,
     pub(crate) ternary: Rc<InstructionFormat>,
     pub(crate) ternary_imm8: Rc<InstructionFormat>,
     pub(crate) trap: Rc<InstructionFormat>,
     pub(crate) unary: Rc<InstructionFormat>,
     pub(crate) unary_const: Rc<InstructionFormat>,
     pub(crate) unary_global_value: Rc<InstructionFormat>,
+    pub(crate) unary_ieee16: Rc<InstructionFormat>,
     pub(crate) unary_ieee32: Rc<InstructionFormat>,
     pub(crate) unary_ieee64: Rc<InstructionFormat>,
     pub(crate) unary_imm: Rc<InstructionFormat>,
@@ -48,6 +48,8 @@ impl Formats {
             unary: Builder::new("Unary").value().build(),
 
             unary_imm: Builder::new("UnaryImm").imm(&imm.imm64).build(),
+
+            unary_ieee16: Builder::new("UnaryIeee16").imm(&imm.ieee16).build(),
 
             unary_ieee32: Builder::new("UnaryIeee32").imm(&imm.ieee32).build(),
 
@@ -190,13 +192,6 @@ impl Formats {
             dynamic_stack_store: Builder::new("DynamicStackStore")
                 .value()
                 .imm(&entities.dynamic_stack_slot)
-                .build(),
-
-            // Accessing a WebAssembly table.
-            table_addr: Builder::new("TableAddr")
-                .imm(&entities.table)
-                .value()
-                .imm(&imm.offset32)
                 .build(),
 
             trap: Builder::new("Trap").imm(&imm.trapcode).build(),

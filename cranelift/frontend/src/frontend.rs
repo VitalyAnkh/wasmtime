@@ -1,8 +1,9 @@
 //! A frontend for building Cranelift IR from other languages.
 use crate::ssa::{SSABuilder, SideEffects};
 use crate::variable::Variable;
+use alloc::vec::Vec;
 use core::fmt::{self, Debug};
-use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::cursor::{Cursor, CursorPosition, FuncCursor};
 use cranelift_codegen::entity::{EntityRef, EntitySet, SecondaryMap};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::condcodes::IntCC;
@@ -15,20 +16,27 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::TargetFrontendConfig;
 use cranelift_codegen::packed_option::PackedOption;
+use cranelift_codegen::traversals::Dfs;
+use smallvec::SmallVec;
+
+mod safepoints;
 
 /// Structure used for translating a series of functions into Cranelift IR.
 ///
 /// In order to reduce memory reallocations when compiling multiple functions,
-/// `FunctionBuilderContext` holds various data structures which are cleared between
+/// [`FunctionBuilderContext`] holds various data structures which are cleared between
 /// functions, rather than dropped, preserving the underlying allocations.
 #[derive(Default)]
 pub struct FunctionBuilderContext {
     ssa: SSABuilder,
     status: SecondaryMap<Block, BlockStatus>,
     types: SecondaryMap<Variable, Type>,
+    stack_map_vars: EntitySet<Variable>,
+    stack_map_values: EntitySet<Value>,
+    safepoints: safepoints::SafepointSpiller,
 }
 
-/// Temporary object used to build a single Cranelift IR `Function`.
+/// Temporary object used to build a single Cranelift IR [`Function`].
 pub struct FunctionBuilder<'a> {
     /// The function currently being built.
     /// This field is public so the function can be re-borrowed.
@@ -53,16 +61,27 @@ enum BlockStatus {
 }
 
 impl FunctionBuilderContext {
-    /// Creates a FunctionBuilderContext structure. The structure is automatically cleared after
-    /// each [`FunctionBuilder`](struct.FunctionBuilder.html) completes translating a function.
+    /// Creates a [`FunctionBuilderContext`] structure. The structure is automatically cleared after
+    /// each [`FunctionBuilder`] completes translating a function.
     pub fn new() -> Self {
         Self::default()
     }
 
     fn clear(&mut self) {
-        self.ssa.clear();
-        self.status.clear();
-        self.types.clear();
+        let FunctionBuilderContext {
+            ssa,
+            status,
+            types,
+            stack_map_vars,
+            stack_map_values,
+            safepoints,
+        } = self;
+        ssa.clear();
+        status.clear();
+        types.clear();
+        stack_map_values.clear();
+        stack_map_vars.clear();
+        safepoints.clear();
     }
 
     fn is_empty(&self) -> bool {
@@ -70,7 +89,7 @@ impl FunctionBuilderContext {
     }
 }
 
-/// Implementation of the [`InstBuilder`](cranelift_codegen::ir::InstBuilder) that has
+/// Implementation of the [`InstBuilder`] that has
 /// one convenience method per Cranelift IR instruction.
 pub struct FuncInstBuilder<'short, 'long: 'short> {
     builder: &'short mut FunctionBuilder<'long>,
@@ -99,7 +118,7 @@ impl<'short, 'long> InstBuilderBase<'short> for FuncInstBuilder<'short, 'long> {
         // We only insert the Block in the layout when an instruction is added to it
         self.builder.ensure_inserted_block();
 
-        let inst = self.builder.func.dfg.make_inst(data.clone());
+        let inst = self.builder.func.dfg.make_inst(data);
         self.builder.func.dfg.make_inst_results(inst, ctrl_typevar);
         self.builder.func.layout.append_inst(inst, self.block);
         if !self.builder.srcloc.is_default() {
@@ -223,7 +242,7 @@ pub enum DefVariableError {
     ///
     /// note: to obtain the type of the value, you can call
     /// [`cranelift_codegen::ir::dfg::DataFlowGraph::value_type`] (using the
-    /// [`FunctionBuilder.func.dfg`] field)
+    /// `FunctionBuilder.func.dfg` field)
     TypeMismatch(Variable, Value),
     /// The value was defined (in a call to [`FunctionBuilder::def_var`]) before
     /// it was declared (in a call to [`FunctionBuilder::declare_var`]).
@@ -246,7 +265,7 @@ impl fmt::Display for DefVariableError {
             DefVariableError::DefinedBeforeDeclared(variable) => {
                 write!(
                     f,
-                    "the value of variabe {} was declared before it was defined",
+                    "the value of variable {} was declared before it was defined",
                     variable.index()
                 )?;
             }
@@ -261,7 +280,7 @@ impl fmt::Display for DefVariableError {
 /// The module is parametrized by one type which is the representation of variables in your
 /// origin language. It offers a way to conveniently append instruction to your program flow.
 /// You are responsible to split your instruction flow into extended blocks (declared with
-/// `create_block`) whose properties are:
+/// [`create_block`](Self::create_block)) whose properties are:
 ///
 /// - branch and jump instructions can only point at the top of extended blocks;
 /// - the last instruction of each block is a terminator instruction which has no natural successor,
@@ -269,28 +288,27 @@ impl fmt::Display for DefVariableError {
 ///
 /// The parameters of Cranelift IR instructions are Cranelift IR values, which can only be created
 /// as results of other Cranelift IR instructions. To be able to create variables redefined multiple
-/// times in your program, use the `def_var` and `use_var` command, that will maintain the
-/// correspondence between your variables and Cranelift IR SSA values.
+/// times in your program, use the [`def_var`](Self::def_var) and [`use_var`](Self::use_var) command,
+/// that will maintain the correspondence between your variables and Cranelift IR SSA values.
 ///
-/// The first block for which you call `switch_to_block` will be assumed to be the beginning of
-/// the function.
+/// The first block for which you call [`switch_to_block`](Self::switch_to_block) will be assumed to
+/// be the beginning of the function.
 ///
-/// At creation, a `FunctionBuilder` instance borrows an already allocated `Function` which it
+/// At creation, a [`FunctionBuilder`] instance borrows an already allocated `Function` which it
 /// modifies with the information stored in the mutable borrowed
-/// [`FunctionBuilderContext`](struct.FunctionBuilderContext.html). The function passed in
-/// argument should be newly created with
-/// [`Function::with_name_signature()`](Function::with_name_signature), whereas the
-/// `FunctionBuilderContext` can be kept as is between two function translations.
+/// [`FunctionBuilderContext`]. The function passed in argument should be newly created with
+/// [`Function::with_name_signature()`], whereas the [`FunctionBuilderContext`] can be kept as is
+/// between two function translations.
 ///
 /// # Errors
 ///
 /// The functions below will panic in debug mode whenever you try to modify the Cranelift IR
 /// function in a way that violate the coherence of the code. For instance: switching to a new
-/// `Block` when you haven't filled the current one with a terminator instruction, inserting a
+/// [`Block`] when you haven't filled the current one with a terminator instruction, inserting a
 /// return instruction with arguments that don't match the function's signature.
 impl<'a> FunctionBuilder<'a> {
-    /// Creates a new FunctionBuilder structure that will operate on a `Function` using a
-    /// `FunctionBuilderContext`.
+    /// Creates a new [`FunctionBuilder`] structure that will operate on a [`Function`] using a
+    /// [`FunctionBuilderContext`].
     pub fn new(func: &'a mut Function, func_ctx: &'a mut FunctionBuilderContext) -> Self {
         debug_assert!(func_ctx.is_empty());
         Self {
@@ -311,7 +329,7 @@ impl<'a> FunctionBuilder<'a> {
         self.srcloc = srcloc;
     }
 
-    /// Creates a new `Block` and returns its reference.
+    /// Creates a new [`Block`] and returns its reference.
     pub fn create_block(&mut self) -> Block {
         let block = self.func.dfg.make_block();
         self.func_ctx.ssa.declare_block(block);
@@ -332,7 +350,7 @@ impl<'a> FunctionBuilder<'a> {
     }
 
     /// After the call to this function, new instructions will be inserted into the designated
-    /// block, in the order they are declared. You must declare the types of the Block arguments
+    /// block, in the order they are declared. You must declare the types of the [`Block`] arguments
     /// you will use here.
     ///
     /// When inserting the terminator instruction (which doesn't have a fallthrough to its immediate
@@ -367,9 +385,9 @@ impl<'a> FunctionBuilder<'a> {
         self.handle_ssa_side_effects(side_effects);
     }
 
-    /// Effectively calls seal_block on all unsealed blocks in the function.
+    /// Effectively calls [seal_block](Self::seal_block) on all unsealed blocks in the function.
     ///
-    /// It's more efficient to seal `Block`s as soon as possible, during
+    /// It's more efficient to seal [`Block`]s as soon as possible, during
     /// translation, but for frontends where this is impractical to do, this
     /// function can be used at the end of translating all blocks to ensure
     /// that everything is sealed.
@@ -378,9 +396,15 @@ impl<'a> FunctionBuilder<'a> {
         self.handle_ssa_side_effects(side_effects);
     }
 
-    /// Declares the type of a variable, so that it can be used later (by calling
-    /// [`FunctionBuilder::use_var`]). This function will return an error if it
-    /// was not possible to use the variable.
+    /// Declares the type of a variable.
+    ///
+    /// This allows the variable to be used later (by calling
+    /// [`FunctionBuilder::use_var`]).
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the variable has been previously
+    /// declared.
     pub fn try_declare_var(&mut self, var: Variable, ty: Type) -> Result<(), DeclareVariableError> {
         if self.func_ctx.types[var] != types::INVALID {
             return Err(DeclareVariableError::DeclaredMultipleTimes(var));
@@ -389,11 +413,36 @@ impl<'a> FunctionBuilder<'a> {
         Ok(())
     }
 
-    /// In order to use a variable (by calling [`FunctionBuilder::use_var`]), you need
-    /// to first declare its type with this method.
+    /// Declares the type of a variable, panicking if it is already declared.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the variable has already been declared.
     pub fn declare_var(&mut self, var: Variable, ty: Type) {
         self.try_declare_var(var, ty)
-            .unwrap_or_else(|_| panic!("the variable {:?} has been declared multiple times", var))
+            .unwrap_or_else(|_| panic!("the variable {var:?} has been declared multiple times"))
+    }
+
+    /// Declare that all uses of the given variable must be included in stack
+    /// map metadata.
+    ///
+    /// All values that are uses of this variable will be spilled to the stack
+    /// before each safepoint and their location on the stack included in stack
+    /// maps. Stack maps allow the garbage collector to identify the on-stack GC
+    /// roots.
+    ///
+    /// This does not affect any pre-existing uses of the variable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the variable's type is larger than 16 bytes or if this
+    /// variable has not been declared yet.
+    pub fn declare_var_needs_stack_map(&mut self, var: Variable) {
+        log::trace!("declare_var_needs_stack_map({var:?})");
+        let ty = self.func_ctx.types[var];
+        assert!(ty != types::INVALID);
+        assert!(ty.bytes() <= 16);
+        self.func_ctx.stack_map_vars.insert(var);
     }
 
     /// Returns the Cranelift IR necessary to use a previously defined user
@@ -414,14 +463,20 @@ impl<'a> FunctionBuilder<'a> {
             debug_assert_ne!(
                 ty,
                 types::INVALID,
-                "variable {:?} is used but its type has not been declared",
-                var
+                "variable {var:?} is used but its type has not been declared"
             );
             self.func_ctx
                 .ssa
                 .use_var(self.func, var, ty, self.position.unwrap())
         };
         self.handle_ssa_side_effects(side_effects);
+
+        // If the variable was declared as needing stack maps, then propagate
+        // that requirement to all values derived from using the variable.
+        if self.func_ctx.stack_map_vars.contains(var) {
+            self.declare_value_needs_stack_map(val);
+        }
+
         Ok(val)
     }
 
@@ -429,10 +484,7 @@ impl<'a> FunctionBuilder<'a> {
     /// position of a previously defined user variable.
     pub fn use_var(&mut self, var: Variable) -> Value {
         self.try_use_var(var).unwrap_or_else(|_| {
-            panic!(
-                "variable {:?} is used but its type has not been declared",
-                var
-            )
+            panic!("variable {var:?} is used but its type has not been declared")
         })
     }
 
@@ -449,6 +501,11 @@ impl<'a> FunctionBuilder<'a> {
             return Err(DefVariableError::TypeMismatch(var, val));
         }
 
+        // If `var` needs inclusion in stack maps, then `val` does too.
+        if self.func_ctx.stack_map_vars.contains(var) {
+            self.declare_value_needs_stack_map(val);
+        }
+
         self.func_ctx.ssa.def_var(var, val, self.position.unwrap());
         Ok(())
     }
@@ -459,23 +516,18 @@ impl<'a> FunctionBuilder<'a> {
         self.try_def_var(var, val)
             .unwrap_or_else(|error| match error {
                 DefVariableError::TypeMismatch(var, val) => {
-                    panic!(
-                        "declared type of variable {:?} doesn't match type of value {}",
-                        var, val
-                    );
+                    panic!("declared type of variable {var:?} doesn't match type of value {val}");
                 }
                 DefVariableError::DefinedBeforeDeclared(var) => {
-                    panic!(
-                        "variable {:?} is used but its type has not been declared",
-                        var
-                    );
+                    panic!("variable {var:?} is used but its type has not been declared");
                 }
             })
     }
 
-    /// Set label for Value
+    /// Set label for [`Value`]
     ///
-    /// This will not do anything unless `func.dfg.collect_debug_info` is called first.
+    /// This will not do anything unless
+    /// [`func.dfg.collect_debug_info`](DataFlowGraph::collect_debug_info) is called first.
     pub fn set_val_label(&mut self, val: Value, label: ValueLabel) {
         if let Some(values_labels) = self.func.stencil.dfg.values_labels.as_mut() {
             use alloc::collections::btree_map::Entry;
@@ -497,19 +549,43 @@ impl<'a> FunctionBuilder<'a> {
         }
     }
 
-    /// Creates a jump table in the function, to be used by `br_table` instructions.
+    /// Declare that the given value is a GC reference that requires inclusion
+    /// in a stack map when it is live across GC safepoints.
+    ///
+    /// At the current moment, values that need inclusion in stack maps are
+    /// spilled before safepoints, but they are not reloaded afterwards. This
+    /// means that moving GCs are not yet supported, however the intention is to
+    /// add this support in the near future.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `val` is larger than 16 bytes.
+    pub fn declare_value_needs_stack_map(&mut self, val: Value) {
+        log::trace!("declare_value_needs_stack_map({val:?})");
+
+        // We rely on these properties in `insert_safepoint_spills`.
+        let size = self.func.dfg.value_type(val).bytes();
+        assert!(size <= 16);
+        assert!(size.is_power_of_two());
+
+        self.func_ctx.stack_map_values.insert(val);
+    }
+
+    /// Creates a jump table in the function, to be used by [`br_table`](InstBuilder::br_table) instructions.
     pub fn create_jump_table(&mut self, data: JumpTableData) -> JumpTable {
         self.func.create_jump_table(data)
     }
 
-    /// Creates a sized stack slot in the function, to be used by `stack_load`, `stack_store` and
-    /// `stack_addr` instructions.
+    /// Creates a sized stack slot in the function, to be used by [`stack_load`](InstBuilder::stack_load),
+    /// [`stack_store`](InstBuilder::stack_store) and [`stack_addr`](InstBuilder::stack_addr) instructions.
     pub fn create_sized_stack_slot(&mut self, data: StackSlotData) -> StackSlot {
         self.func.create_sized_stack_slot(data)
     }
 
-    /// Creates a dynamic stack slot in the function, to be used by `dynamic_stack_load`,
-    /// `dynamic_stack_store` and `dynamic_stack_addr` instructions.
+    /// Creates a dynamic stack slot in the function, to be used by
+    /// [`dynamic_stack_load`](InstBuilder::dynamic_stack_load),
+    /// [`dynamic_stack_store`](InstBuilder::dynamic_stack_store) and
+    /// [`dynamic_stack_addr`](InstBuilder::dynamic_stack_addr) instructions.
     pub fn create_dynamic_stack_slot(&mut self, data: DynamicStackSlotData) -> DynamicStackSlot {
         self.func.create_dynamic_stack_slot(data)
     }
@@ -529,8 +605,8 @@ impl<'a> FunctionBuilder<'a> {
         self.func.create_global_value(data)
     }
 
-    /// Returns an object with the [`InstBuilder`](cranelift_codegen::ir::InstBuilder)
-    /// trait that allows to conveniently append an instruction to the current `Block` being built.
+    /// Returns an object with the [`InstBuilder`]
+    /// trait that allows to conveniently append an instruction to the current [`Block`] being built.
     pub fn ins<'short>(&'short mut self) -> FuncInstBuilder<'short, 'a> {
         let block = self
             .position
@@ -554,10 +630,10 @@ impl<'a> FunctionBuilder<'a> {
         }
     }
 
-    /// Returns a `FuncCursor` pointed at the current position ready for inserting instructions.
+    /// Returns a [`FuncCursor`] pointed at the current position ready for inserting instructions.
     ///
     /// This can be used to insert SSA code that doesn't need to access locals and that doesn't
-    /// need to know about `FunctionBuilder` at all.
+    /// need to know about [`FunctionBuilder`] at all.
     pub fn cursor(&mut self) -> FuncCursor {
         self.ensure_inserted_block();
         FuncCursor::new(self.func)
@@ -565,7 +641,7 @@ impl<'a> FunctionBuilder<'a> {
             .at_bottom(self.position.unwrap())
     }
 
-    /// Append parameters to the given `Block` corresponding to the function
+    /// Append parameters to the given [`Block`] corresponding to the function
     /// parameters. This can be used to set up the block parameters for the
     /// entry block.
     pub fn append_block_params_for_function_params(&mut self, block: Block) {
@@ -589,7 +665,7 @@ impl<'a> FunctionBuilder<'a> {
         }
     }
 
-    /// Append parameters to the given `Block` corresponding to the function
+    /// Append parameters to the given [`Block`] corresponding to the function
     /// return values. This can be used to set up the block parameters for a
     /// function exit block.
     pub fn append_block_params_for_function_returns(&mut self, block: Block) {
@@ -610,9 +686,9 @@ impl<'a> FunctionBuilder<'a> {
 
     /// Declare that translation of the current function is complete.
     ///
-    /// This resets the state of the `FunctionBuilderContext` in preparation to
+    /// This resets the state of the [`FunctionBuilderContext`] in preparation to
     /// be used for another function.
-    pub fn finalize(self) {
+    pub fn finalize(mut self) {
         // Check that all the `Block`s are filled and sealed.
         #[cfg(debug_assertions)]
         {
@@ -620,13 +696,11 @@ impl<'a> FunctionBuilder<'a> {
                 if !self.is_pristine(block) {
                     assert!(
                         self.func_ctx.ssa.is_sealed(block),
-                        "FunctionBuilder finalized, but block {} is not sealed",
-                        block,
+                        "FunctionBuilder finalized, but block {block} is not sealed",
                     );
                     assert!(
                         self.is_filled(block),
-                        "FunctionBuilder finalized, but block {} is not filled",
-                        block,
+                        "FunctionBuilder finalized, but block {block} is not filled",
                     );
                 }
             }
@@ -639,12 +713,15 @@ impl<'a> FunctionBuilder<'a> {
             for block in self.func_ctx.status.keys() {
                 if let Err((inst, msg)) = self.func.is_block_basic(block) {
                     let inst_str = self.func.dfg.display_inst(inst);
-                    panic!(
-                        "{} failed basic block invariants on {}: {}",
-                        block, inst_str, msg
-                    );
+                    panic!("{block} failed basic block invariants on {inst_str}: {msg}");
                 }
             }
+        }
+
+        if !self.func_ctx.stack_map_values.is_empty() {
+            self.func_ctx
+                .safepoints
+                .run(&mut self.func, &self.func_ctx.stack_map_values);
         }
 
         // Clear the state (but preserve the allocated buffers) in preparation
@@ -659,18 +736,19 @@ impl<'a> FunctionBuilder<'a> {
 /// function. The functions below help you inspect the function you're creating and modify it
 /// in ways that can be unsafe if used incorrectly.
 impl<'a> FunctionBuilder<'a> {
-    /// Retrieves all the parameters for a `Block` currently inferred from the jump instructions
+    /// Retrieves all the parameters for a [`Block`] currently inferred from the jump instructions
     /// inserted that target it and the SSA construction.
     pub fn block_params(&self, block: Block) -> &[Value] {
         self.func.dfg.block_params(block)
     }
 
-    /// Retrieves the signature with reference `sigref` previously added with `import_signature`.
+    /// Retrieves the signature with reference `sigref` previously added with
+    /// [`import_signature`](Self::import_signature).
     pub fn signature(&self, sigref: SigRef) -> Option<&Signature> {
         self.func.dfg.signatures.get(sigref)
     }
 
-    /// Creates a parameter for a specific `Block` by appending it to the list of already existing
+    /// Creates a parameter for a specific [`Block`] by appending it to the list of already existing
     /// parameters.
     ///
     /// **Note:** this function has to be called at the creation of the `Block` before adding
@@ -703,7 +781,7 @@ impl<'a> FunctionBuilder<'a> {
         }
     }
 
-    /// Returns `true` if and only if the current `Block` is sealed and has no predecessors declared.
+    /// Returns `true` if and only if the current [`Block`] is sealed and has no predecessors declared.
     ///
     /// The entry block of a function is never unreachable.
     pub fn is_unreachable(&self) -> bool {
@@ -720,13 +798,13 @@ impl<'a> FunctionBuilder<'a> {
     }
 
     /// Returns `true` if and only if no instructions have been added since the last call to
-    /// `switch_to_block`.
+    /// [`switch_to_block`](Self::switch_to_block).
     fn is_pristine(&self, block: Block) -> bool {
         self.func_ctx.status[block] == BlockStatus::Empty
     }
 
     /// Returns `true` if and only if a terminator instruction has been inserted since the
-    /// last call to `switch_to_block`.
+    /// last call to [`switch_to_block`](Self::switch_to_block).
     fn is_filled(&self, block: Block) -> bool {
         self.func_ctx.status[block] == BlockStatus::Filled
     }
@@ -753,6 +831,7 @@ impl<'a> FunctionBuilder<'a> {
             s.params.push(AbiParam::new(pointer_type));
             s.params.push(AbiParam::new(pointer_type));
             s.params.push(AbiParam::new(pointer_type));
+            s.returns.push(AbiParam::new(pointer_type));
             self.import_signature(s)
         };
 
@@ -853,6 +932,7 @@ impl<'a> FunctionBuilder<'a> {
             s.params.push(AbiParam::new(pointer_type));
             s.params.push(AbiParam::new(types::I32));
             s.params.push(AbiParam::new(pointer_type));
+            s.returns.push(AbiParam::new(pointer_type));
             self.import_signature(s)
         };
 
@@ -949,6 +1029,7 @@ impl<'a> FunctionBuilder<'a> {
             s.params.push(AbiParam::new(pointer_type));
             s.params.push(AbiParam::new(pointer_type));
             s.params.push(AbiParam::new(pointer_type));
+            s.returns.push(AbiParam::new(pointer_type));
             self.import_signature(s)
         };
 
@@ -1035,7 +1116,7 @@ impl<'a> FunctionBuilder<'a> {
             | SignedGreaterThanOrEqual
             | SignedGreaterThan
             | SignedLessThanOrEqual => {
-                panic!("Signed comparison {} not supported by memcmp", int_cc)
+                panic!("Signed comparison {int_cc} not supported by memcmp")
             }
         };
 
@@ -1095,9 +1176,6 @@ impl<'a> FunctionBuilder<'a> {
     }
 
     fn handle_ssa_side_effects(&mut self, side_effects: SideEffects) {
-        for split_block in side_effects.split_blocks_created {
-            self.func_ctx.status[split_block] = BlockStatus::Filled;
-        }
         for modified_block in side_effects.instructions_added_to_blocks {
             if self.is_pristine(modified_block) {
                 self.func_ctx.status[modified_block] = BlockStatus::Partial;
@@ -1235,12 +1313,12 @@ mod tests {
 
     #[track_caller]
     fn check(func: &Function, expected_ir: &str) {
+        let expected_ir = expected_ir.trim();
         let actual_ir = func.display().to_string();
+        let actual_ir = actual_ir.trim();
         assert!(
             expected_ir == actual_ir,
-            "Expected:\n{}\nGot:\n{}",
-            expected_ir,
-            actual_ir
+            "Expected:\n{expected_ir}\nGot:\n{actual_ir}"
         );
     }
 
@@ -1249,6 +1327,7 @@ mod tests {
         TargetFrontendConfig {
             default_call_conv: CallConv::SystemV,
             pointer_width: PointerWidth::U64,
+            page_size_align_log2: 12,
         }
     }
 
@@ -1286,15 +1365,15 @@ mod tests {
         check(
             &func,
             "function %sample() -> i32 system_v {
-    sig0 = (i64, i64, i64) system_v
+    sig0 = (i64, i64, i64) -> i64 system_v
     fn0 = %Memcpy sig0
 
 block0:
+    v4 = iconst.i64 0
+    v1 -> v4
     v3 = iconst.i64 0
-    v1 -> v3
-    v2 = iconst.i64 0
-    v0 -> v2
-    call fn0(v1, v0, v1)  ; v1 = 0, v0 = 0, v1 = 0
+    v0 -> v3
+    v2 = call fn0(v1, v0, v1)  ; v1 = 0, v0 = 0, v1 = 0
     return v1  ; v1 = 0
 }
 ",
@@ -1396,16 +1475,16 @@ block0:
         check(
             &func,
             "function %sample() -> i32 system_v {
-    sig0 = (i64, i64, i64) system_v
+    sig0 = (i64, i64, i64) -> i64 system_v
     fn0 = %Memcpy sig0
 
 block0:
+    v5 = iconst.i64 0
+    v1 -> v5
     v4 = iconst.i64 0
-    v1 -> v4
-    v3 = iconst.i64 0
-    v0 -> v3
+    v0 -> v4
     v2 = iconst.i64 8192
-    call fn0(v1, v0, v2)  ; v1 = 0, v0 = 0, v2 = 8192
+    v3 = call fn0(v1, v0, v2)  ; v1 = 0, v0 = 0, v2 = 8192
     return v1  ; v1 = 0
 }
 ",
@@ -1481,16 +1560,16 @@ block0:
         check(
             &func,
             "function %sample() -> i32 system_v {
-    sig0 = (i64, i32, i64) system_v
+    sig0 = (i64, i32, i64) -> i64 system_v
     fn0 = %Memset sig0
 
 block0:
-    v4 = iconst.i64 0
-    v0 -> v4
+    v5 = iconst.i64 0
+    v0 -> v5
     v1 = iconst.i8 1
     v2 = iconst.i64 8192
     v3 = uextend.i32 v1  ; v1 = 1
-    call fn0(v0, v3, v2)  ; v0 = 0, v2 = 8192
+    v4 = call fn0(v0, v3, v2)  ; v0 = 0, v2 = 8192
     return v0  ; v0 = 0
 }
 ",
@@ -1754,7 +1833,7 @@ block0:
 
         check(
             &func,
-            &format!("function %sample() -> i8 system_v {{{}\n}}\n", expected),
+            &format!("function %sample() -> i8 system_v {{{expected}\n}}\n"),
         );
     }
 
@@ -1850,5 +1929,35 @@ block0:
                 ))
             );
         }
+    }
+
+    #[test]
+    fn test_builder_with_iconst_and_negative_constant() {
+        let sig = Signature::new(CallConv::SystemV);
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let mut func = Function::with_name_signature(UserFuncName::testcase("sample"), sig);
+
+        let mut builder = FunctionBuilder::new(&mut func, &mut fn_ctx);
+
+        let block0 = builder.create_block();
+        builder.switch_to_block(block0);
+        builder.ins().iconst(I32, -1);
+        builder.ins().return_(&[]);
+
+        builder.seal_all_blocks();
+        builder.finalize();
+
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        let ctx = cranelift_codegen::Context::for_function(func);
+        ctx.verify(&flags).expect("should be valid");
+
+        check(
+            &ctx.func,
+            "function %sample() system_v {
+block0:
+    v0 = iconst.i32 -1
+    return
+}",
+        );
     }
 }

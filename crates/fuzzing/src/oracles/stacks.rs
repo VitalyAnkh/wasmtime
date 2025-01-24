@@ -1,5 +1,5 @@
 use crate::generators::Stacks;
-use anyhow::{bail, Result};
+use anyhow::bail;
 use wasmtime::*;
 
 /// Run the given `Stacks` test case and assert that the host's view of the Wasm
@@ -40,7 +40,10 @@ pub fn check_stacks(stacks: Stacks) -> usize {
             "call_func",
             |mut caller: Caller<'_, ()>, f: Option<Func>| {
                 let f = f.unwrap();
-                f.call(&mut caller, &[], &mut [])?;
+                let ty = f.ty(&caller);
+                let params = vec![Val::I32(0); ty.params().len()];
+                let mut results = vec![Val::I32(0); ty.results().len()];
+                f.call(&mut caller, &params, &mut results)?;
                 Ok(())
             },
         )

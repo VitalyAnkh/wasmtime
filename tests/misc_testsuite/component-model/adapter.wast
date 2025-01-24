@@ -1,3 +1,5 @@
+;;! multi_memory = true
+
 ;; basic function lifting
 (component
   (core module $m
@@ -121,7 +123,9 @@
     (memory (export "memory") 0)
   )
   (core instance $m (instantiate $m))
-  (func $f (param "a" (list (record)))
+  (type $t' (result))
+  (export $t "t" (type $t'))
+  (func $f (param "a" (list $t))
     (canon lift
       (core func $m "x")
       (realloc (func $m "realloc"))

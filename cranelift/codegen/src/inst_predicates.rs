@@ -1,12 +1,6 @@
 //! Instruction predicates/properties, shared by various analyses.
 use crate::ir::immediates::Offset32;
-use crate::ir::{self, Block, DataFlowGraph, Function, Inst, InstructionData, Opcode, Type, Value};
-use cranelift_entity::EntityRef;
-
-/// Preserve instructions with used result values.
-pub fn any_inst_results_used(inst: Inst, live: &[bool], dfg: &DataFlowGraph) -> bool {
-    dfg.inst_results(inst).iter().any(|v| live[v.index()])
-}
+use crate::ir::{self, Block, Function, Inst, InstructionData, Opcode, Type, Value};
 
 /// Test whether the given opcode is unsafe to even consider as side-effect-free.
 #[inline(always)]
@@ -38,7 +32,7 @@ fn is_load_with_defined_trapping(opcode: Opcode, data: &InstructionData) -> bool
 /// Does the given instruction have any side-effect that would preclude it from being removed when
 /// its value is unused?
 #[inline(always)]
-pub fn has_side_effect(func: &Function, inst: Inst) -> bool {
+fn has_side_effect(func: &Function, inst: Inst) -> bool {
     let data = &func.dfg.insts[inst];
     let opcode = data.opcode();
     trivially_has_side_effects(opcode) || is_load_with_defined_trapping(opcode, data)
@@ -58,9 +52,10 @@ pub fn is_pure_for_egraph(func: &Function, inst: Inst) -> bool {
         } => flags.readonly() && flags.notrap(),
         _ => false,
     };
+
     // Multi-value results do not play nicely with much of the egraph
     // infrastructure. They are in practice used only for multi-return
-    // calls and some other odd instructions (e.g. iadd_cout) which,
+    // calls and some other odd instructions (e.g. uadd_overflow) which,
     // for now, we can afford to leave in place as opaque
     // side-effecting ops. So if more than one result, then the inst
     // is "not pure". Similarly, ops with zero results can be used
@@ -73,6 +68,24 @@ pub fn is_pure_for_egraph(func: &Function, inst: Inst) -> bool {
     has_one_result && (is_readonly_load || (!op.can_load() && !trivially_has_side_effects(op)))
 }
 
+/// Can the given instruction be merged into another copy of itself?
+/// These instructions may have side-effects, but as long as we retain
+/// the first instance of the instruction, the second and further
+/// instances are redundant if they would produce the same trap or
+/// result.
+pub fn is_mergeable_for_egraph(func: &Function, inst: Inst) -> bool {
+    let op = func.dfg.insts[inst].opcode();
+    // We can only merge zero- and one-result operators due to the way that GVN
+    // is structured in the egraph implementation.
+    func.dfg.inst_results(inst).len() <= 1
+        // Loads/stores are handled by alias analysis and not
+        // otherwise mergeable.
+        && !op.can_load()
+        && !op.can_store()
+        // Can only have idempotent side-effects.
+        && (!has_side_effect(func, inst) || op.side_effects_idempotent())
+}
+
 /// Does the given instruction have any side-effect as per [has_side_effect], or else is a load,
 /// but not the get_pinned_reg opcode?
 pub fn has_lowering_side_effect(func: &Function, inst: Inst) -> bool {
@@ -83,12 +96,9 @@ pub fn has_lowering_side_effect(func: &Function, inst: Inst) -> bool {
 /// Is the given instruction a constant value (`iconst`, `fconst`) that can be
 /// represented in 64 bits?
 pub fn is_constant_64bit(func: &Function, inst: Inst) -> Option<u64> {
-    let data = &func.dfg.insts[inst];
-    if data.opcode() == Opcode::Null {
-        return Some(0);
-    }
-    match data {
+    match &func.dfg.insts[inst] {
         &InstructionData::UnaryImm { imm, .. } => Some(imm.bits() as u64),
+        &InstructionData::UnaryIeee16 { imm, .. } => Some(imm.bits() as u64),
         &InstructionData::UnaryIeee32 { imm, .. } => Some(imm.bits() as u64),
         &InstructionData::UnaryIeee64 { imm, .. } => Some(imm.bits()),
         _ => None,
@@ -97,8 +107,7 @@ pub fn is_constant_64bit(func: &Function, inst: Inst) -> Option<u64> {
 
 /// Get the address, offset, and access type from the given instruction, if any.
 pub fn inst_addr_offset_type(func: &Function, inst: Inst) -> Option<(Value, Offset32, Type)> {
-    let data = &func.dfg.insts[inst];
-    match data {
+    match &func.dfg.insts[inst] {
         InstructionData::Load { arg, offset, .. } => {
             let ty = func.dfg.value_type(func.dfg.inst_results(inst)[0]);
             Some((*arg, *offset, ty))
@@ -121,8 +130,7 @@ pub fn inst_addr_offset_type(func: &Function, inst: Inst) -> Option<(Value, Offs
 
 /// Get the store data, if any, from an instruction.
 pub fn inst_store_data(func: &Function, inst: Inst) -> Option<Value> {
-    let data = &func.dfg.insts[inst];
-    match data {
+    match &func.dfg.insts[inst] {
         InstructionData::Store { args, .. } | InstructionData::StoreNoOffset { args, .. } => {
             Some(args[0])
         }

@@ -5,7 +5,9 @@
 
 use crate::entity::SecondaryMap;
 use crate::ir::entities::AnyEntity;
-use crate::ir::{Block, DataFlowGraph, Function, Inst, SigRef, Type, Value, ValueDef};
+use crate::ir::immediates::Ieee128;
+use crate::ir::pcc::Fact;
+use crate::ir::{Block, DataFlowGraph, Function, Inst, Opcode, SigRef, Type, Value, ValueDef};
 use crate::packed_option::ReservedValue;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -43,31 +45,30 @@ pub trait FuncWriter {
 
         for (ss, slot) in func.dynamic_stack_slots.iter() {
             any = true;
-            self.write_entity_definition(w, func, ss.into(), slot)?;
+            self.write_entity_definition(w, func, ss.into(), slot, None)?;
         }
 
         for (ss, slot) in func.sized_stack_slots.iter() {
             any = true;
-            self.write_entity_definition(w, func, ss.into(), slot)?;
+            self.write_entity_definition(w, func, ss.into(), slot, None)?;
         }
 
         for (gv, gv_data) in &func.global_values {
             any = true;
-            self.write_entity_definition(w, func, gv.into(), gv_data)?;
+            let maybe_fact = func.global_value_facts[gv].as_ref();
+            self.write_entity_definition(w, func, gv.into(), gv_data, maybe_fact)?;
         }
 
-        for (table, table_data) in &func.tables {
-            if !table_data.index_type.is_invalid() {
-                any = true;
-                self.write_entity_definition(w, func, table.into(), table_data)?;
-            }
+        for (mt, mt_data) in &func.memory_types {
+            any = true;
+            self.write_entity_definition(w, func, mt.into(), mt_data, None)?;
         }
 
         // Write out all signatures before functions since function declarations can refer to
         // signatures.
         for (sig, sig_data) in &func.dfg.signatures {
             any = true;
-            self.write_entity_definition(w, func, sig.into(), &sig_data)?;
+            self.write_entity_definition(w, func, sig.into(), &sig_data, None)?;
         }
 
         for (fnref, ext_func) in &func.dfg.ext_funcs {
@@ -78,18 +79,19 @@ pub trait FuncWriter {
                     func,
                     fnref.into(),
                     &ext_func.display(Some(&func.params)),
+                    None,
                 )?;
             }
         }
 
         for (&cref, cval) in func.dfg.constants.iter() {
             any = true;
-            self.write_entity_definition(w, func, cref.into(), cval)?;
+            self.write_entity_definition(w, func, cref.into(), cval, None)?;
         }
 
         if let Some(limit) = func.stack_limit {
             any = true;
-            self.write_entity_definition(w, func, AnyEntity::StackLimit, &limit)?;
+            self.write_entity_definition(w, func, AnyEntity::StackLimit, &limit, None)?;
         }
 
         Ok(any)
@@ -102,8 +104,9 @@ pub trait FuncWriter {
         func: &Function,
         entity: AnyEntity,
         value: &dyn fmt::Display,
+        maybe_fact: Option<&Fact>,
     ) -> fmt::Result {
-        self.super_entity_definition(w, func, entity, value)
+        self.super_entity_definition(w, func, entity, value, maybe_fact)
     }
 
     /// Default impl of `write_entity_definition`
@@ -114,8 +117,13 @@ pub trait FuncWriter {
         func: &Function,
         entity: AnyEntity,
         value: &dyn fmt::Display,
+        maybe_fact: Option<&Fact>,
     ) -> fmt::Result {
-        writeln!(w, "    {} = {}", entity, value)
+        if let Some(fact) = maybe_fact {
+            writeln!(w, "    {entity} ! {fact} = {value}")
+        } else {
+            writeln!(w, "    {entity} = {value}")
+        }
     }
 }
 
@@ -199,14 +207,19 @@ fn write_spec(w: &mut dyn Write, func: &Function) -> fmt::Result {
 // Basic blocks
 
 fn write_arg(w: &mut dyn Write, func: &Function, arg: Value) -> fmt::Result {
-    write!(w, "{}: {}", arg, func.dfg.value_type(arg))
+    let ty = func.dfg.value_type(arg);
+    if let Some(f) = &func.dfg.facts[arg] {
+        write!(w, "{arg} ! {f}: {ty}")
+    } else {
+        write!(w, "{arg}: {ty}")
+    }
 }
 
 /// Write out the basic block header, outdented:
 ///
 ///    block1:
 ///    block1(v1: i32):
-///    block10(v4: f64, v5: b1):
+///    block10(v4: f64, v5: i8):
 ///
 pub fn write_block_header(
     w: &mut dyn Write,
@@ -225,7 +238,7 @@ pub fn write_block_header(
 
     let mut args = func.dfg.block_params(block).iter().cloned();
     match args.next() {
-        None => return writeln!(w, "{}:", cold),
+        None => return writeln!(w, "{cold}:"),
         Some(arg) => {
             write!(w, "(")?;
             write_arg(w, func, arg)?;
@@ -236,7 +249,7 @@ pub fn write_block_header(
         write!(w, ", ")?;
         write_arg(w, func, arg)?;
     }
-    writeln!(w, "){}:", cold)
+    writeln!(w, "){cold}:")
 }
 
 fn decorate_block<FW: FuncWriter>(
@@ -331,20 +344,23 @@ fn write_instruction(
     // Source location goes first.
     let srcloc = func.srcloc(inst);
     if !srcloc.is_default() {
-        write!(s, "{} ", srcloc)?;
+        write!(s, "{srcloc} ")?;
     }
 
     // Write out prefix and indent the instruction.
-    write!(w, "{1:0$}", indent, s)?;
+    write!(w, "{s:indent$}")?;
 
     // Write out the result values, if any.
     let mut has_results = false;
     for r in func.dfg.inst_results(inst) {
         if !has_results {
             has_results = true;
-            write!(w, "{}", r)?;
+            write!(w, "{r}")?;
         } else {
-            write!(w, ", {}", r)?;
+            write!(w, ", {r}")?;
+        }
+        if let Some(f) = &func.dfg.facts[*r] {
+            write!(w, " ! {f}")?;
         }
     }
     if has_results {
@@ -355,8 +371,8 @@ fn write_instruction(
     let opcode = func.dfg.insts[inst].opcode();
 
     match type_suffix(func, inst) {
-        Some(suf) => write!(w, "{}.{}", opcode, suf)?,
-        None => write!(w, "{}", opcode)?,
+        Some(suf) => write!(w, "{opcode}.{suf}")?,
+        None => write!(w, "{opcode}")?,
     }
 
     write_operands(w, &func.dfg, inst)?;
@@ -374,22 +390,36 @@ pub fn write_operands(w: &mut dyn Write, dfg: &DataFlowGraph, inst: Inst) -> fmt
     let pool = &dfg.value_lists;
     let jump_tables = &dfg.jump_tables;
     use crate::ir::instructions::InstructionData::*;
+    let ctrl_ty = dfg.ctrl_typevar(inst);
     match dfg.insts[inst] {
         AtomicRmw { op, args, .. } => write!(w, " {} {}, {}", op, args[0], args[1]),
         AtomicCas { args, .. } => write!(w, " {}, {}, {}", args[0], args[1], args[2]),
-        LoadNoOffset { flags, arg, .. } => write!(w, "{} {}", flags, arg),
+        LoadNoOffset { flags, arg, .. } => write!(w, "{flags} {arg}"),
         StoreNoOffset { flags, args, .. } => write!(w, "{} {}, {}", flags, args[0], args[1]),
-        Unary { arg, .. } => write!(w, " {}", arg),
-        UnaryImm { imm, .. } => write!(w, " {}", imm),
-        UnaryIeee32 { imm, .. } => write!(w, " {}", imm),
-        UnaryIeee64 { imm, .. } => write!(w, " {}", imm),
-        UnaryGlobalValue { global_value, .. } => write!(w, " {}", global_value),
+        Unary { arg, .. } => write!(w, " {arg}"),
+        UnaryImm { imm, .. } => write!(w, " {}", {
+            let mut imm = imm;
+            if ctrl_ty.bits() != 0 {
+                imm = imm.sign_extend_from_width(ctrl_ty.bits());
+            }
+            imm
+        }),
+        UnaryIeee16 { imm, .. } => write!(w, " {imm}"),
+        UnaryIeee32 { imm, .. } => write!(w, " {imm}"),
+        UnaryIeee64 { imm, .. } => write!(w, " {imm}"),
+        UnaryGlobalValue { global_value, .. } => write!(w, " {global_value}"),
         UnaryConst {
             constant_handle, ..
-        } => write!(w, " {}", constant_handle),
+        } => write!(w, " {constant_handle}"),
         Binary { args, .. } => write!(w, " {}, {}", args[0], args[1]),
-        BinaryImm8 { arg, imm, .. } => write!(w, " {}, {}", arg, imm),
-        BinaryImm64 { arg, imm, .. } => write!(w, " {}, {}", arg, imm),
+        BinaryImm8 { arg, imm, .. } => write!(w, " {arg}, {imm}"),
+        BinaryImm64 { arg, imm, .. } => write!(w, " {}, {}", arg, {
+            let mut imm = imm;
+            if ctrl_ty.bits() != 0 {
+                imm = imm.sign_extend_from_width(ctrl_ty.bits());
+            }
+            imm
+        }),
         Ternary { args, .. } => write!(w, " {}, {}, {}", args[0], args[1], args[2]),
         MultiAry { ref args, .. } => {
             if args.is_empty() {
@@ -407,7 +437,13 @@ pub fn write_operands(w: &mut dyn Write, dfg: &DataFlowGraph, inst: Inst) -> fmt
             write!(w, " {}, {}, {}", args[0], args[1], data)
         }
         IntCompare { cond, args, .. } => write!(w, " {} {}, {}", cond, args[0], args[1]),
-        IntCompareImm { cond, arg, imm, .. } => write!(w, " {} {}, {}", cond, arg, imm),
+        IntCompareImm { cond, arg, imm, .. } => write!(w, " {} {}, {}", cond, arg, {
+            let mut imm = imm;
+            if ctrl_ty.bits() != 0 {
+                imm = imm.sign_extend_from_width(ctrl_ty.bits());
+            }
+            imm
+        }),
         IntAddTrap { args, code, .. } => write!(w, " {}, {}, {}", args[0], args[1], code),
         FloatCompare { cond, args, .. } => write!(w, " {} {}, {}", cond, args[0], args[1]),
         Jump { destination, .. } => {
@@ -426,7 +462,10 @@ pub fn write_operands(w: &mut dyn Write, dfg: &DataFlowGraph, inst: Inst) -> fmt
         }
         Call {
             func_ref, ref args, ..
-        } => write!(w, " {}({})", func_ref, DisplayValues(args.as_slice(pool))),
+        } => {
+            write!(w, " {}({})", func_ref, DisplayValues(args.as_slice(pool)))?;
+            write_user_stack_map_entries(w, dfg, inst)
+        }
         CallIndirect {
             sig_ref, ref args, ..
         } => {
@@ -437,56 +476,87 @@ pub fn write_operands(w: &mut dyn Write, dfg: &DataFlowGraph, inst: Inst) -> fmt
                 sig_ref,
                 args[0],
                 DisplayValues(&args[1..])
-            )
+            )?;
+            write_user_stack_map_entries(w, dfg, inst)
         }
-        FuncAddr { func_ref, .. } => write!(w, " {}", func_ref),
+        FuncAddr { func_ref, .. } => write!(w, " {func_ref}"),
         StackLoad {
             stack_slot, offset, ..
-        } => write!(w, " {}{}", stack_slot, offset),
+        } => write!(w, " {stack_slot}{offset}"),
         StackStore {
             arg,
             stack_slot,
             offset,
             ..
-        } => write!(w, " {}, {}{}", arg, stack_slot, offset),
+        } => write!(w, " {arg}, {stack_slot}{offset}"),
         DynamicStackLoad {
             dynamic_stack_slot, ..
-        } => write!(w, " {}", dynamic_stack_slot),
+        } => write!(w, " {dynamic_stack_slot}"),
         DynamicStackStore {
             arg,
             dynamic_stack_slot,
             ..
-        } => write!(w, " {}, {}", arg, dynamic_stack_slot),
-        TableAddr { table, arg, .. } => write!(w, " {}, {}", table, arg),
+        } => write!(w, " {arg}, {dynamic_stack_slot}"),
         Load {
             flags, arg, offset, ..
-        } => write!(w, "{} {}{}", flags, arg, offset),
+        } => write!(w, "{flags} {arg}{offset}"),
         Store {
             flags,
             args,
             offset,
             ..
         } => write!(w, "{} {}, {}{}", flags, args[0], args[1], offset),
-        Trap { code, .. } => write!(w, " {}", code),
-        CondTrap { arg, code, .. } => write!(w, " {}, {}", arg, code),
+        Trap { code, .. } => write!(w, " {code}"),
+        CondTrap { arg, code, .. } => write!(w, " {arg}, {code}"),
     }?;
 
     let mut sep = "  ; ";
     for arg in dfg.inst_values(inst) {
         if let ValueDef::Result(src, _) = dfg.value_def(arg) {
             let imm = match dfg.insts[src] {
-                UnaryImm { imm, .. } => imm.to_string(),
+                UnaryImm { imm, .. } => {
+                    let mut imm = imm;
+                    if dfg.ctrl_typevar(src).bits() != 0 {
+                        imm = imm.sign_extend_from_width(dfg.ctrl_typevar(src).bits());
+                    }
+                    imm.to_string()
+                }
+                UnaryIeee16 { imm, .. } => imm.to_string(),
                 UnaryIeee32 { imm, .. } => imm.to_string(),
                 UnaryIeee64 { imm, .. } => imm.to_string(),
+                UnaryConst {
+                    constant_handle,
+                    opcode: Opcode::F128const,
+                } => Ieee128::try_from(dfg.constants.get(constant_handle))
+                    .expect("16-byte f128 constant")
+                    .to_string(),
                 UnaryConst {
                     constant_handle, ..
                 } => constant_handle.to_string(),
                 _ => continue,
             };
-            write!(w, "{}{} = {}", sep, arg, imm)?;
+            write!(w, "{sep}{arg} = {imm}")?;
             sep = ", ";
         }
     }
+    Ok(())
+}
+
+fn write_user_stack_map_entries(w: &mut dyn Write, dfg: &DataFlowGraph, inst: Inst) -> fmt::Result {
+    let entries = match dfg.user_stack_map_entries(inst) {
+        None => return Ok(()),
+        Some(es) => es,
+    };
+    write!(w, ", stack_map=[")?;
+    let mut need_comma = false;
+    for entry in entries {
+        if need_comma {
+            write!(w, ", ")?;
+        }
+        write!(w, "{} @ {}+{}", entry.ty, entry.slot, entry.offset)?;
+        need_comma = true;
+    }
+    write!(w, "]")?;
     Ok(())
 }
 
@@ -497,9 +567,9 @@ impl<'a> fmt::Display for DisplayValues<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for (i, val) in self.0.iter().enumerate() {
             if i == 0 {
-                write!(f, "{}", val)?;
+                write!(f, "{val}")?;
             } else {
-                write!(f, ", {}", val)?;
+                write!(f, ", {val}")?;
             }
         }
         Ok(())
@@ -521,7 +591,7 @@ mod tests {
         f.name = UserFuncName::testcase("foo");
         assert_eq!(f.to_string(), "function %foo() fast {\n}\n");
 
-        f.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4));
+        f.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 0));
         assert_eq!(
             f.to_string(),
             "function %foo() fast {\n    ss0 = explicit_slot 4\n}\n"
@@ -554,6 +624,13 @@ mod tests {
         assert_eq!(
             f.to_string(),
             "function %foo() fast {\n    ss0 = explicit_slot 4\n\nblock0(v0: i8, v1: f32x4):\n    return\n}\n"
+        );
+
+        let mut f = Function::new();
+        f.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 2));
+        assert_eq!(
+            f.to_string(),
+            "function u0:0() fast {\n    ss0 = explicit_slot 4, align = 4\n}\n"
         );
     }
 

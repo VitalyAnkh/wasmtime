@@ -1,13 +1,13 @@
 use anyhow::Result;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use once_cell::unsync::Lazy;
+use std::cell::LazyCell;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
 use std::thread;
+use wasi_common::{sync::WasiCtxBuilder, WasiCtx};
 use wasmtime::*;
-use wasmtime_wasi::{sync::WasiCtxBuilder, WasiCtx};
 
 fn store(engine: &Engine) -> Store<WasiCtx> {
     let wasi = WasiCtxBuilder::new().build();
@@ -20,10 +20,11 @@ fn instantiate(pre: &InstancePre<WasiCtx>, engine: &Engine) -> Result<()> {
     Ok(())
 }
 
-fn benchmark_name<'a>(strategy: &InstanceAllocationStrategy) -> &'static str {
+fn benchmark_name(strategy: &InstanceAllocationStrategy) -> &'static str {
     match strategy {
         InstanceAllocationStrategy::OnDemand => "default",
         InstanceAllocationStrategy::Pooling { .. } => "pooling",
+        _ => unreachable!(),
     }
 }
 
@@ -35,7 +36,7 @@ fn bench_sequential(c: &mut Criterion, path: &Path) {
             benchmark_name(&strategy),
             path.file_name().unwrap().to_str().unwrap(),
         );
-        let state = Lazy::new(|| {
+        let state = LazyCell::new(|| {
             let mut config = Config::default();
             config.allocation_strategy(strategy.clone());
 
@@ -44,7 +45,11 @@ fn bench_sequential(c: &mut Criterion, path: &Path) {
                 panic!("failed to load benchmark `{}`: {:?}", path.display(), e)
             });
             let mut linker = Linker::new(&engine);
-            wasmtime_wasi::add_to_linker(&mut linker, |cx| cx).unwrap();
+            // Add these imports so we can benchmark instantiation of Sightglass
+            // benchmark programs.
+            linker.func_wrap("bench", "start", || {}).unwrap();
+            linker.func_wrap("bench", "end", || {}).unwrap();
+            wasi_common::sync::add_to_linker(&mut linker, |cx| cx).unwrap();
             let pre = linker
                 .instantiate_pre(&module)
                 .expect("failed to pre-instantiate");
@@ -66,7 +71,7 @@ fn bench_parallel(c: &mut Criterion, path: &Path) {
     let mut group = c.benchmark_group("parallel");
 
     for strategy in strategies() {
-        let state = Lazy::new(|| {
+        let state = LazyCell::new(|| {
             let mut config = Config::default();
             config.allocation_strategy(strategy.clone());
 
@@ -74,7 +79,11 @@ fn bench_parallel(c: &mut Criterion, path: &Path) {
             let module =
                 Module::from_file(&engine, path).expect("failed to load WASI example module");
             let mut linker = Linker::new(&engine);
-            wasmtime_wasi::add_to_linker(&mut linker, |cx| cx).unwrap();
+            // Add these imports so we can benchmark instantiation of Sightglass
+            // benchmark programs.
+            linker.func_wrap("bench", "start", || {}).unwrap();
+            linker.func_wrap("bench", "end", || {}).unwrap();
+            wasi_common::sync::add_to_linker(&mut linker, |cx| cx).unwrap();
             let pre = Arc::new(
                 linker
                     .instantiate_pre(&module)
@@ -145,14 +154,21 @@ fn bench_deserialize_module(c: &mut Criterion, path: &Path) {
 
     let name = path.file_name().unwrap().to_str().unwrap();
     let tmpfile = tempfile::NamedTempFile::new().unwrap();
-    let state = Lazy::new(|| {
+    let state = LazyCell::new(|| {
         let engine = Engine::default();
         let module = Module::from_file(&engine, path).expect("failed to load WASI example module");
-        std::fs::write(tmpfile.path(), module.serialize().unwrap()).unwrap();
-        (engine, tmpfile.path())
+        let bytes = module.serialize().unwrap();
+        std::fs::write(tmpfile.path(), bytes.clone()).unwrap();
+        (engine, bytes, tmpfile.path())
     });
     group.bench_function(BenchmarkId::new("deserialize", name), |b| {
-        let (engine, path) = &*state;
+        let (engine, bytes, _) = &*state;
+        b.iter(|| unsafe {
+            Module::deserialize(&engine, bytes).unwrap();
+        });
+    });
+    group.bench_function(BenchmarkId::new("deserialize_file", name), |b| {
+        let (engine, _, path) = &*state;
         b.iter(|| unsafe {
             Module::deserialize_file(&engine, path).unwrap();
         });
@@ -170,7 +186,7 @@ fn build_wasi_example() {
             "-p",
             "example-wasi-wasm",
             "--target",
-            "wasm32-wasi",
+            "wasm32-wasip1",
         ])
         .spawn()
         .expect("failed to run cargo to build WASI example")
@@ -178,11 +194,11 @@ fn build_wasi_example() {
         .expect("failed to wait for cargo to build")
         .success()
     {
-        panic!("failed to build WASI example for target `wasm32-wasi`");
+        panic!("failed to build WASI example for target `wasm32-wasip1`");
     }
 
     std::fs::copy(
-        "target/wasm32-wasi/release/wasi.wasm",
+        "target/wasm32-wasip1/release/wasi.wasm",
         "benches/instantiation/wasi.wasm",
     )
     .expect("failed to copy WASI example module");
@@ -204,7 +220,7 @@ fn strategies() -> impl Iterator<Item = InstanceAllocationStrategy> {
         InstanceAllocationStrategy::OnDemand,
         InstanceAllocationStrategy::Pooling({
             let mut config = PoolingAllocationConfig::default();
-            config.instance_memory_pages(10_000);
+            config.max_memory_size(10_000 << 16);
             config
         }),
     ]

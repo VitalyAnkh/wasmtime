@@ -7,14 +7,18 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::{OwnedTargetIsa, TargetIsa};
 use cranelift_codegen::{ir, settings, CodegenError, Context};
+use cranelift_control::ControlPlane;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, ModuleError};
 use cranelift_native::builder_with_options;
 use cranelift_reader::TestFile;
+use pulley_interpreter::interp as pulley;
 use std::cmp::max;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::ptr::NonNull;
+use target_lexicon::Architecture;
 use thiserror::Error;
 
 const TESTFILE_NAMESPACE: u32 = 0;
@@ -49,6 +53,7 @@ struct DefinedFunction {
 /// "outside-of-function" functionality, see `cranelift_jit::backend::JITBackend`.
 ///
 /// ```
+/// # let ctrl_plane = &mut Default::default();
 /// use cranelift_filetests::TestFileCompiler;
 /// use cranelift_reader::parse_functions;
 /// use cranelift_codegen::data_value::DataValue;
@@ -57,8 +62,8 @@ struct DefinedFunction {
 /// let func = parse_functions(code).unwrap().into_iter().nth(0).unwrap();
 /// let mut compiler = TestFileCompiler::with_default_host_isa().unwrap();
 /// compiler.declare_function(&func).unwrap();
-/// compiler.define_function(func.clone()).unwrap();
-/// compiler.create_trampoline_for_function(&func).unwrap();
+/// compiler.define_function(func.clone(), ctrl_plane).unwrap();
+/// compiler.create_trampoline_for_function(&func, ctrl_plane).unwrap();
 /// let compiled = compiler.compile().unwrap();
 /// let trampoline = compiled.get_trampoline(&func).unwrap();
 ///
@@ -87,7 +92,32 @@ impl TestFileCompiler {
     /// host machine, this [TargetIsa] must match the host machine's ISA (see
     /// [TestFileCompiler::with_host_isa]).
     pub fn new(isa: OwnedTargetIsa) -> Self {
-        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let _ = &mut builder; // require mutability on all architectures
+        #[cfg(target_arch = "x86_64")]
+        {
+            builder.symbol_lookup_fn(Box::new(|name| {
+                if name == "__cranelift_x86_pshufb" {
+                    Some(__cranelift_x86_pshufb as *const u8)
+                } else {
+                    None
+                }
+            }));
+        }
+
+        // On Unix platforms force `libm` to get linked into this executable
+        // because tests that use libcalls rely on this library being present.
+        // Without this it's been seen that when cross-compiled to riscv64 the
+        // final binary doesn't link in `libm`.
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                safe fn ceilf(f: f32) -> f32;
+            }
+            let f = 1.2_f32;
+            assert_eq!(f.ceil(), ceilf(f));
+        }
+
         let module = JITModule::new(builder);
         let ctx = module.make_context();
 
@@ -114,20 +144,42 @@ impl TestFileCompiler {
         Self::with_host_isa(flags)
     }
 
-    /// Registers all functions in a [TestFile]. Additionally creates a trampoline for each one
-    /// of them.
-    pub fn add_testfile(&mut self, testfile: &TestFile) -> Result<()> {
+    /// Declares and compiles all functions in `functions`. Additionally creates a trampoline for
+    /// each one of them.
+    pub fn add_functions(
+        &mut self,
+        functions: &[Function],
+        ctrl_planes: Vec<ControlPlane>,
+    ) -> Result<()> {
         // Declare all functions in the file, so that they may refer to each other.
-        for (func, _) in &testfile.functions {
+        for func in functions {
             self.declare_function(func)?;
         }
 
+        let ctrl_planes = ctrl_planes
+            .into_iter()
+            .chain(std::iter::repeat(ControlPlane::default()));
+
         // Define all functions and trampolines
-        for (func, _) in &testfile.functions {
-            self.define_function(func.clone())?;
-            self.create_trampoline_for_function(func)?;
+        for (func, ref mut ctrl_plane) in functions.iter().zip(ctrl_planes) {
+            self.define_function(func.clone(), ctrl_plane)?;
+            self.create_trampoline_for_function(func, ctrl_plane)?;
         }
 
+        Ok(())
+    }
+
+    /// Registers all functions in a [TestFile]. Additionally creates a trampoline for each one
+    /// of them.
+    pub fn add_testfile(&mut self, testfile: &TestFile) -> Result<()> {
+        let functions = testfile
+            .functions
+            .iter()
+            .map(|(f, _)| f)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        self.add_functions(&functions[..], Vec::new())?;
         Ok(())
     }
 
@@ -203,21 +255,28 @@ impl TestFileCompiler {
     }
 
     /// Defines the body of a function
-    pub fn define_function(&mut self, func: Function) -> Result<()> {
+    pub fn define_function(&mut self, func: Function, ctrl_plane: &mut ControlPlane) -> Result<()> {
         let defined_func = self
             .defined_functions
             .get(&func.name)
             .ok_or(anyhow!("Undeclared function {} found!", &func.name))?;
 
         self.ctx.func = self.apply_func_rename(func, defined_func)?;
-        self.module
-            .define_function(defined_func.func_id, &mut self.ctx)?;
+        self.module.define_function_with_control_plane(
+            defined_func.func_id,
+            &mut self.ctx,
+            ctrl_plane,
+        )?;
         self.module.clear_context(&mut self.ctx);
         Ok(())
     }
 
     /// Creates and registers a trampoline for a function if none exists.
-    pub fn create_trampoline_for_function(&mut self, func: &Function) -> Result<()> {
+    pub fn create_trampoline_for_function(
+        &mut self,
+        func: &Function,
+        ctrl_plane: &mut ControlPlane,
+    ) -> Result<()> {
         if !self.defined_functions.contains_key(&func.name) {
             anyhow::bail!("Undeclared function {} found!", &func.name);
         }
@@ -232,7 +291,7 @@ impl TestFileCompiler {
         let trampoline = make_trampoline(name.clone(), &func.signature, self.module.isa());
 
         self.declare_function(&trampoline)?;
-        self.define_function(trampoline)?;
+        self.define_function(trampoline, ctrl_plane)?;
 
         self.trampolines.insert(func.signature.clone(), name);
 
@@ -314,11 +373,44 @@ impl<'a> Trampoline<'a> {
         let function_ptr = self.module.get_finalized_function(self.func_id);
         let trampoline_ptr = self.module.get_finalized_function(self.trampoline_id);
 
-        let callable_trampoline: fn(*const u8, *mut u128) -> () =
-            unsafe { mem::transmute(trampoline_ptr) };
-        callable_trampoline(function_ptr, arguments_address);
+        unsafe {
+            self.call_raw(trampoline_ptr, function_ptr, arguments_address);
+        }
 
         values.collect_returns(&self.func_signature)
+    }
+
+    unsafe fn call_raw(
+        &self,
+        trampoline_ptr: *const u8,
+        function_ptr: *const u8,
+        arguments_address: *mut u128,
+    ) {
+        match self.module.isa().triple().architecture {
+            // For the pulley target this is pulley bytecode, not machine code,
+            // so run the interpreter.
+            Architecture::Pulley32
+            | Architecture::Pulley64
+            | Architecture::Pulley32be
+            | Architecture::Pulley64be => {
+                let mut state = pulley::Vm::new();
+                state.call(
+                    NonNull::new(trampoline_ptr.cast_mut()).unwrap(),
+                    &[
+                        pulley::XRegVal::new_ptr(function_ptr.cast_mut()).into(),
+                        pulley::XRegVal::new_ptr(arguments_address).into(),
+                    ],
+                    [],
+                );
+            }
+
+            // Other targets natively execute this machine code.
+            _ => {
+                let callable_trampoline: fn(*const u8, *mut u128) -> () =
+                    unsafe { mem::transmute(trampoline_ptr) };
+                callable_trampoline(function_ptr, arguments_address);
+            }
+        }
     }
 }
 
@@ -469,6 +561,55 @@ fn make_trampoline(name: UserFuncName, signature: &ir::Signature, isa: &dyn Targ
     func
 }
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::__m128i;
+#[cfg(target_arch = "x86_64")]
+#[expect(
+    improper_ctypes_definitions,
+    reason = "manually verified to work for now"
+)]
+extern "C" fn __cranelift_x86_pshufb(a: __m128i, b: __m128i) -> __m128i {
+    union U {
+        reg: __m128i,
+        mem: [u8; 16],
+    }
+
+    unsafe {
+        let a = U { reg: a }.mem;
+        let b = U { reg: b }.mem;
+
+        let select = |arr: &[u8; 16], byte: u8| {
+            if byte & 0x80 != 0 {
+                0x00
+            } else {
+                arr[(byte & 0xf) as usize]
+            }
+        };
+
+        U {
+            mem: [
+                select(&a, b[0]),
+                select(&a, b[1]),
+                select(&a, b[2]),
+                select(&a, b[3]),
+                select(&a, b[4]),
+                select(&a, b[5]),
+                select(&a, b[6]),
+                select(&a, b[7]),
+                select(&a, b[8]),
+                select(&a, b[9]),
+                select(&a, b[10]),
+                select(&a, b[11]),
+                select(&a, b[12]),
+                select(&a, b[13]),
+                select(&a, b[14]),
+                select(&a, b[15]),
+            ],
+        }
+        .reg
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -480,6 +621,10 @@ mod test {
 
     #[test]
     fn nop() {
+        // Skip this test when cranelift doesn't support the native platform.
+        if cranelift_native::builder().is_err() {
+            return;
+        }
         let code = String::from(
             "
             test run
@@ -490,6 +635,7 @@ mod test {
                 return v1
             }",
         );
+        let ctrl_plane = &mut ControlPlane::default();
 
         // extract function
         let test_file = parse_test(code.as_str(), ParseOptions::default()).unwrap();
@@ -499,8 +645,12 @@ mod test {
         // execute function
         let mut compiler = TestFileCompiler::with_default_host_isa().unwrap();
         compiler.declare_function(&function).unwrap();
-        compiler.define_function(function.clone()).unwrap();
-        compiler.create_trampoline_for_function(&function).unwrap();
+        compiler
+            .define_function(function.clone(), ctrl_plane)
+            .unwrap();
+        compiler
+            .create_trampoline_for_function(&function, ctrl_plane)
+            .unwrap();
         let compiled = compiler.compile().unwrap();
         let trampoline = compiled.get_trampoline(&function).unwrap();
         let returned = trampoline.call(&[]);
@@ -509,6 +659,10 @@ mod test {
 
     #[test]
     fn trampolines() {
+        // Skip this test when cranelift doesn't support the native platform.
+        if cranelift_native::builder().is_err() {
+            return;
+        }
         let function = parse(
             "
             function %test(f32, i8, i64x2, i8) -> f32x4, i64 {
@@ -525,8 +679,8 @@ mod test {
             &function.signature,
             compiler.module.isa(),
         );
-        println!("{}", trampoline);
-        assert!(format!("{}", trampoline).ends_with(
+        println!("{trampoline}");
+        assert!(format!("{trampoline}").ends_with(
             "sig0 = (f32, i8, i64x2, i8) -> f32x4, i64 fast
 
 block0(v0: i64, v1: i64):

@@ -1,5 +1,3 @@
-extern crate proc_macro;
-
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse_macro_input;
@@ -27,8 +25,8 @@ use syn::parse_macro_input;
 ///       and return `Result<($return_types),$error_type>`
 ///
 ///     * When the `wiggle` crate is built with the `wasmtime_integration`
-///     feature, each module contains an `add_to_linker` function to add it to
-///     a `wasmtime::Linker`.
+///       feature, each module contains an `add_to_linker` function to add it to
+///       a `wasmtime::Linker`.
 ///
 /// Arguments are provided using Rust struct value syntax.
 ///
@@ -96,7 +94,7 @@ use syn::parse_macro_input;
 /// /// is an asynchronous method. Therefore, we use the `async_trait` proc macro
 /// /// to define this trait, so that `double_int_return_float` can be an `async fn`.
 /// /// `wiggle::async_trait` is defined as `#[async_trait::async_trait(?Send)]` -
-/// /// in wiggle, async methods do not have the Send constaint.
+/// /// in wiggle, async methods do not have the Send constraint.
 /// impl example::Example for YourCtxType {
 ///     /// The arrays module has two methods, shown here.
 ///     /// Note that the `GuestPtr` type comes from `wiggle`,
@@ -130,14 +128,14 @@ use syn::parse_macro_input;
 ///
 /// impl types::UserErrorConversion for YourCtxType {
 ///     fn errno_from_your_rich_error(&mut self, e: YourRichError)
-///         -> Result<types::Errno, wiggle::wasmtime_crate::Trap>
+///         -> Result<types::Errno, wiggle::wasmtime_crate::Error>
 ///     {
 ///         println!("Rich error: {:?}", e);
 ///         match e {
 ///             YourRichError::InvalidArg{..} => Ok(types::Errno::InvalidArg),
 ///             YourRichError::Io{..} => Ok(types::Errno::Io),
 ///             YourRichError::Overflow => Ok(types::Errno::Overflow),
-///             YourRichError::Trap(s) => Err(wiggle::wasmtime_crate::Trap::new(s)),
+///             YourRichError::Trap(s) => Err(wiggle::wasmtime_crate::Error::msg(s)),
 ///         }
 ///     }
 /// }
@@ -168,7 +166,30 @@ pub fn from_witx(args: TokenStream) -> TokenStream {
         quote!()
     };
 
-    TokenStream::from(quote! { #code #metadata })
+    let mut ret = quote! { #code #metadata };
+
+    if std::env::var("WIGGLE_DEBUG_BINDGEN").is_ok() {
+        use std::path::Path;
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        static INVOCATION: AtomicUsize = AtomicUsize::new(0);
+        let root = Path::new(env!("DEBUG_OUTPUT_DIR"));
+        let n = INVOCATION.fetch_add(1, Relaxed);
+        let path = root.join(format!("wiggle{n}.rs"));
+
+        std::fs::write(&path, ret.to_string()).unwrap();
+
+        // optimistically format the code but don't require success
+        drop(
+            std::process::Command::new("rustfmt")
+                .arg(&path)
+                .arg("--edition=2021")
+                .output(),
+        );
+
+        let path = path.to_str().unwrap();
+        ret = quote!(include!(#path););
+    }
+    TokenStream::from(ret)
 }
 
 #[proc_macro_attribute]

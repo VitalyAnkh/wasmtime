@@ -1,22 +1,27 @@
-use crate::abi::ABI;
-use crate::codegen::{CodeGen, CodeGenContext};
-use crate::frame::Frame;
+use crate::{
+    abi::{wasm_sig, ABI},
+    codegen::{BuiltinFunctions, CodeGen, CodeGenContext, FuncEnv, TypeConverter},
+};
+
+use crate::frame::{DefinedLocals, Frame};
 use crate::isa::x64::masm::MacroAssembler as X64Masm;
 use crate::masm::MacroAssembler;
 use crate::regalloc::RegAlloc;
 use crate::stack::Stack;
 use crate::{
     isa::{Builder, TargetIsa},
-    regset::RegSet,
+    regset::RegBitSet,
 };
 use anyhow::Result;
-use cranelift_codegen::{
-    isa::x64::settings as x64_settings, settings::Flags, Final, MachBufferFinalized,
-};
+use cranelift_codegen::settings::{self, Flags};
+use cranelift_codegen::{isa::x64::settings as x64_settings, Final, MachBufferFinalized};
+use cranelift_codegen::{MachTextSectionBuilder, TextSectionBuilder};
 use target_lexicon::Triple;
-use wasmparser::{FuncType, FuncValidator, FunctionBody, ValidatorResources};
+use wasmparser::{FuncValidator, FunctionBody, ValidatorResources};
+use wasmtime_cranelift::CompiledFunction;
+use wasmtime_environ::{ModuleTranslation, ModuleTypesBuilder, Tunables, VMOffsets, WasmFuncType};
 
-use self::regs::ALL_GPR;
+use self::regs::{ALL_FPR, ALL_GPR, MAX_FPR, MAX_GPR, NON_ALLOCATABLE_FPR, NON_ALLOCATABLE_GPR};
 
 mod abi;
 mod address;
@@ -30,17 +35,17 @@ mod regs;
 
 /// Create an ISA builder.
 pub(crate) fn isa_builder(triple: Triple) -> Builder {
-    Builder {
+    Builder::new(
         triple,
-        settings: x64_settings::builder(),
-        constructor: |triple, shared_flags, settings| {
+        x64_settings::builder(),
+        |triple, shared_flags, settings| {
             // TODO: Once enabling/disabling flags is allowed, and once features like SIMD are supported
             // ensure compatibility between shared flags and ISA flags.
             let isa_flags = x64_settings::Flags::new(&shared_flags, settings);
             let isa = X64::new(triple, shared_flags, isa_flags);
             Ok(Box::new(isa))
         },
-    }
+    )
 }
 
 /// x64 ISA.
@@ -73,25 +78,99 @@ impl TargetIsa for X64 {
         &self.triple
     }
 
+    fn flags(&self) -> &settings::Flags {
+        &self.shared_flags
+    }
+
+    fn isa_flags(&self) -> Vec<settings::Value> {
+        self.isa_flags.iter().collect()
+    }
+
     fn compile_function(
         &self,
-        sig: &FuncType,
+        sig: &WasmFuncType,
         body: &FunctionBody,
-        mut validator: FuncValidator<ValidatorResources>,
-    ) -> Result<MachBufferFinalized<Final>> {
+        translation: &ModuleTranslation,
+        types: &ModuleTypesBuilder,
+        builtins: &mut BuiltinFunctions,
+        validator: &mut FuncValidator<ValidatorResources>,
+        tunables: &Tunables,
+    ) -> Result<CompiledFunction> {
+        let pointer_bytes = self.pointer_bytes();
+        let vmoffsets = VMOffsets::new(pointer_bytes, &translation.module);
+
         let mut body = body.get_binary_reader();
-        let mut masm = X64Masm::new(self.shared_flags.clone(), self.isa_flags.clone());
+        let mut masm = X64Masm::new(
+            pointer_bytes,
+            self.shared_flags.clone(),
+            self.isa_flags.clone(),
+        )?;
         let stack = Stack::new();
-        let abi = abi::X64ABI::default();
-        let abi_sig = abi.sig(sig);
-        let frame = Frame::new(&abi_sig, &mut body, &mut validator, &abi)?;
-        // TODO Add in floating point bitmask
-        let regalloc = RegAlloc::new(RegSet::new(ALL_GPR, 0), regs::scratch());
-        let codegen_context = CodeGenContext::new(regalloc, stack, &frame);
-        let mut codegen = CodeGen::new::<abi::X64ABI>(&mut masm, codegen_context, abi_sig);
 
-        codegen.emit(&mut body, validator)?;
+        let abi_sig = wasm_sig::<abi::X64ABI>(sig)?;
 
-        Ok(masm.finalize())
+        let env = FuncEnv::new(
+            &vmoffsets,
+            translation,
+            types,
+            builtins,
+            self,
+            abi::X64ABI::ptr_type(),
+        );
+        let type_converter = TypeConverter::new(env.translation, env.types);
+        let defined_locals =
+            DefinedLocals::new::<abi::X64ABI>(&type_converter, &mut body, validator)?;
+        let frame = Frame::new::<abi::X64ABI>(&abi_sig, &defined_locals)?;
+        let gpr = RegBitSet::int(
+            ALL_GPR.into(),
+            NON_ALLOCATABLE_GPR.into(),
+            usize::try_from(MAX_GPR).unwrap(),
+        );
+        let fpr = RegBitSet::float(
+            ALL_FPR.into(),
+            NON_ALLOCATABLE_FPR.into(),
+            usize::try_from(MAX_FPR).unwrap(),
+        );
+
+        let regalloc = RegAlloc::from(gpr, fpr);
+        let codegen_context = CodeGenContext::new(regalloc, stack, frame, &vmoffsets);
+        let codegen = CodeGen::new(tunables, &mut masm, codegen_context, env, abi_sig);
+
+        let mut body_codegen = codegen.emit_prologue()?;
+
+        body_codegen.emit(&mut body, validator)?;
+        let base = body_codegen.source_location.base;
+
+        let names = body_codegen.env.take_name_map();
+        Ok(CompiledFunction::new(
+            masm.finalize(base)?,
+            names,
+            self.function_alignment(),
+        ))
+    }
+
+    fn text_section_builder(&self, num_funcs: usize) -> Box<dyn TextSectionBuilder> {
+        Box::new(MachTextSectionBuilder::<cranelift_codegen::isa::x64::Inst>::new(num_funcs))
+    }
+
+    fn function_alignment(&self) -> u32 {
+        // See `cranelift_codegen`'s value of this for more information.
+        16
+    }
+
+    fn emit_unwind_info(
+        &self,
+        buffer: &MachBufferFinalized<Final>,
+        kind: cranelift_codegen::isa::unwind::UnwindInfoKind,
+    ) -> Result<Option<cranelift_codegen::isa::unwind::UnwindInfo>> {
+        Ok(cranelift_codegen::isa::x64::emit_unwind_info(buffer, kind)?)
+    }
+
+    fn create_systemv_cie(&self) -> Option<gimli::write::CommonInformationEntry> {
+        Some(cranelift_codegen::isa::x64::create_cie())
+    }
+
+    fn page_size_align_log2(&self) -> u8 {
+        12
     }
 }

@@ -101,13 +101,13 @@
 //! algorithm is a one-pass approach to partitioning everything into adapter
 //! modules.
 //!
-//! Adapters were indentified in-order as part of the inlining phase of
+//! Adapters were identified in-order as part of the inlining phase of
 //! translation where we're guaranteed that once an adapter is identified
 //! it can't depend on anything identified later. The pass implemented here is
 //! to visit all transitive dependencies of an adapter. If one of the
 //! dependencies of an adapter is an adapter in the current adapter module
 //! being built then the current module is finished and a new adapter module is
-//! started. This should quickly parition adapters into contiugous chunks of
+//! started. This should quickly partition adapters into contiugous chunks of
 //! their index space which can be in adapter modules together.
 //!
 //! There's probably more general algorithms for this but for now this should be
@@ -119,7 +119,6 @@ use crate::component::translate::*;
 use crate::fact;
 use crate::EntityType;
 use std::collections::HashSet;
-use wasmparser::WasmFeatures;
 
 /// Metadata information about a fused adapter.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -158,8 +157,12 @@ pub struct AdapterOptions {
     pub memory64: bool,
     /// An optional definition of `realloc` to used.
     pub realloc: Option<dfg::CoreDef>,
+    /// The async callback function used by these options, if specified.
+    pub callback: Option<dfg::CoreDef>,
     /// An optional definition of a `post-return` to use.
     pub post_return: Option<dfg::CoreDef>,
+    /// Whether to use the async ABI for lifting or lowering.
+    pub async_: bool,
 }
 
 impl<'data> Translator<'_, 'data> {
@@ -171,7 +174,7 @@ impl<'data> Translator<'_, 'data> {
     /// metadata for adapter modules.
     pub(super) fn partition_adapter_modules(&mut self, component: &mut dfg::ComponentDfg) {
         // Visit each adapter, in order of its original definition, during the
-        // paritioning. This allows for the guarantee that dependencies are
+        // partitioning. This allows for the guarantee that dependencies are
         // visited in a topological fashion ideally.
         let mut state = PartitionAdapterModules::default();
         for (id, adapter) in component.adapters.iter() {
@@ -184,7 +187,8 @@ impl<'data> Translator<'_, 'data> {
         // the module using standard core wasm translation, and then fills out
         // the dfg metadata for each adapter.
         for (module_id, adapter_module) in state.adapter_modules.iter() {
-            let mut module = fact::Module::new(self.types, self.tunables.debug_adapter_modules);
+            let mut module =
+                fact::Module::new(self.types.types(), self.tunables.debug_adapter_modules);
             let mut names = Vec::with_capacity(adapter_module.adapters.len());
             for adapter in adapter_module.adapters.iter() {
                 let name = format!("adapter{}", adapter.as_u32());
@@ -211,13 +215,10 @@ impl<'data> Translator<'_, 'data> {
             // specifically enabled here since the adapter module is highly
             // likely to use that if anything is actually indirected through
             // memory.
-            let mut validator = Validator::new_with_features(WasmFeatures {
-                multi_memory: true,
-                ..*self.validator.features()
-            });
+            self.validator.reset();
             let translation = ModuleEnvironment::new(
                 self.tunables,
-                &mut validator,
+                &mut self.validator,
                 self.types.module_types_builder(),
             )
             .translate(Parser::new(0), wasm)
@@ -230,7 +231,7 @@ impl<'data> Translator<'_, 'data> {
             // in-order here as well. (with an assert to double-check)
             for (adapter, name) in adapter_module.adapters.iter().zip(&names) {
                 let index = translation.module.exports[name];
-                let i = component.adapter_paritionings.push((module_id, index));
+                let i = component.adapter_partitionings.push((module_id, index));
                 assert_eq!(i, *adapter);
             }
 
@@ -256,6 +257,13 @@ fn fact_import_to_core_def(
     import: &fact::Import,
     ty: EntityType,
 ) -> dfg::CoreDef {
+    let mut simple_intrinsic = |trampoline: dfg::Trampoline| {
+        let signature = ty.unwrap_func();
+        let index = dfg
+            .trampolines
+            .push((signature.unwrap_module_type_index(), trampoline));
+        dfg::CoreDef::Trampoline(index)
+    };
     match import {
         fact::Import::CoreDef(def) => def.clone(),
         fact::Import::Transcode {
@@ -275,19 +283,39 @@ fn fact_import_to_core_def(
                 }
             }
 
-            let from = dfg.memories.push_uniq(unwrap_memory(from));
-            let to = dfg.memories.push_uniq(unwrap_memory(to));
-            dfg::CoreDef::Transcoder(dfg.transcoders.push_uniq(dfg::Transcoder {
-                op: *op,
-                from,
-                from64: *from64,
-                to,
-                to64: *to64,
-                signature: match ty {
-                    EntityType::Function(signature) => signature,
-                    _ => unreachable!(),
+            let from = dfg.memories.push(unwrap_memory(from));
+            let to = dfg.memories.push(unwrap_memory(to));
+            let signature = ty.unwrap_func();
+            let index = dfg.trampolines.push((
+                signature.unwrap_module_type_index(),
+                dfg::Trampoline::Transcoder {
+                    op: *op,
+                    from,
+                    from64: *from64,
+                    to,
+                    to64: *to64,
                 },
-            }))
+            ));
+            dfg::CoreDef::Trampoline(index)
+        }
+        fact::Import::ResourceTransferOwn => simple_intrinsic(dfg::Trampoline::ResourceTransferOwn),
+        fact::Import::ResourceTransferBorrow => {
+            simple_intrinsic(dfg::Trampoline::ResourceTransferBorrow)
+        }
+        fact::Import::ResourceEnterCall => simple_intrinsic(dfg::Trampoline::ResourceEnterCall),
+        fact::Import::ResourceExitCall => simple_intrinsic(dfg::Trampoline::ResourceExitCall),
+        fact::Import::AsyncEnterCall => simple_intrinsic(dfg::Trampoline::AsyncEnterCall),
+        fact::Import::AsyncExitCall {
+            callback,
+            post_return,
+        } => simple_intrinsic(dfg::Trampoline::AsyncExitCall {
+            callback: callback.clone().map(|v| dfg.callbacks.push(v)),
+            post_return: post_return.clone().map(|v| dfg.post_returns.push(v)),
+        }),
+        fact::Import::FutureTransfer => simple_intrinsic(dfg::Trampoline::FutureTransfer),
+        fact::Import::StreamTransfer => simple_intrinsic(dfg::Trampoline::StreamTransfer),
+        fact::Import::ErrorContextTransfer => {
+            simple_intrinsic(dfg::Trampoline::ErrorContextTransfer)
         }
     }
 }
@@ -352,6 +380,9 @@ impl PartitionAdapterModules {
         if let Some(def) = &options.realloc {
             self.core_def(dfg, def);
         }
+        if let Some(def) = &options.callback {
+            self.core_def(dfg, def);
+        }
         if let Some(def) = &options.post_return {
             self.core_def(dfg, def);
         }
@@ -378,12 +409,7 @@ impl PartitionAdapterModules {
             }
 
             // These items can't transitively depend on an adapter
-            dfg::CoreDef::Lowered(_)
-            | dfg::CoreDef::AlwaysTrap(_)
-            | dfg::CoreDef::InstanceFlags(_) => {}
-
-            // should not be in the dfg yet
-            dfg::CoreDef::Transcoder(_) => unreachable!(),
+            dfg::CoreDef::Trampoline(_) | dfg::CoreDef::InstanceFlags(_) => {}
         }
     }
 

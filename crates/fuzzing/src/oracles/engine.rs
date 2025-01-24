@@ -1,6 +1,6 @@
 //! Define the interface for differential evaluation of Wasm functions.
 
-use crate::generators::{Config, DiffValue, DiffValueType};
+use crate::generators::{CompilerStrategy, Config, DiffValue, DiffValueType};
 use crate::oracles::{diff_wasmi::WasmiEngine, diff_wasmtime::WasmtimeEngine};
 use anyhow::Error;
 use arbitrary::Unstructured;
@@ -16,8 +16,22 @@ pub fn build(
     config: &mut Config,
 ) -> arbitrary::Result<Option<Box<dyn DiffEngine>>> {
     let engine: Box<dyn DiffEngine> = match name {
-        "wasmtime" => Box::new(WasmtimeEngine::new(u, config)?),
+        "wasmtime" => Box::new(WasmtimeEngine::new(
+            u,
+            config,
+            CompilerStrategy::CraneliftNative,
+        )?),
+        "pulley" => Box::new(WasmtimeEngine::new(
+            u,
+            config,
+            CompilerStrategy::CraneliftPulley,
+        )?),
         "wasmi" => Box::new(WasmiEngine::new(config)),
+
+        #[cfg(target_arch = "x86_64")]
+        "winch" => Box::new(WasmtimeEngine::new(u, config, CompilerStrategy::Winch)?),
+        #[cfg(not(target_arch = "x86_64"))]
+        "winch" => return Ok(None),
 
         #[cfg(feature = "fuzz-spec-interpreter")]
         "spec" => Box::new(crate::oracles::diff_spec::SpecInterpreter::new(config)),
@@ -45,7 +59,7 @@ pub trait DiffEngine {
 
     /// Tests that the wasmtime-originating `trap` matches the error this engine
     /// generated.
-    fn assert_error_match(&self, trap: &Trap, err: &Error);
+    fn assert_error_match(&self, err: &Error, trap: &Trap);
 
     /// Returns whether the error specified from this engine might be stack
     /// overflow.
@@ -88,14 +102,17 @@ pub fn setup_engine_runtimes() {
 /// Build a list of allowed values from the given `defaults` using the
 /// `env_list`.
 ///
+/// The entries in `defaults` are preserved, in order, and are replaced with
+/// `None` in the returned list if they are disabled.
+///
 /// ```
 /// # use wasmtime_fuzzing::oracles::engine::build_allowed_env_list;
 /// // Passing no `env_list` returns the defaults:
-/// assert_eq!(build_allowed_env_list(None, &["a"]), vec!["a"]);
+/// assert_eq!(build_allowed_env_list(None, &["a"]), vec![Some("a")]);
 /// // We can build up a subset of the defaults:
-/// assert_eq!(build_allowed_env_list(Some(vec!["b".to_string()]), &["a","b"]), vec!["b"]);
+/// assert_eq!(build_allowed_env_list(Some(vec!["b".to_string()]), &["a","b"]), vec![None, Some("b")]);
 /// // Alternately we can subtract from the defaults:
-/// assert_eq!(build_allowed_env_list(Some(vec!["-a".to_string()]), &["a","b"]), vec!["b"]);
+/// assert_eq!(build_allowed_env_list(Some(vec!["-a".to_string()]), &["a","b"]), vec![None, Some("b")]);
 /// ```
 /// ```should_panic
 /// # use wasmtime_fuzzing::oracles::engine::build_allowed_env_list;
@@ -111,7 +128,7 @@ pub fn setup_engine_runtimes() {
 pub fn build_allowed_env_list<'a>(
     env_list: Option<Vec<String>>,
     defaults: &[&'a str],
-) -> Vec<&'a str> {
+) -> Vec<Option<&'a str>> {
     if let Some(configured) = &env_list {
         // Check that the names are either all additions or all subtractions.
         let subtract_from_defaults = configured.iter().all(|c| c.starts_with("-"));
@@ -127,10 +144,7 @@ pub fn build_allowed_env_list<'a>(
         // Check that the configured names are valid ones.
         for c in configured {
             if !defaults.contains(&&c[start..]) {
-                panic!(
-                    "invalid environment configuration `{}`; must be one of: {:?}",
-                    c, defaults
-                );
+                panic!("invalid environment configuration `{c}`; must be one of: {defaults:?}");
             }
         }
 
@@ -139,12 +153,14 @@ pub fn build_allowed_env_list<'a>(
         for &d in defaults {
             let mentioned = configured.iter().any(|c| &c[start..] == d);
             if (add_from_defaults && mentioned) || (subtract_from_defaults && !mentioned) {
-                allowed.push(d);
+                allowed.push(Some(d));
+            } else {
+                allowed.push(None);
             }
         }
         allowed
     } else {
-        defaults.to_vec()
+        defaults.iter().copied().map(Some).collect()
     }
 }
 
@@ -155,6 +171,7 @@ pub fn parse_env_list(env_variable: &str) -> Option<Vec<String>> {
         .map(|l| l.split(",").map(|s| s.to_owned()).collect())
 }
 
+/// Smoke test an engine with a given config.
 #[cfg(test)]
 pub fn smoke_test_engine<T>(
     mk_engine: impl Fn(&mut arbitrary::Unstructured<'_>, &mut Config) -> arbitrary::Result<T>,
@@ -180,7 +197,7 @@ pub fn smoke_test_engine<T>(
         let mut engine = match mk_engine(&mut u, &mut config) {
             Ok(engine) => engine,
             Err(e) => {
-                println!("skip {:?}", e);
+                println!("skip {e:?}");
                 continue;
             }
         };

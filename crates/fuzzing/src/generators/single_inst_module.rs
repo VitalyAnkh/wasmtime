@@ -31,9 +31,9 @@ pub struct SingleInstModule<'a> {
 /// of these types.
 #[derive(Clone)]
 enum NanType {
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "expected to be used in the future")]
     F32,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "expected to be used in the future")]
     F64,
     F32x4,
     F64x2,
@@ -57,7 +57,7 @@ impl<'a> SingleInstModule<'a> {
 
         // Encode the type section.
         let mut types = TypeSection::new();
-        types.function(
+        types.ty().function(
             self.parameters.iter().cloned(),
             self.results.iter().cloned(),
         );
@@ -163,36 +163,38 @@ impl<'a> SingleInstModule<'a> {
 // instructions compactly and allow for easier changes to the Rust code (e.g.,
 // `SingleInstModule`).
 
-macro_rules! valtype {
-    (i32) => {
+macro_rules! valtypes {
+    (@list ($($ty:tt),*)) => {&[$(valtypes!(@one $ty)),*]};
+    (@list $ty:tt) => {&[valtypes!(@one $ty)]};
+    (@one i32) => {
         ValType::I32
     };
-    (i64) => {
+    (@one i64) => {
         ValType::I64
     };
-    (f32) => {
+    (@one f32) => {
         ValType::F32
     };
-    (f64) => {
+    (@one f64) => {
         ValType::F64
     };
-    (v128) => {
+    (@one v128) => {
         ValType::V128
     };
 }
 
 macro_rules! inst {
-    ($inst:ident, ($($arguments_ty:tt),*) -> $result_ty:tt) => {
-        inst! { $inst, ($($arguments_ty),*) -> $result_ty, |_| true }
+    ($inst:ident, $arguments:tt -> $results:tt) => {
+        inst! { $inst, $arguments -> $results, |_| true }
     };
-    ($inst:ident, ($($arguments_ty:tt),*) -> $result_ty:tt, $feature:expr) => {
-        inst! { $inst, ($($arguments_ty),*) -> $result_ty, $feature, None }
+    ($inst:ident, $arguments:tt -> $results:tt, $feature:expr) => {
+        inst! { $inst, $arguments -> $results, $feature, None }
     };
-    ($inst:ident, ($($arguments_ty:tt),*) -> $result_ty:tt, $feature:expr, $nan:expr) => {
+    ($inst:ident, $arguments:tt -> $results:tt, $feature:expr, $nan:expr) => {
         SingleInstModule {
             instruction: Instruction::$inst,
-            parameters: &[$(valtype!($arguments_ty)),*],
-            results: &[valtype!($result_ty)],
+            parameters: valtypes!(@list $arguments),
+            results: valtypes!(@list $results),
             feature: $feature,
             canonicalize_nan: $nan,
         }
@@ -314,11 +316,11 @@ static INSTRUCTIONS: &[SingleInstModule] = &[
     inst!(F32Ge, (f32, f32) -> i32),
     inst!(F64Ge, (f64, f64) -> i32),
     // Integer conversions ("to integer").
-    inst!(I32Extend8S, (i32) -> i32, |c| c.config.sign_extension_enabled),
-    inst!(I32Extend16S, (i32) -> i32, |c| c.config.sign_extension_enabled),
-    inst!(I64Extend8S, (i64) -> i64, |c| c.config.sign_extension_enabled),
-    inst!(I64Extend16S, (i64) -> i64, |c| c.config.sign_extension_enabled),
-    inst!(I64Extend32S, (i64) -> i64, |c| c.config.sign_extension_enabled),
+    inst!(I32Extend8S, (i32) -> i32, |c| c.config.sign_extension_ops_enabled),
+    inst!(I32Extend16S, (i32) -> i32, |c| c.config.sign_extension_ops_enabled),
+    inst!(I64Extend8S, (i64) -> i64, |c| c.config.sign_extension_ops_enabled),
+    inst!(I64Extend16S, (i64) -> i64, |c| c.config.sign_extension_ops_enabled),
+    inst!(I64Extend32S, (i64) -> i64, |c| c.config.sign_extension_ops_enabled),
     inst!(I32WrapI64, (i64) -> i32),
     inst!(I64ExtendI32S, (i32) -> i64),
     inst!(I64ExtendI32U, (i32) -> i64),
@@ -568,6 +570,11 @@ static INSTRUCTIONS: &[SingleInstModule] = &[
     inst!(F64x2ConvertLowI32x4U, (v128) -> v128, |c| c.config.simd_enabled),
     inst!(F32x4DemoteF64x2Zero, (v128) -> v128, |c| c.config.simd_enabled),
     inst!(F64x2PromoteLowF32x4, (v128) -> v128, |c| c.config.simd_enabled),
+    // wide arithmetic
+    inst!(I64Add128, (i64, i64, i64, i64) -> (i64, i64), |c| c.config.wide_arithmetic_enabled && c.config.multi_value_enabled),
+    inst!(I64Sub128, (i64, i64, i64, i64) -> (i64, i64), |c| c.config.wide_arithmetic_enabled && c.config.multi_value_enabled),
+    inst!(I64MulWideS, (i64, i64) -> (i64, i64), |c| c.config.wide_arithmetic_enabled && c.config.multi_value_enabled),
+    inst!(I64MulWideU, (i64, i64) -> (i64, i64), |c| c.config.wide_arithmetic_enabled && c.config.multi_value_enabled),
 ];
 
 #[cfg(test)]
@@ -589,13 +596,14 @@ mod test {
             wat,
             r#"(module
   (type (;0;) (func (param i32 i32) (result i32)))
+  (export "test" (func 0))
   (func (;0;) (type 0) (param i32 i32) (result i32)
     local.get 0
     local.get 1
     i32.add
   )
-  (export "test" (func 0))
-)"#
+)
+"#
         )
     }
 

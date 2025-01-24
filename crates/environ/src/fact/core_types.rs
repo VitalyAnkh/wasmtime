@@ -1,3 +1,4 @@
+use crate::prelude::*;
 use std::collections::HashMap;
 use wasm_encoder::{TypeSection, ValType};
 
@@ -17,6 +18,7 @@ impl CoreTypes {
             .or_insert_with(|| {
                 let idx = self.section.len();
                 self.section
+                    .ty()
                     .function(params.iter().copied(), results.iter().copied());
                 idx
             })

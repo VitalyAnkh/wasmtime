@@ -1,9 +1,10 @@
 //! A strongly-normalizing intermediate representation for ISLE rules. This representation is chosen
 //! to closely reflect the operations we can implement in Rust, to make code generation easy.
+use crate::disjointsets::DisjointSets;
 use crate::error::{Error, Span};
 use crate::lexer::Pos;
 use crate::sema;
-use crate::{DisjointSets, StableSet};
+use crate::stablemapset::StableSet;
 use std::collections::{hash_map::Entry, HashMap};
 
 /// A field index in a tuple or an enum variant.
@@ -47,6 +48,13 @@ impl BindingId {
 /// such as constants or function calls; but it also includes names bound in pattern matches.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Binding {
+    /// Evaluates to the given boolean literal.
+    ConstBool {
+        /// The constant value.
+        val: bool,
+        /// The constant's type.
+        ty: sema::TypeId,
+    },
     /// Evaluates to the given integer literal.
     ConstInt {
         /// The constant value.
@@ -110,6 +118,11 @@ pub enum Binding {
         /// get the field names.
         field: TupleIndex,
     },
+    /// The result of constructing an Option::Some variant.
+    MakeSome {
+        /// Contained expression.
+        inner: BindingId,
+    },
     /// Pattern-match one of the previous bindings against `Option::Some` and produce a new binding
     /// from its contents. There must be a corresponding [Constraint::Some] for each `source` that
     /// appears in a `MatchSome` binding. (This currently only happens with external extractors.)
@@ -142,6 +155,13 @@ pub enum Constraint {
         /// Number of fields in this variant of this enum. This is recorded in the constraint for
         /// convenience, to avoid needing to look up the variant in a [sema::TypeEnv].
         fields: TupleIndex,
+    },
+    /// The value must equal this boolean literal.
+    ConstBool {
+        /// The constant value.
+        val: bool,
+        /// The constant's type.
+        ty: sema::TypeId,
     },
     /// The value must equal this integer literal.
     ConstInt {
@@ -241,6 +261,7 @@ impl Binding {
     /// Returns the binding sites which must be evaluated before this binding.
     pub fn sources(&self) -> &[BindingId] {
         match self {
+            Binding::ConstBool { .. } => &[][..],
             Binding::ConstInt { .. } => &[][..],
             Binding::ConstPrim { .. } => &[][..],
             Binding::Argument { .. } => &[][..],
@@ -249,6 +270,7 @@ impl Binding {
             Binding::Iterator { source } => std::slice::from_ref(source),
             Binding::MakeVariant { fields, .. } => &fields[..],
             Binding::MatchVariant { source, .. } => std::slice::from_ref(source),
+            Binding::MakeSome { inner } => std::slice::from_ref(inner),
             Binding::MatchSome { source } => std::slice::from_ref(source),
             Binding::MatchTuple { source, .. } => std::slice::from_ref(source),
         }
@@ -260,7 +282,9 @@ impl Constraint {
     pub fn bindings_for(self, source: BindingId) -> Vec<Binding> {
         match self {
             // These constraints never introduce any bindings.
-            Constraint::ConstInt { .. } | Constraint::ConstPrim { .. } => vec![],
+            Constraint::ConstBool { .. }
+            | Constraint::ConstInt { .. }
+            | Constraint::ConstPrim { .. } => vec![],
             Constraint::Some => vec![Binding::MatchSome { source }],
             Constraint::Variant {
                 variant, fields, ..
@@ -383,6 +407,11 @@ impl RuleSetBuilder {
         self.current_rule.pos = rule.pos;
         self.current_rule.prio = rule.prio;
         self.current_rule.result = rule.visit(self, termenv);
+        if termenv.terms[rule.root_term.index()].is_partial() {
+            self.current_rule.result = self.dedup_binding(Binding::MakeSome {
+                inner: self.current_rule.result,
+            });
+        }
         self.normalize_equivalence_classes();
         let rule = std::mem::take(&mut self.current_rule);
 
@@ -413,6 +442,7 @@ impl RuleSetBuilder {
     /// copy the constraint and push the equality inside it. For example:
     /// - `(term x @ 2 x)` is rewritten to `(term 2 2)`
     /// - `(term x @ (T.A _ _) x)` is rewritten to `(term (T.A y z) (T.A y z))`
+    ///
     /// In the latter case, note that every field of `T.A` has been replaced with a fresh variable
     /// and each of the copies are set equal.
     ///
@@ -512,6 +542,11 @@ impl sema::PatternVisitor for RuleSetBuilder {
         }
     }
 
+    fn add_match_bool(&mut self, input: BindingId, ty: sema::TypeId, val: bool) {
+        let bindings = self.set_constraint(input, Constraint::ConstBool { val, ty });
+        debug_assert_eq!(bindings, &[]);
+    }
+
     fn add_match_int(&mut self, input: BindingId, ty: sema::TypeId, val: i128) {
         let bindings = self.set_constraint(input, Constraint::ConstInt { val, ty });
         debug_assert_eq!(bindings, &[]);
@@ -580,6 +615,10 @@ impl sema::PatternVisitor for RuleSetBuilder {
 
 impl sema::ExprVisitor for RuleSetBuilder {
     type ExprId = BindingId;
+
+    fn add_const_bool(&mut self, ty: sema::TypeId, val: bool) -> BindingId {
+        self.dedup_binding(Binding::ConstBool { val, ty })
+    }
 
     fn add_const_int(&mut self, ty: sema::TypeId, val: i128) -> BindingId {
         self.dedup_binding(Binding::ConstInt { val, ty })

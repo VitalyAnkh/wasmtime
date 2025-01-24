@@ -5,10 +5,9 @@
 //!
 //! Note also that we make use of pinned VRegs to refer to PRegs.
 
-use crate::machinst::{AllocationConsumer, RealReg, Reg};
-use crate::settings;
+use crate::machinst::{RealReg, Reg};
 use alloc::string::ToString;
-use regalloc2::{MachineEnv, PReg, RegClass, VReg};
+use regalloc2::{PReg, RegClass, VReg};
 use std::string::String;
 
 // Hardware encodings (note the special rax, rcx, rdx, rbx order).
@@ -156,63 +155,6 @@ pub(crate) fn xmm15() -> Reg {
     fpr(15)
 }
 
-/// Create the register environment for x64.
-pub(crate) fn create_reg_env_systemv(flags: &settings::Flags) -> MachineEnv {
-    fn preg(r: Reg) -> PReg {
-        r.to_real_reg().unwrap().into()
-    }
-
-    let mut env = MachineEnv {
-        preferred_regs_by_class: [
-            // Preferred GPRs: caller-saved in the SysV ABI.
-            vec![
-                preg(rsi()),
-                preg(rdi()),
-                preg(rax()),
-                preg(rcx()),
-                preg(rdx()),
-                preg(r8()),
-                preg(r9()),
-                preg(r10()),
-                preg(r11()),
-            ],
-            // Preferred XMMs: all of them.
-            vec![
-                preg(xmm0()),
-                preg(xmm1()),
-                preg(xmm2()),
-                preg(xmm3()),
-                preg(xmm4()),
-                preg(xmm5()),
-                preg(xmm6()),
-                preg(xmm7()),
-                preg(xmm8()),
-                preg(xmm9()),
-                preg(xmm10()),
-                preg(xmm11()),
-                preg(xmm12()),
-                preg(xmm13()),
-                preg(xmm14()),
-                preg(xmm15()),
-            ],
-        ],
-        non_preferred_regs_by_class: [
-            // Non-preferred GPRs: callee-saved in the SysV ABI.
-            vec![preg(rbx()), preg(r12()), preg(r13()), preg(r14())],
-            // Non-preferred XMMs: none.
-            vec![],
-        ],
-        fixed_stack_slots: vec![],
-    };
-
-    debug_assert_eq!(r15(), pinned_reg());
-    if !flags.enable_pinned_reg() {
-        env.non_preferred_regs_by_class[0].push(preg(r15()));
-    }
-
-    env
-}
-
 /// Give the name of a RealReg.
 pub fn realreg_name(reg: RealReg) -> &'static str {
     let preg = PReg::from(reg);
@@ -234,7 +176,7 @@ pub fn realreg_name(reg: RealReg) -> &'static str {
             ENC_R13 => "%r13",
             ENC_R14 => "%r14",
             ENC_R15 => "%r15",
-            _ => panic!("Invalid PReg: {:?}", preg),
+            _ => panic!("Invalid PReg: {preg:?}"),
         },
         RegClass::Float => match preg.hw_enc() {
             0 => "%xmm0",
@@ -253,8 +195,9 @@ pub fn realreg_name(reg: RealReg) -> &'static str {
             13 => "%xmm13",
             14 => "%xmm14",
             15 => "%xmm15",
-            _ => panic!("Invalid PReg: {:?}", preg),
+            _ => panic!("Invalid PReg: {preg:?}"),
         },
+        RegClass::Vector => unreachable!(),
     }
 }
 
@@ -262,7 +205,7 @@ pub fn show_reg(reg: Reg) -> String {
     if let Some(rreg) = reg.to_real_reg() {
         realreg_name(rreg).to_string()
     } else {
-        format!("%{:?}", reg)
+        format!("%{reg:?}")
     }
 }
 
@@ -327,7 +270,6 @@ pub fn show_ireg_sized(reg: Reg, size: u8) -> String {
 // words, we can't pretty-print a `Reg` all by itself in a build that
 // may have multiple backends; but we can pretty-print one as part of
 // an x64 Inst or x64 RegMemImm.)
-pub fn pretty_print_reg(reg: Reg, size: u8, allocs: &mut AllocationConsumer<'_>) -> String {
-    let reg = allocs.next(reg);
+pub fn pretty_print_reg(reg: Reg, size: u8) -> String {
     show_ireg_sized(reg, size)
 }

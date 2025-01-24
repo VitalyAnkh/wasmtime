@@ -1,6 +1,6 @@
 //! These tests are intended to exercise various relocation-based logic of
 //! Wasmtime, especially the "jump veneer" insertion in the object-file-assembly
-//! for when platform-specific relative call instructios can't always reach
+//! for when platform-specific relative call instructors can't always reach
 //! their destination within the platform-specific limits.
 //!
 //! Note that the limits of AArch64 are primarily what's being stressed here
@@ -8,10 +8,16 @@
 //! 32-bits, and right now object files aren't supported larger than 4gb anyway
 //! so we would need a lot of other support necessary to exercise that.
 
-use anyhow::Result;
+#![cfg(not(miri))]
+
 use wasmtime::*;
 
 const MB: usize = 1 << 20;
+const PADDING: usize = if cfg!(target_pointer_width = "32") {
+    1 * MB
+} else {
+    128 * MB
+};
 
 fn store_with_padding(padding: usize) -> Result<Store<()>> {
     let mut config = Config::new();
@@ -29,7 +35,7 @@ fn store_with_padding(padding: usize) -> Result<Store<()>> {
 
 #[test]
 fn forward_call_works() -> Result<()> {
-    let mut store = store_with_padding(128 * MB)?;
+    let mut store = store_with_padding(PADDING)?;
     let module = Module::new(
         store.engine(),
         r#"
@@ -50,7 +56,7 @@ fn forward_call_works() -> Result<()> {
 
 #[test]
 fn backwards_call_works() -> Result<()> {
-    let mut store = store_with_padding(128 * MB)?;
+    let mut store = store_with_padding(PADDING)?;
     let module = Module::new(
         store.engine(),
         r#"
@@ -91,12 +97,12 @@ fn test_many_call_module(mut store: Store<()>) -> Result<()> {
     wat.push_str("(module\n");
     wat.push_str("(func $first (result i32) (i32.const 1))\n");
     for i in 0..N {
-        wat.push_str(&format!("(func (export \"{}\") (result i32 i32)\n", i));
+        wat.push_str(&format!("(func (export \"{i}\") (result i32 i32)\n"));
         wat.push_str("call $first\n");
-        wat.push_str(&format!("i32.const {}\n", i));
+        wat.push_str(&format!("i32.const {i}\n"));
         wat.push_str("i32.add\n");
         wat.push_str("call $last\n");
-        wat.push_str(&format!("i32.const {}\n", i));
+        wat.push_str(&format!("i32.const {i}\n"));
         wat.push_str("i32.add)\n");
     }
     wat.push_str("(func $last (result i32) (i32.const 2))\n");

@@ -1,9 +1,9 @@
 test compile precise-output
 target s390x
 
-function %swizzle(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %swizzle(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
-    v2 = swizzle.i8x16 v0, v1
+    v2 = swizzle v0, v1
     return v2
 }
 
@@ -15,7 +15,7 @@ block0(v0: i8x16, v1: i8x16):
 ;   vmxlb %v17, %v5, %v7
 ;   vperm %v24, %v3, %v24, %v17
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vzero %v3
@@ -25,7 +25,7 @@ block0(v0: i8x16, v1: i8x16):
 ;   vperm %v24, %v3, %v24, %v17
 ;   br %r14
 
-function %shuffle_0(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_0(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
     return v2
@@ -36,14 +36,14 @@ block0(v0: i8x16, v1: i8x16):
 ;   vrepib %v3, 15
 ;   vperm %v24, %v24, %v25, %v3
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vrepib %v3, 0xf
 ;   vperm %v24, %v24, %v25, %v3
 ;   br %r14
 
-function %shuffle_1(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_1(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [3 0 31 26 4 6 12 11 23 13 24 4 2 15 17 5]
     return v2
@@ -54,7 +54,7 @@ block0(v0: i8x16, v1: i8x16):
 ;   bras %r1, 20 ; data.u128 0x0a1e000d0b1702180403090b15100f0c ; vl %v3, 0(%r1)
 ;   vperm %v24, %v24, %v25, %v3
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   bras %r1, 0x14
@@ -70,38 +70,7 @@ block0(v0: i8x16, v1: i8x16):
 ;   vperm %v24, %v24, %v25, %v3
 ;   br %r14
 
-function %shuffle_2(i8x16, i8x16) -> i8x16 wasmtime_system_v {
-block0(v0: i8x16, v1: i8x16):
-    v2 = shuffle v0, v1, [0 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47]
-    return v2
-}
-
-; VCode:
-; block0:
-;   vgbm %v3, 1
-;   bras %r1, 20 ; data.u128 0x8080808080808080808080808080800f ; vl %v5, 0(%r1)
-;   vperm %v7, %v24, %v25, %v5
-;   vn %v24, %v3, %v7
-;   br %r14
-; 
-; Disassembled:
-; block0: ; offset 0x0
-;   vgbm %v3, 1
-;   bras %r1, 0x1a
-;   .byte 0x80, 0x80
-;   .byte 0x80, 0x80
-;   .byte 0x80, 0x80
-;   .byte 0x80, 0x80
-;   .byte 0x80, 0x80
-;   .byte 0x80, 0x80
-;   .byte 0x80, 0x80
-;   .byte 0x80, 0x0f
-;   vl %v5, 0(%r1)
-;   vperm %v7, %v24, %v25, %v5
-;   vn %v24, %v3, %v7
-;   br %r14
-
-function %shuffle_vmrhg_xy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhg_xy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [24 25 26 27 28 29 30 31 8 9 10 11 12 13 14 15]
     return v2
@@ -111,13 +80,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhg %v24, %v24, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhg %v24, %v24, %v25
 ;   br %r14
 
-function %shuffle_vmrhf_xy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhf_xy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [24 25 26 27 8 9 10 11 28 29 30 31 12 13 14 15]
     return v2
@@ -127,13 +96,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhf %v24, %v24, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhf %v24, %v24, %v25
 ;   br %r14
 
-function %shuffle_vmrhh_xy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhh_xy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [24 25 8 9 26 27 10 11 28 29 12 13 30 31 14 15]
     return v2
@@ -143,13 +112,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhh %v24, %v24, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhh %v24, %v24, %v25
 ;   br %r14
 
-function %shuffle_vmrhb_xy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhb_xy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [24 8 25 9 26 10 27 11 28 12 29 13 30 14 31 15]
     return v2
@@ -159,13 +128,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhb %v24, %v24, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhb %v24, %v24, %v25
 ;   br %r14
 
-function %shuffle_vmrhg_yx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhg_yx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31]
     return v2
@@ -175,13 +144,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhg %v24, %v25, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhg %v24, %v25, %v24
 ;   br %r14
 
-function %shuffle_vmrhf_yx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhf_yx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [8 9 10 11 24 25 26 27 12 13 14 15 28 29 30 31]
     return v2
@@ -191,13 +160,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhf %v24, %v25, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhf %v24, %v25, %v24
 ;   br %r14
 
-function %shuffle_vmrhh_yx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhh_yx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [8 9 24 25 10 11 26 27 12 13 28 29 14 15 30 31]
     return v2
@@ -207,13 +176,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhh %v24, %v25, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhh %v24, %v25, %v24
 ;   br %r14
 
-function %shuffle_vmrhb_yx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhb_yx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [8 24 9 25 10 26 11 27 12 28 13 29 14 30 15 31]
     return v2
@@ -223,13 +192,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhb %v24, %v25, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhb %v24, %v25, %v24
 ;   br %r14
 
-function %shuffle_vmrhg_xx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhg_xx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [8 9 10 11 12 13 14 15 8 9 10 11 12 13 14 15]
     return v2
@@ -239,13 +208,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhg %v24, %v24, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhg %v24, %v24, %v24
 ;   br %r14
 
-function %shuffle_vmrhf_xx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhf_xx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [8 9 10 11 8 9 10 11 12 13 14 15 12 13 14 15]
     return v2
@@ -255,13 +224,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhf %v24, %v24, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhf %v24, %v24, %v24
 ;   br %r14
 
-function %shuffle_vmrhh_xx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhh_xx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [8 9 8 9 10 11 10 11 12 13 12 13 14 15 14 15]
     return v2
@@ -271,13 +240,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhh %v24, %v24, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhh %v24, %v24, %v24
 ;   br %r14
 
-function %shuffle_vmrhb_xx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhb_xx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15]
     return v2
@@ -287,13 +256,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhb %v24, %v24, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhb %v24, %v24, %v24
 ;   br %r14
 
-function %shuffle_vmrhg_yy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhg_yy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [24 25 26 27 28 29 30 31 24 25 26 27 28 29 30 31]
     return v2
@@ -303,13 +272,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhg %v24, %v25, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhg %v24, %v25, %v25
 ;   br %r14
 
-function %shuffle_vmrhf_yy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhf_yy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [24 25 26 27 24 25 26 27 28 29 30 31 28 29 30 31]
     return v2
@@ -319,13 +288,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhf %v24, %v25, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhf %v24, %v25, %v25
 ;   br %r14
 
-function %shuffle_vmrhh_yy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhh_yy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [24 25 24 25 26 27 26 27 28 29 28 29 30 31 30 31]
     return v2
@@ -335,13 +304,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhh %v24, %v25, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhh %v24, %v25, %v25
 ;   br %r14
 
-function %shuffle_vmrhb_yy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrhb_yy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [24 24 25 25 26 26 27 27 28 28 29 29 30 30 31 31]
     return v2
@@ -351,13 +320,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrhb %v24, %v25, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrhb %v24, %v25, %v25
 ;   br %r14
 
-function %shuffle_vmrlg_xy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlg_xy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [16 17 18 19 20 21 22 23 0 1 2 3 4 5 6 7]
     return v2
@@ -367,13 +336,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlg %v24, %v24, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlg %v24, %v24, %v25
 ;   br %r14
 
-function %shuffle_vmrlf_xy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlf_xy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [16 17 18 19 0 1 2 3 20 21 22 23 4 5 6 7]
     return v2
@@ -383,13 +352,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlf %v24, %v24, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlf %v24, %v24, %v25
 ;   br %r14
 
-function %shuffle_vmrlh_xy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlh_xy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [16 17 0 1 18 19 2 3 20 21 4 5 22 23 6 7]
     return v2
@@ -399,13 +368,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlh %v24, %v24, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlh %v24, %v24, %v25
 ;   br %r14
 
-function %shuffle_vmrlb_xy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlb_xy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [16 0 17 1 18 2 19 3 20 4 21 5 22 6 23 7]
     return v2
@@ -415,13 +384,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlb %v24, %v24, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlb %v24, %v24, %v25
 ;   br %r14
 
-function %shuffle_vmrlg_yx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlg_yx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23]
     return v2
@@ -431,13 +400,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlg %v24, %v25, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlg %v24, %v25, %v24
 ;   br %r14
 
-function %shuffle_vmrlf_yx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlf_yx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [0 1 2 3 16 17 18 19 4 5 6 7 20 21 22 23]
     return v2
@@ -447,13 +416,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlf %v24, %v25, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlf %v24, %v25, %v24
 ;   br %r14
 
-function %shuffle_vmrlh_yx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlh_yx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [0 1 16 17 2 3 18 19 4 5 20 21 6 7 22 23]
     return v2
@@ -463,13 +432,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlh %v24, %v25, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlh %v24, %v25, %v24
 ;   br %r14
 
-function %shuffle_vmrlb_yx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlb_yx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [0 16 1 17 2 18 3 19 4 20 5 21 6 22 7 23]
     return v2
@@ -479,13 +448,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlb %v24, %v25, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlb %v24, %v25, %v24
 ;   br %r14
 
-function %shuffle_vmrlg_xx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlg_xx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7]
     return v2
@@ -495,13 +464,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlg %v24, %v24, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlg %v24, %v24, %v24
 ;   br %r14
 
-function %shuffle_vmrlf_xx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlf_xx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [0 1 2 3 0 1 2 3 4 5 6 7 4 5 6 7]
     return v2
@@ -511,13 +480,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlf %v24, %v24, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlf %v24, %v24, %v24
 ;   br %r14
 
-function %shuffle_vmrlh_xx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlh_xx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [0 1 0 1 2 3 2 3 4 5 4 5 6 7 6 7]
     return v2
@@ -527,13 +496,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlh %v24, %v24, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlh %v24, %v24, %v24
 ;   br %r14
 
-function %shuffle_vmrlb_xx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlb_xx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7]
     return v2
@@ -543,13 +512,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlb %v24, %v24, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlb %v24, %v24, %v24
 ;   br %r14
 
-function %shuffle_vmrlg_yy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlg_yy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [16 17 18 19 20 21 22 23 16 17 18 19 20 21 22 23]
     return v2
@@ -559,13 +528,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlg %v24, %v25, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlg %v24, %v25, %v25
 ;   br %r14
 
-function %shuffle_vmrlf_yy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlf_yy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [16 17 18 19 16 17 18 19 20 21 22 23 20 21 22 23]
     return v2
@@ -575,13 +544,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlf %v24, %v25, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlf %v24, %v25, %v25
 ;   br %r14
 
-function %shuffle_vmrlh_yy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlh_yy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [16 17 16 17 18 19 18 19 20 21 20 21 22 23 22 23]
     return v2
@@ -591,13 +560,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlh %v24, %v25, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlh %v24, %v25, %v25
 ;   br %r14
 
-function %shuffle_vmrlb_yy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vmrlb_yy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [16 16 17 17 18 18 19 19 20 20 21 21 22 22 23 23]
     return v2
@@ -607,14 +576,14 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vmrlb %v24, %v25, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vmrlb %v24, %v25, %v25
 ;   br %r14
 
 ;; Special patterns that can be implemented via PACK.
-function %shuffle_vpkg_xy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vpkg_xy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [16 17 18 19 24 25 26 27 0 1 2 3 8 9 10 11]
     return v2
@@ -624,13 +593,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vpkg %v24, %v24, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vpkg %v24, %v24, %v25
 ;   br %r14
 
-function %shuffle_vpkf_xy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vpkf_xy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [16 17 20 21 24 25 28 29 0 1 4 5 8 9 12 13]
     return v2
@@ -640,13 +609,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vpkf %v24, %v24, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vpkf %v24, %v24, %v25
 ;   br %r14
 
-function %shuffle_vpkh_xy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vpkh_xy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [16 18 20 22 24 26 28 30 0 2 4 6 8 10 12 14]
     return v2
@@ -656,13 +625,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vpkh %v24, %v24, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vpkh %v24, %v24, %v25
 ;   br %r14
 
-function %shuffle_vpkg_yx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vpkg_yx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [0 1 2 3 8 9 10 11 16 17 18 19 24 25 26 27]
     return v2
@@ -672,13 +641,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vpkg %v24, %v25, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vpkg %v24, %v25, %v24
 ;   br %r14
 
-function %shuffle_vpkf_yx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vpkf_yx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [0 1 4 5 8 9 12 13 16 17 20 21 24 25 28 29]
     return v2
@@ -688,13 +657,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vpkf %v24, %v25, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vpkf %v24, %v25, %v24
 ;   br %r14
 
-function %shuffle_vpkh_yx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vpkh_yx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30]
     return v2
@@ -704,13 +673,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vpkh %v24, %v25, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vpkh %v24, %v25, %v24
 ;   br %r14
 
-function %shuffle_vpkg_xx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vpkg_xx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [0 1 2 3 8 9 10 11 0 1 2 3 8 9 10 11]
     return v2
@@ -720,13 +689,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vpkg %v24, %v24, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vpkg %v24, %v24, %v24
 ;   br %r14
 
-function %shuffle_vpkf_xx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vpkf_xx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [0 1 4 5 8 9 12 13 0 1 4 5 8 9 12 13]
     return v2
@@ -736,13 +705,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vpkf %v24, %v24, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vpkf %v24, %v24, %v24
 ;   br %r14
 
-function %shuffle_vpkh_xx(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vpkh_xx(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [0 2 4 6 8 10 12 14 0 2 4 6 8 10 12 14]
     return v2
@@ -752,13 +721,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vpkh %v24, %v24, %v24
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vpkh %v24, %v24, %v24
 ;   br %r14
 
-function %shuffle_vpkg_yy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vpkg_yy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [16 17 18 19 24 25 26 27 16 17 18 19 24 25 26 27]
     return v2
@@ -768,13 +737,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vpkg %v24, %v25, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vpkg %v24, %v25, %v25
 ;   br %r14
 
-function %shuffle_vpkf_yy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vpkf_yy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [16 17 20 21 24 25 28 29 16 17 20 21 24 25 28 29]
     return v2
@@ -784,13 +753,13 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vpkf %v24, %v25, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vpkf %v24, %v25, %v25
 ;   br %r14
 
-function %shuffle_vpkh_yy(i8x16, i8x16) -> i8x16 wasmtime_system_v {
+function %shuffle_vpkh_yy(i8x16, i8x16) -> i8x16 tail {
 block0(v0: i8x16, v1: i8x16):
     v2 = shuffle v0, v1, [16 18 20 22 24 26 28 30 16 18 20 22 24 26 28 30]
     return v2
@@ -800,7 +769,7 @@ block0(v0: i8x16, v1: i8x16):
 ; block0:
 ;   vpkh %v24, %v25, %v25
 ;   br %r14
-; 
+;
 ; Disassembled:
 ; block0: ; offset 0x0
 ;   vpkh %v24, %v25, %v25

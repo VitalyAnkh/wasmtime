@@ -1,9 +1,6 @@
 use crate::ir::{MemFlags, TrapCode};
 use crate::isa::s390x::inst::*;
 use crate::isa::s390x::settings as s390x_settings;
-use crate::settings;
-use alloc::vec::Vec;
-use smallvec::smallvec;
 
 #[cfg(test)]
 fn simm20_zero() -> SImm20 {
@@ -2082,7 +2079,7 @@ fn test_s390x_binemit() {
             rn: gpr(5),
             rm: gpr(6),
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "B9728056",
         "crte %r5, %r6",
@@ -2093,7 +2090,7 @@ fn test_s390x_binemit() {
             rn: gpr(5),
             rm: gpr(6),
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "B9608056",
         "cgrte %r5, %r6",
@@ -2104,7 +2101,7 @@ fn test_s390x_binemit() {
             rn: gpr(5),
             rm: gpr(6),
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "B9738056",
         "clrte %r5, %r6",
@@ -2115,7 +2112,7 @@ fn test_s390x_binemit() {
             rn: gpr(5),
             rm: gpr(6),
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "B9618056",
         "clgrte %r5, %r6",
@@ -2126,7 +2123,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: -32768,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC7080008072",
         "cite %r7, -32768",
@@ -2137,7 +2134,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 32767,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC707FFF8072",
         "cite %r7, 32767",
@@ -2148,7 +2145,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: -32768,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC7080008070",
         "cgite %r7, -32768",
@@ -2159,7 +2156,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 32767,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC707FFF8070",
         "cgite %r7, 32767",
@@ -2170,7 +2167,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 0,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC7000008073",
         "clfite %r7, 0",
@@ -2181,7 +2178,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 65535,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC70FFFF8073",
         "clfite %r7, 65535",
@@ -2192,7 +2189,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 0,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC7000008071",
         "clgite %r7, 0",
@@ -2203,7 +2200,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 65535,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC70FFFF8071",
         "clgite %r7, 65535",
@@ -6041,24 +6038,6 @@ fn test_s390x_binemit() {
     ));
 
     insns.push((
-        Inst::Mvc {
-            dst: MemArgPair {
-                base: gpr(2),
-                disp: UImm12::maybe_from_u64(0x345).unwrap(),
-                flags: MemFlags::trusted(),
-            },
-            src: MemArgPair {
-                base: gpr(8),
-                disp: UImm12::maybe_from_u64(0x9ab).unwrap(),
-                flags: MemFlags::trusted(),
-            },
-            len_minus_one: 255,
-        },
-        "D2FF234589AB",
-        "mvc 837(255,%r2), 2475(%r8)",
-    ));
-
-    insns.push((
         Inst::LoadMultiple64 {
             rt: writable_gpr(8),
             rt2: writable_gpr(12),
@@ -6735,119 +6714,6 @@ fn test_s390x_binemit() {
     ));
 
     insns.push((
-        Inst::OneWayCondBr {
-            target: MachLabel::from_block(BlockIndex::new(0)),
-            cond: Cond::from_mask(1),
-        },
-        "C01400000000",
-        "jgo label0",
-    ));
-    insns.push((
-        Inst::OneWayCondBr {
-            target: MachLabel::from_block(BlockIndex::new(0)),
-            cond: Cond::from_mask(2),
-        },
-        "C02400000000",
-        "jgh label0",
-    ));
-    insns.push((
-        Inst::OneWayCondBr {
-            target: MachLabel::from_block(BlockIndex::new(0)),
-            cond: Cond::from_mask(3),
-        },
-        "C03400000000",
-        "jgnle label0",
-    ));
-    insns.push((
-        Inst::OneWayCondBr {
-            target: MachLabel::from_block(BlockIndex::new(0)),
-            cond: Cond::from_mask(4),
-        },
-        "C04400000000",
-        "jgl label0",
-    ));
-    insns.push((
-        Inst::OneWayCondBr {
-            target: MachLabel::from_block(BlockIndex::new(0)),
-            cond: Cond::from_mask(5),
-        },
-        "C05400000000",
-        "jgnhe label0",
-    ));
-    insns.push((
-        Inst::OneWayCondBr {
-            target: MachLabel::from_block(BlockIndex::new(0)),
-            cond: Cond::from_mask(6),
-        },
-        "C06400000000",
-        "jglh label0",
-    ));
-    insns.push((
-        Inst::OneWayCondBr {
-            target: MachLabel::from_block(BlockIndex::new(0)),
-            cond: Cond::from_mask(7),
-        },
-        "C07400000000",
-        "jgne label0",
-    ));
-    insns.push((
-        Inst::OneWayCondBr {
-            target: MachLabel::from_block(BlockIndex::new(0)),
-            cond: Cond::from_mask(8),
-        },
-        "C08400000000",
-        "jge label0",
-    ));
-    insns.push((
-        Inst::OneWayCondBr {
-            target: MachLabel::from_block(BlockIndex::new(0)),
-            cond: Cond::from_mask(9),
-        },
-        "C09400000000",
-        "jgnlh label0",
-    ));
-    insns.push((
-        Inst::OneWayCondBr {
-            target: MachLabel::from_block(BlockIndex::new(0)),
-            cond: Cond::from_mask(10),
-        },
-        "C0A400000000",
-        "jghe label0",
-    ));
-    insns.push((
-        Inst::OneWayCondBr {
-            target: MachLabel::from_block(BlockIndex::new(0)),
-            cond: Cond::from_mask(11),
-        },
-        "C0B400000000",
-        "jgnl label0",
-    ));
-    insns.push((
-        Inst::OneWayCondBr {
-            target: MachLabel::from_block(BlockIndex::new(0)),
-            cond: Cond::from_mask(12),
-        },
-        "C0C400000000",
-        "jgle label0",
-    ));
-    insns.push((
-        Inst::OneWayCondBr {
-            target: MachLabel::from_block(BlockIndex::new(0)),
-            cond: Cond::from_mask(13),
-        },
-        "C0D400000000",
-        "jgnh label0",
-    ));
-    insns.push((
-        Inst::OneWayCondBr {
-            target: MachLabel::from_block(BlockIndex::new(0)),
-            cond: Cond::from_mask(14),
-        },
-        "C0E400000000",
-        "jgno label0",
-    ));
-
-    insns.push((
         Inst::CondBr {
             taken: MachLabel::from_block(BlockIndex::new(0)),
             not_taken: MachLabel::from_block(BlockIndex::new(0)),
@@ -6986,16 +6852,10 @@ fn test_s390x_binemit() {
     insns.push((
         Inst::Call {
             link: writable_gpr(14),
-            info: Box::new(CallInfo {
-                dest: ExternalName::testcase("test0"),
-                uses: smallvec![],
-                defs: smallvec![],
-                clobbers: PRegSet::empty(),
-                opcode: Opcode::Call,
-                caller_callconv: CallConv::SystemV,
-                callee_callconv: CallConv::SystemV,
-                tls_symbol: None,
-            }),
+            info: Box::new(CallInfo::empty(
+                ExternalName::testcase("test0"),
+                CallConv::SystemV,
+            )),
         },
         "C0E500000000",
         "brasl %r14, %test0",
@@ -7004,45 +6864,30 @@ fn test_s390x_binemit() {
     insns.push((
         Inst::CallInd {
             link: writable_gpr(14),
-            info: Box::new(CallIndInfo {
-                rn: gpr(1),
-                uses: smallvec![],
-                defs: smallvec![],
-                clobbers: PRegSet::empty(),
-                opcode: Opcode::CallIndirect,
-                caller_callconv: CallConv::SystemV,
-                callee_callconv: CallConv::SystemV,
-            }),
+            info: Box::new(CallInfo::empty(gpr(1), CallConv::SystemV)),
         },
         "0DE1",
         "basr %r14, %r1",
     ));
 
-    insns.push((
-        Inst::Ret {
-            link: gpr(14),
-            rets: vec![],
-        },
-        "07FE",
-        "br %r14",
-    ));
+    insns.push((Inst::Ret { link: gpr(14) }, "07FE", "br %r14"));
 
-    insns.push((Inst::Debugtrap, "0001", "debugtrap"));
+    insns.push((Inst::Debugtrap, "0001", ".word 0x0001 # debugtrap"));
 
     insns.push((
         Inst::Trap {
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "0000",
-        "trap",
+        ".word 0x0000 # trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
             cond: Cond::from_mask(1),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
-        "A7E400030000",
-        "jno 6 ; trap",
+        "C01400000001",
+        "jgo .+2 # trap=stk_ovf",
     ));
 
     insns.push((
@@ -7072,6 +6917,15 @@ fn test_s390x_binemit() {
         },
         "1923C0D400000008BA456000C064FFFFFFFA",
         "0: cr %r2, %r3 ; jgnh 1f ; cs %r4, %r5, 0(%r6) ; jglh 0b ; 1:",
+    ));
+
+    insns.push((
+        Inst::StackProbeLoop {
+            probe_count: writable_gpr(1),
+            guard_size: 4096,
+        },
+        "A7FBF0009200F000A716FFFC",
+        "0: aghi %r15, -4096 ; mvi 0(%r15), 0 ; brct %r1, 0b",
     ));
 
     insns.push((
@@ -13362,34 +13216,32 @@ fn test_s390x_binemit() {
     use crate::settings::Configurable;
     let mut isa_flag_builder = s390x_settings::builder();
     isa_flag_builder.enable("arch13").unwrap();
-    let isa_flags = s390x_settings::Flags::new(&flags, isa_flag_builder);
+    let isa_flags = s390x_settings::Flags::new(&flags, &isa_flag_builder);
+    let ctrl_plane = &mut Default::default();
+    let constants = Default::default();
 
     let emit_info = EmitInfo::new(isa_flags);
     for (insn, expected_encoding, expected_printing) in insns {
-        println!(
-            "S390x: {:?}, {}, {}",
-            insn, expected_encoding, expected_printing
-        );
+        println!("S390x: {insn:?}, {expected_encoding}, {expected_printing}");
 
         // Check the printed text is as expected.
-        let actual_printing =
-            insn.print_with_state(&mut EmitState::default(), &mut AllocationConsumer::new(&[]));
+        let actual_printing = insn.print_with_state(&mut EmitState::default());
         assert_eq!(expected_printing, actual_printing);
 
         let mut buffer = MachBuffer::new();
 
         // Label 0 before the instruction.
         let label0 = buffer.get_label();
-        buffer.bind_label(label0);
+        buffer.bind_label(label0, ctrl_plane);
 
         // Emit the instruction.
-        insn.emit(&[], &mut buffer, &emit_info, &mut Default::default());
+        insn.emit(&mut buffer, &emit_info, &mut Default::default());
 
         // Label 1 after the instruction.
         let label1 = buffer.get_label();
-        buffer.bind_label(label1);
+        buffer.bind_label(label1, ctrl_plane);
 
-        let buffer = buffer.finish();
+        let buffer = buffer.finish(&constants, ctrl_plane);
         let actual_encoding = &buffer.stringify_code_bytes();
         assert_eq!(expected_encoding, actual_encoding);
     }

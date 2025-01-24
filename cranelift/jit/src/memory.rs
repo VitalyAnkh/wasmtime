@@ -5,7 +5,6 @@ use memmap2::MmapMut;
 
 #[cfg(not(any(feature = "selinux-fix", windows)))]
 use std::alloc;
-use std::convert::TryFrom;
 use std::ffi::c_void;
 use std::io;
 use std::mem;
@@ -37,7 +36,7 @@ impl PtrLen {
     /// suitably sized and aligned for memory protection.
     #[cfg(all(not(target_os = "windows"), feature = "selinux-fix"))]
     fn with_size(size: usize) -> io::Result<Self> {
-        let alloc_size = region::page::ceil(size);
+        let alloc_size = region::page::ceil(size as *const ()) as usize;
         MmapMut::map_anon(alloc_size).map(|mut mmap| {
             // The order here is important; we assign the pointer first to get
             // around compile time borrow errors.
@@ -53,7 +52,7 @@ impl PtrLen {
     fn with_size(size: usize) -> io::Result<Self> {
         assert_ne!(size, 0);
         let page_size = region::page::size();
-        let alloc_size = region::page::ceil(size);
+        let alloc_size = region::page::ceil(size as *const ()) as usize;
         let layout = alloc::Layout::from_size_align(alloc_size, page_size).unwrap();
         // Safety: We assert that the size is non-zero above.
         let ptr = unsafe { alloc::alloc(layout) };
@@ -86,7 +85,7 @@ impl PtrLen {
         if !ptr.is_null() {
             Ok(Self {
                 ptr: ptr as *mut u8,
-                len: region::page::ceil(size),
+                len: region::page::ceil(size as *const ()) as usize,
             })
         } else {
             Err(io::Error::last_os_error())
@@ -132,6 +131,8 @@ pub(crate) struct Memory {
     position: usize,
     branch_protection: BranchProtection,
 }
+
+unsafe impl Send for Memory {}
 
 impl Memory {
     pub(crate) fn new(branch_protection: BranchProtection) -> Self {
@@ -251,7 +252,7 @@ impl Memory {
         let iter = self.allocations[self.already_protected..].iter();
 
         #[cfg(all(not(target_os = "windows"), feature = "selinux-fix"))]
-        return iter.filter(|&PtrLen { ref map, len, .. }| *len != 0 && map.is_some());
+        return iter.filter(|&PtrLen { map, len, .. }| *len != 0 && map.is_some());
 
         #[cfg(any(target_os = "windows", not(feature = "selinux-fix")))]
         return iter.filter(|&PtrLen { len, .. }| *len != 0);

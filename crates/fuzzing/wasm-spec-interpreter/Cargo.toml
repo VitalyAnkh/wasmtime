@@ -5,7 +5,11 @@ name = "wasm-spec-interpreter"
 version = "0.0.0"
 publish = false
 edition.workspace = true
+rust-version.workspace = true
 license = "Apache-2.0 WITH LLVM-exception"
+
+[lints]
+workspace = true
 
 # Until https://gitlab.com/ocaml-rust/ocaml-boxroot/-/issues/1 is resolved and
 # this crate can use the `without-ocamlopt` feature to avoid build failures, it
@@ -13,10 +17,9 @@ license = "Apache-2.0 WITH LLVM-exception"
 # `build-libinterpret` feature set by this crate's parent).
 [dependencies]
 ocaml-interop = { version = "0.8", optional = true }
-once_cell = { workspace = true, optional = true }
 
 [dev-dependencies]
 wat = { workspace = true }
 
 [features]
-build-libinterpret = ["ocaml-interop", "once_cell"]
+build-libinterpret = ["ocaml-interop"]

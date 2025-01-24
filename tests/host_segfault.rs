@@ -9,6 +9,7 @@
 // then we also make sure that stderr is empty to confirm that no weird panics
 // happened or anything like that.
 
+use libtest_mimic::{Arguments, Trial};
 use std::env;
 use std::future::Future;
 use std::io::{self, Write};
@@ -22,7 +23,7 @@ const CONFIRM: &str = "well at least we ran up to the crash";
 
 fn segfault() -> ! {
     unsafe {
-        println!("{}", CONFIRM);
+        println!("{CONFIRM}");
         io::stdout().flush().unwrap();
         *(0x4 as *mut i32) = 3;
         unreachable!()
@@ -40,7 +41,7 @@ fn allocate_stack_space() -> ! {
 }
 
 fn overrun_the_stack() -> ! {
-    println!("{}", CONFIRM);
+    println!("{CONFIRM}");
     io::stdout().flush().unwrap();
     allocate_stack_space();
 }
@@ -79,7 +80,17 @@ fn dummy_waker() -> Waker {
     }
 }
 
+#[derive(PartialEq, Copy, Clone)]
+enum StackOverflow {
+    No,
+    Host,
+    Wasm,
+}
+
 fn main() {
+    if cfg!(miri) {
+        return;
+    }
     // Skip this tests if it looks like we're in a cross-compiled situation and
     // we're emulating this test for a different platform. In that scenario
     // emulators (like QEMU) tend to not report signals the same way and such.
@@ -91,8 +102,25 @@ fn main() {
         return;
     }
 
-    let tests: &[(&str, fn(), bool)] = &[
-        ("normal segfault", || segfault(), false),
+    // Disable core dumps on Unix to avoid spamming the system core dump utility
+    // and having this test take longer.
+    #[cfg(unix)]
+    unsafe {
+        let zero = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let rc = libc::setrlimit(libc::RLIMIT_CORE, &zero);
+        assert_eq!(
+            rc,
+            0,
+            "failed to disable core dumps: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let tests: &[(&str, fn(), StackOverflow)] = &[
+        ("normal segfault", || segfault(), StackOverflow::No),
         (
             "make instance then segfault",
             || {
@@ -102,7 +130,7 @@ fn main() {
                 let _instance = Instance::new(&mut store, &module, &[]).unwrap();
                 segfault();
             },
-            false,
+            StackOverflow::No,
         ),
         (
             "make instance then overrun the stack",
@@ -113,7 +141,7 @@ fn main() {
                 let _instance = Instance::new(&mut store, &module, &[]).unwrap();
                 overrun_the_stack();
             },
-            true,
+            StackOverflow::Host,
         ),
         (
             "segfault in a host function",
@@ -121,11 +149,11 @@ fn main() {
                 let engine = Engine::default();
                 let mut store = Store::new(&engine, ());
                 let module = Module::new(&engine, r#"(import "" "" (func)) (start 0)"#).unwrap();
-                let segfault = Func::wrap(&mut store, || segfault());
+                let segfault = Func::wrap(&mut store, || -> () { segfault() });
                 Instance::new(&mut store, &module, &[segfault.into()]).unwrap();
                 unreachable!();
             },
-            false,
+            StackOverflow::No,
         ),
         (
             "hit async stack guard page",
@@ -134,25 +162,27 @@ fn main() {
                 config.async_support(true);
                 let engine = Engine::new(&config).unwrap();
                 let mut store = Store::new(&engine, ());
-                let f = Func::wrap0_async(&mut store, |_| {
+                let f = Func::wrap_async(&mut store, |_, _: ()| {
                     Box::new(async {
-                        overrun_the_stack();
+                        if true {
+                            overrun_the_stack();
+                        }
                     })
                 });
                 run_future(f.call_async(&mut store, &[], &mut [])).unwrap();
                 unreachable!();
             },
-            true,
+            StackOverflow::Host,
         ),
         (
             "overrun 8k with misconfigured host",
             || overrun_with_big_module(8 << 10),
-            true,
+            StackOverflow::Wasm,
         ),
         (
             "overrun 32k with misconfigured host",
             || overrun_with_big_module(32 << 10),
-            true,
+            StackOverflow::Wasm,
         ),
         #[cfg(not(any(target_arch = "riscv64")))]
         // Due to `InstanceAllocationStrategy::pooling()` trying to alloc more than 6000G memory space.
@@ -163,18 +193,26 @@ fn main() {
             || {
                 let mut config = Config::default();
                 config.async_support(true);
-                config.allocation_strategy(InstanceAllocationStrategy::pooling());
+                let mut cfg = PoolingAllocationConfig::default();
+                cfg.total_memories(1);
+                cfg.max_memory_size(1 << 16);
+                cfg.total_tables(1);
+                cfg.table_elements(10);
+                cfg.total_stacks(1);
+                config.allocation_strategy(cfg);
                 let engine = Engine::new(&config).unwrap();
                 let mut store = Store::new(&engine, ());
-                let f = Func::wrap0_async(&mut store, |_| {
+                let f = Func::wrap_async(&mut store, |_, _: ()| {
                     Box::new(async {
-                        overrun_the_stack();
+                        if true {
+                            overrun_the_stack();
+                        }
                     })
                 });
                 run_future(f.call_async(&mut store, &[], &mut [])).unwrap();
                 unreachable!();
             },
-            true,
+            StackOverflow::Host,
         ),
     ];
     match env::var(VAR_NAME) {
@@ -187,15 +225,19 @@ fn main() {
             test();
         }
         Err(_) => {
+            let mut trials = Vec::new();
             for (name, _test, stack_overflow) in tests {
-                println!("running {name}");
-                run_test(name, *stack_overflow);
+                trials.push(Trial::test(name.to_string(), || {
+                    run_test(name, *stack_overflow);
+                    Ok(())
+                }));
             }
+            libtest_mimic::run(&Arguments::from_args(), trials).exit()
         }
     }
 }
 
-fn run_test(name: &str, stack_overflow: bool) {
+fn run_test(name: &str, stack_overflow: StackOverflow) {
     let me = env::current_exe().unwrap();
     let mut cmd = Command::new(me);
     cmd.env(VAR_NAME, name);
@@ -216,27 +258,34 @@ fn run_test(name: &str, stack_overflow: bool) {
         desc.push_str(&stderr.replace("\n", "\n    "));
     }
 
-    if stack_overflow {
-        if is_stack_overflow(&output.status, &stderr) {
-            assert!(
-                stdout.trim().ends_with(CONFIRM),
-                "failed to find confirmation in test `{}`\n{}",
-                name,
-                desc
-            );
-        } else {
-            panic!("\n\nexpected a stack overflow on `{}`\n{}\n\n", name, desc);
+    match stack_overflow {
+        // If the host stack overflows then the result should always indicate a
+        // stack overflow. If the guest stack overflows then that won't actually
+        // trigger an overflow when Cranelift doesn't have native support
+        // because Pulley is used in that case.
+        StackOverflow::Host | StackOverflow::Wasm => {
+            let native_stack_overflow = is_stack_overflow(&output.status, &stderr);
+            let expect_native_overflow =
+                stack_overflow == StackOverflow::Host || cranelift_native::builder().is_ok();
+
+            if native_stack_overflow == expect_native_overflow {
+                assert!(
+                    stdout.trim().ends_with(CONFIRM),
+                    "failed to find confirmation in test `{name}`\n{desc}"
+                );
+            } else {
+                panic!("\n\nexpected a stack overflow on `{name}`\n{desc}\n\n");
+            }
         }
-    } else {
-        if is_segfault(&output.status) {
-            assert!(
-                stdout.trim().ends_with(CONFIRM) && stderr.is_empty(),
-                "failed to find confirmation in test `{}`\n{}",
-                name,
-                desc
-            );
-        } else {
-            panic!("\n\nexpected a segfault on `{}`\n{}\n\n", name, desc);
+        StackOverflow::No => {
+            if is_segfault(&output.status) {
+                assert!(
+                    stdout.trim().ends_with(CONFIRM) && stderr.is_empty(),
+                    "failed to find confirmation in test `{name}`\n{desc}"
+                );
+            } else {
+                panic!("\n\nexpected a segfault on `{name}`\n{desc}\n\n");
+            }
         }
     }
 }
@@ -255,12 +304,16 @@ fn is_segfault(status: &ExitStatus) -> bool {
 fn is_stack_overflow(status: &ExitStatus, stderr: &str) -> bool {
     use std::os::unix::prelude::*;
 
-    // The main thread might overflow or it might be from a fiber stack (SIGSEGV/SIGBUS)
+    // The exit status should always be SIGABRT, not SIGSEGV. Something, be it
+    // the standard library or Wasmtime, should catch the original SIGSEGV or
+    // SIGBUS and abort instead.
+    match status.signal() {
+        Some(libc::SIGABRT) => {}
+        _ => return false,
+    }
+
+    // A helpful message should additionally be printed at all times.
     stderr.contains("has overflowed its stack")
-        || match status.signal() {
-            Some(libc::SIGSEGV) | Some(libc::SIGBUS) => true,
-            _ => false,
-        }
 }
 
 #[cfg(windows)]

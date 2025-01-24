@@ -54,31 +54,24 @@ with `cargo run`.
 
 ## Building the Wasmtime C API
 
-To build the C API of Wasmtime you can run:
-
-```shell
-cargo build --release --manifest-path crates/c-api/Cargo.toml
-```
-
-This will place the shared library inside of `target/release`. On Linux it will
-be called `libwasmtime.{a,so}`, on macOS it will be called
-`libwasmtime.{a,dylib}`, and on Windows it will be called
-`wasmtime.{lib,dll,dll.lib}`.
+See
+[`crates/c-api/README.md`](https://github.com/bytecodealliance/wasmtime/blob/main/crates/c-api/README.md)
+for details.
 
 ## Building Other Wasmtime Crates
 
 You can build any of the Wasmtime crates by appending `-p wasmtime-whatever` to
-the `cargo build` invocation. For example, to build the `wasmtime-jit` crate,
+the `cargo build` invocation. For example, to build the `wasmtime-environ` crate,
 execute this command:
 
 ```shell
-cargo build -p wasmtime-jit
+cargo build -p wasmtime-environ
 ```
 
 Alternatively, you can `cd` into the crate's directory, and run `cargo build`
 there, without needing to supply the `-p` flag:
 
 ```shell
-cd crates/jit/
+cd crates/environ/
 cargo build
 ```

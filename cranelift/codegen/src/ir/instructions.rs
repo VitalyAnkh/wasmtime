@@ -6,15 +6,16 @@
 //! A large part of this module is auto-generated from the instruction descriptions in the meta
 //! directory.
 
+use crate::constant_hash::Table;
 use alloc::vec::Vec;
 use core::fmt::{self, Display, Formatter};
 use core::ops::{Deref, DerefMut};
 use core::str::FromStr;
 
 #[cfg(feature = "enable-serde")]
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 
-use crate::bitset::BitSet;
+use crate::bitset::ScalarBitSet;
 use crate::entity;
 use crate::ir::{
     self,
@@ -45,7 +46,7 @@ pub type ValueListPool = entity::ListPool<Value>;
 /// The BlockCall::new function guarantees this layout by requiring a block argument that's written
 /// in as the first element of the EntityList. Any subsequent entries are always assumed to be real
 /// Values.
-#[derive(Debug, Clone, Copy, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 pub struct BlockCall {
     /// The underlying storage for the BlockCall. The first element of the values EntityList is
@@ -150,7 +151,7 @@ impl<'a> Display for DisplayBlockCall<'a> {
                 if ix > 0 {
                     write!(f, ", ")?;
                 }
-                write!(f, "{}", arg)?;
+                write!(f, "{arg}")?;
             }
             write!(f, ")")?;
         }
@@ -193,12 +194,12 @@ impl Opcode {
         OPCODE_CONSTRAINTS[self as usize - 1]
     }
 
-    /// Returns true if the instruction is a resumable trap.
-    pub fn is_resumable_trap(&self) -> bool {
-        match self {
-            Opcode::ResumableTrap | Opcode::ResumableTrapnz => true,
-            _ => false,
-        }
+    /// Is this instruction a GC safepoint?
+    ///
+    /// Safepoints are all kinds of calls, except for tail calls.
+    #[inline]
+    pub fn is_safepoint(self) -> bool {
+        self.is_call() && !self.is_return()
     }
 }
 
@@ -211,17 +212,7 @@ impl FromStr for Opcode {
 
     /// Parse an Opcode name from a string.
     fn from_str(s: &str) -> Result<Self, &'static str> {
-        use crate::constant_hash::{probe, simple_hash, Table};
-
-        impl<'a> Table<&'a str> for [Option<Opcode>] {
-            fn len(&self) -> usize {
-                self.len()
-            }
-
-            fn key(&self, idx: usize) -> Option<&'a str> {
-                self[idx].map(opcode_name)
-            }
-        }
+        use crate::constant_hash::{probe, simple_hash};
 
         match probe::<&str, [Option<Self>]>(&OPCODE_HASH_TABLE, s, simple_hash(s)) {
             Err(_) => Err("Unknown opcode"),
@@ -229,6 +220,16 @@ impl FromStr for Opcode {
             // at this index is not None.
             Ok(i) => Ok(OPCODE_HASH_TABLE[i].unwrap()),
         }
+    }
+}
+
+impl<'a> Table<&'a str> for [Option<Opcode>] {
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn key(&self, idx: usize) -> Option<&'a str> {
+        self[idx].map(opcode_name)
     }
 }
 
@@ -281,9 +282,9 @@ impl Display for VariableArgs {
     fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
         for (i, val) in self.0.iter().enumerate() {
             if i == 0 {
-                write!(fmt, "{}", val)?;
+                write!(fmt, "{val}")?;
             } else {
-                write!(fmt, ", {}", val)?;
+                write!(fmt, ", {val}")?;
             }
         }
         Ok(())
@@ -304,11 +305,9 @@ impl InstructionData {
     /// Get the destinations of this instruction, if it's a branch.
     ///
     /// `br_table` returns the empty slice.
-    pub fn branch_destination<'a>(&'a self, jump_tables: &'a ir::JumpTables) -> &[BlockCall] {
+    pub fn branch_destination<'a>(&'a self, jump_tables: &'a ir::JumpTables) -> &'a [BlockCall] {
         match self {
-            Self::Jump {
-                ref destination, ..
-            } => std::slice::from_ref(destination),
+            Self::Jump { destination, .. } => std::slice::from_ref(destination),
             Self::Brif { blocks, .. } => blocks.as_slice(),
             Self::BranchTable { table, .. } => jump_tables.get(*table).unwrap().all_branches(),
             _ => {
@@ -324,12 +323,9 @@ impl InstructionData {
     pub fn branch_destination_mut<'a>(
         &'a mut self,
         jump_tables: &'a mut ir::JumpTables,
-    ) -> &mut [BlockCall] {
+    ) -> &'a mut [BlockCall] {
         match self {
-            Self::Jump {
-                ref mut destination,
-                ..
-            } => std::slice::from_mut(destination),
+            Self::Jump { destination, .. } => std::slice::from_mut(destination),
             Self::Brif { blocks, .. } => blocks.as_mut_slice(),
             Self::BranchTable { table, .. } => {
                 jump_tables.get_mut(*table).unwrap().all_branches_mut()
@@ -337,6 +333,25 @@ impl InstructionData {
             _ => {
                 debug_assert!(!self.opcode().is_branch());
                 &mut []
+            }
+        }
+    }
+
+    /// Replace the values used in this instruction according to the given
+    /// function.
+    pub fn map_values(
+        &mut self,
+        pool: &mut ValueListPool,
+        jump_tables: &mut ir::JumpTables,
+        mut f: impl FnMut(Value) -> Value,
+    ) {
+        for arg in self.arguments_mut(pool) {
+            *arg = f(*arg);
+        }
+
+        for block in self.branch_destination_mut(jump_tables) {
+            for arg in block.args_slice_mut(pool) {
+                *arg = f(*arg);
             }
         }
     }
@@ -403,7 +418,9 @@ impl InstructionData {
             &InstructionData::Load { flags, .. }
             | &InstructionData::LoadNoOffset { flags, .. }
             | &InstructionData::Store { flags, .. }
-            | &InstructionData::StoreNoOffset { flags, .. } => Some(flags),
+            | &InstructionData::StoreNoOffset { flags, .. }
+            | &InstructionData::AtomicCas { flags, .. }
+            | &InstructionData::AtomicRmw { flags, .. } => Some(flags),
             _ => None,
         }
     }
@@ -428,6 +445,14 @@ impl InstructionData {
             Self::CallIndirect {
                 sig_ref, ref args, ..
             } => CallInfo::Indirect(sig_ref, &args.as_slice(pool)[1..]),
+            Self::Ternary {
+                opcode: Opcode::StackSwitch,
+                ..
+            } => {
+                // `StackSwitch` is not actually a call, but has the .call() side
+                // effect as it continues execution elsewhere.
+                CallInfo::NotACall
+            }
             _ => {
                 debug_assert!(!self.opcode().is_call());
                 CallInfo::NotACall
@@ -436,7 +461,7 @@ impl InstructionData {
     }
 
     #[inline]
-    pub(crate) fn sign_extend_immediates(&mut self, ctrl_typevar: Type) {
+    pub(crate) fn mask_immediates(&mut self, ctrl_typevar: Type) {
         if ctrl_typevar.is_invalid() {
             return;
         }
@@ -444,13 +469,16 @@ impl InstructionData {
         let bit_width = ctrl_typevar.bits();
 
         match self {
+            Self::UnaryImm { opcode: _, imm } => {
+                *imm = imm.mask_to_width(bit_width);
+            }
             Self::BinaryImm64 {
                 opcode,
                 arg: _,
                 imm,
             } => {
                 if *opcode == Opcode::SdivImm || *opcode == Opcode::SremImm {
-                    imm.sign_extend_from_width(bit_width);
+                    *imm = imm.mask_to_width(bit_width);
                 }
             }
             Self::IntCompareImm {
@@ -461,7 +489,7 @@ impl InstructionData {
             } => {
                 debug_assert_eq!(*opcode, Opcode::IcmpImm);
                 if cond.unsigned() != *cond {
-                    imm.sign_extend_from_width(bit_width);
+                    *imm = imm.mask_to_width(bit_width);
                 }
             }
             _ => {}
@@ -573,12 +601,9 @@ impl OpcodeConstraints {
     /// `ctrl_type`.
     pub fn result_type(self, n: usize, ctrl_type: Type) -> Type {
         debug_assert!(n < self.num_fixed_results(), "Invalid result index");
-        if let ResolvedConstraint::Bound(t) =
-            OPERAND_CONSTRAINTS[self.constraint_offset() + n].resolve(ctrl_type)
-        {
-            t
-        } else {
-            panic!("Result constraints can't be free");
+        match OPERAND_CONSTRAINTS[self.constraint_offset() + n].resolve(ctrl_type) {
+            ResolvedConstraint::Bound(t) => t,
+            ResolvedConstraint::Free(ts) => panic!("Result constraints can't be free: {ts:?}"),
         }
     }
 
@@ -608,11 +633,11 @@ impl OpcodeConstraints {
     }
 }
 
-type BitSet8 = BitSet<u8>;
-type BitSet16 = BitSet<u16>;
+type BitSet8 = ScalarBitSet<u8>;
+type BitSet16 = ScalarBitSet<u16>;
 
 /// A value type set describes the permitted set of types for a type variable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ValueTypeSet {
     /// Allowed lane sizes
     pub lanes: BitSet16,
@@ -620,8 +645,6 @@ pub struct ValueTypeSet {
     pub ints: BitSet8,
     /// Allowed float widths
     pub floats: BitSet8,
-    /// Allowed ref widths
-    pub refs: BitSet8,
     /// Allowed dynamic vectors minimum lane sizes
     pub dynamic_lanes: BitSet16,
 }
@@ -631,13 +654,11 @@ impl ValueTypeSet {
     ///
     /// Note that the base type set does not have to be included in the type set proper.
     fn is_base_type(self, scalar: Type) -> bool {
-        let l2b = scalar.log2_lane_bits();
+        let l2b = u8::try_from(scalar.log2_lane_bits()).unwrap();
         if scalar.is_int() {
             self.ints.contains(l2b)
         } else if scalar.is_float() {
             self.floats.contains(l2b)
-        } else if scalar.is_ref() {
-            self.refs.contains(l2b)
         } else {
             false
         }
@@ -646,10 +667,10 @@ impl ValueTypeSet {
     /// Does `typ` belong to this set?
     pub fn contains(self, typ: Type) -> bool {
         if typ.is_dynamic_vector() {
-            let l2l = typ.log2_min_lane_count();
+            let l2l = u8::try_from(typ.log2_min_lane_count()).unwrap();
             self.dynamic_lanes.contains(l2l) && self.is_base_type(typ.lane_type())
         } else {
-            let l2l = typ.log2_lane_count();
+            let l2l = u8::try_from(typ.log2_lane_count()).unwrap();
             self.lanes.contains(l2l) && self.is_base_type(typ.lane_type())
         }
     }
@@ -684,8 +705,8 @@ enum OperandConstraint {
     /// This operand is `ctrlType.lane_of()`.
     LaneOf,
 
-    /// This operand is `ctrlType.as_bool()`.
-    AsBool,
+    /// This operand is `ctrlType.as_truthy()`.
+    AsTruthy,
 
     /// This operand is `ctrlType.half_width()`.
     HalfWidth,
@@ -701,6 +722,12 @@ enum OperandConstraint {
 
     /// This operands is `ctrlType.dynamic_to_vector()`.
     DynamicToVector,
+
+    /// This operand is `ctrlType.narrower()`.
+    Narrower,
+
+    /// This operand is `ctrlType.wider()`.
+    Wider,
 }
 
 impl OperandConstraint {
@@ -714,7 +741,7 @@ impl OperandConstraint {
             Free(vts) => ResolvedConstraint::Free(TYPE_SETS[vts as usize]),
             Same => Bound(ctrl_type),
             LaneOf => Bound(ctrl_type.lane_of()),
-            AsBool => Bound(ctrl_type.as_bool()),
+            AsTruthy => Bound(ctrl_type.as_truthy()),
             HalfWidth => Bound(ctrl_type.half_width().expect("invalid type for half_width")),
             DoubleWidth => Bound(
                 ctrl_type
@@ -764,6 +791,58 @@ impl OperandConstraint {
                     .dynamic_to_vector()
                     .expect("invalid type for dynamic_to_vector"),
             ),
+            Narrower => {
+                let ctrl_type_bits = ctrl_type.log2_lane_bits();
+                let mut tys = ValueTypeSet::default();
+
+                // We're testing scalar values, only.
+                tys.lanes = ScalarBitSet::from_range(0, 1);
+
+                if ctrl_type.is_int() {
+                    // The upper bound in from_range is exclusive, and we want to exclude the
+                    // control type to construct the interval of [I8, ctrl_type).
+                    tys.ints = BitSet8::from_range(3, ctrl_type_bits as u8);
+                } else if ctrl_type.is_float() {
+                    // The upper bound in from_range is exclusive, and we want to exclude the
+                    // control type to construct the interval of [F16, ctrl_type).
+                    tys.floats = BitSet8::from_range(4, ctrl_type_bits as u8);
+                } else {
+                    panic!("The Narrower constraint only operates on floats or ints");
+                }
+                ResolvedConstraint::Free(tys)
+            }
+            Wider => {
+                let ctrl_type_bits = ctrl_type.log2_lane_bits();
+                let mut tys = ValueTypeSet::default();
+
+                // We're testing scalar values, only.
+                tys.lanes = ScalarBitSet::from_range(0, 1);
+
+                if ctrl_type.is_int() {
+                    let lower_bound = ctrl_type_bits as u8 + 1;
+                    // The largest integer type we can represent in `BitSet8` is I128, which is
+                    // represented by bit 7 in the bit set. Adding one to exclude I128 from the
+                    // lower bound would overflow as 2^8 doesn't fit in a u8, but this would
+                    // already describe the empty set so instead we leave `ints` in its default
+                    // empty state.
+                    if lower_bound < BitSet8::capacity() {
+                        // The interval should include all types wider than `ctrl_type`, so we use
+                        // `2^8` as the upper bound, and add one to the bits of `ctrl_type` to define
+                        // the interval `(ctrl_type, I128]`.
+                        tys.ints = BitSet8::from_range(lower_bound, 8);
+                    }
+                } else if ctrl_type.is_float() {
+                    // Same as above but for `tys.floats`, as the largest float type is F128.
+                    let lower_bound = ctrl_type_bits as u8 + 1;
+                    if lower_bound < BitSet8::capacity() {
+                        tys.floats = BitSet8::from_range(lower_bound, 8);
+                    }
+                } else {
+                    panic!("The Wider constraint only operates on floats or ints");
+                }
+
+                ResolvedConstraint::Free(tys)
+            }
         }
     }
 }
@@ -877,6 +956,7 @@ mod tests {
         assert!(cmp.requires_typevar_operand());
         assert_eq!(cmp.num_fixed_results(), 1);
         assert_eq!(cmp.num_fixed_value_arguments(), 2);
+        assert_eq!(cmp.result_type(0, types::I64), types::I8);
     }
 
     #[test]
@@ -887,7 +967,6 @@ mod tests {
             lanes: BitSet16::from_range(0, 8),
             ints: BitSet8::from_range(4, 7),
             floats: BitSet8::from_range(0, 0),
-            refs: BitSet8::from_range(5, 7),
             dynamic_lanes: BitSet16::from_range(0, 4),
         };
         assert!(!vts.contains(I8));
@@ -895,16 +974,15 @@ mod tests {
         assert!(vts.contains(I64));
         assert!(vts.contains(I32X4));
         assert!(vts.contains(I32X4XN));
+        assert!(!vts.contains(F16));
         assert!(!vts.contains(F32));
-        assert!(vts.contains(R32));
-        assert!(vts.contains(R64));
+        assert!(!vts.contains(F128));
         assert_eq!(vts.example().to_string(), "i32");
 
         let vts = ValueTypeSet {
             lanes: BitSet16::from_range(0, 8),
             ints: BitSet8::from_range(0, 0),
             floats: BitSet8::from_range(5, 7),
-            refs: BitSet8::from_range(0, 0),
             dynamic_lanes: BitSet16::from_range(0, 8),
         };
         assert_eq!(vts.example().to_string(), "f32");
@@ -913,7 +991,6 @@ mod tests {
             lanes: BitSet16::from_range(1, 8),
             ints: BitSet8::from_range(0, 0),
             floats: BitSet8::from_range(5, 7),
-            refs: BitSet8::from_range(0, 0),
             dynamic_lanes: BitSet16::from_range(0, 8),
         };
         assert_eq!(vts.example().to_string(), "f32x2");
@@ -922,7 +999,6 @@ mod tests {
             lanes: BitSet16::from_range(2, 8),
             ints: BitSet8::from_range(3, 7),
             floats: BitSet8::from_range(0, 0),
-            refs: BitSet8::from_range(0, 0),
             dynamic_lanes: BitSet16::from_range(0, 8),
         };
         assert_eq!(vts.example().to_string(), "i32x4");
@@ -932,12 +1008,9 @@ mod tests {
             lanes: BitSet16::from_range(0, 9),
             ints: BitSet8::from_range(3, 7),
             floats: BitSet8::from_range(0, 0),
-            refs: BitSet8::from_range(0, 0),
             dynamic_lanes: BitSet16::from_range(0, 8),
         };
         assert!(vts.contains(I32));
         assert!(vts.contains(I32X4));
-        assert!(!vts.contains(R32));
-        assert!(!vts.contains(R64));
     }
 }

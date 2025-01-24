@@ -5,6 +5,9 @@ target x86_64
 target aarch64
 target aarch64 sign_return_address
 target aarch64 has_pauth sign_return_address
+target riscv64
+target riscv64 has_c has_zcb
+set enable_multi_ret_implicit_sret
 target s390x
 
 
