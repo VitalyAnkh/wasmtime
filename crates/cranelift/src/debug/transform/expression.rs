@@ -1,86 +1,129 @@
 use super::address_transform::AddressTransform;
+use super::dbi_log;
+use crate::debug::transform::debug_transform_logging::{
+    dbi_log_enabled, log_get_value_loc, log_get_value_name, log_get_value_ranges,
+};
 use crate::debug::ModuleMemoryOffset;
+use crate::translate::get_vmctx_value_label;
 use anyhow::{Context, Error, Result};
-use cranelift_codegen::ir::{LabelValueLoc, StackSlots, ValueLabel};
+use core::fmt;
+use cranelift_codegen::ir::ValueLabel;
 use cranelift_codegen::isa::TargetIsa;
+use cranelift_codegen::LabelValueLoc;
 use cranelift_codegen::ValueLabelsRanges;
-use cranelift_wasm::get_vmctx_value_label;
-use gimli::{self, write, Expression, Operation, Reader, ReaderOffset, X86_64};
+use gimli::{write, Expression, Operation, Reader, ReaderOffset};
+use itertools::Itertools;
 use std::cmp::PartialEq;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use wasmtime_environ::{DefinedFuncIndex, EntityRef};
 
 #[derive(Debug)]
 pub struct FunctionFrameInfo<'a> {
     pub value_ranges: &'a ValueLabelsRanges,
     pub memory_offset: ModuleMemoryOffset,
-    pub sized_stack_slots: &'a StackSlots,
-}
-
-impl<'a> FunctionFrameInfo<'a> {
-    fn vmctx_memory_offset(&self) -> Option<i64> {
-        match self.memory_offset {
-            ModuleMemoryOffset::Defined(x) => Some(x as i64),
-            ModuleMemoryOffset::Imported(_) => {
-                // TODO implement memory offset for imported memory
-                None
-            }
-            ModuleMemoryOffset::None => None,
-        }
-    }
 }
 
 struct ExpressionWriter(write::EndianVec<gimli::RunTimeEndian>);
 
+enum VmctxBase {
+    Reg(u16),
+    OnStack,
+}
+
 impl ExpressionWriter {
-    pub fn new() -> Self {
+    fn new() -> Self {
         let endian = gimli::RunTimeEndian::Little;
         let writer = write::EndianVec::new(endian);
         ExpressionWriter(writer)
     }
 
-    pub fn write_op(&mut self, op: gimli::DwOp) -> write::Result<()> {
-        self.write_u8(op.0 as u8)
+    fn write_op(&mut self, op: gimli::DwOp) -> write::Result<()> {
+        self.write_u8(op.0)
     }
 
-    pub fn write_op_reg(&mut self, reg: u16) -> write::Result<()> {
+    fn write_op_reg(&mut self, reg: u16) -> write::Result<()> {
         if reg < 32 {
-            self.write_u8(gimli::constants::DW_OP_reg0.0 as u8 + reg as u8)
+            self.write_u8(gimli::constants::DW_OP_reg0.0 + reg as u8)
         } else {
             self.write_op(gimli::constants::DW_OP_regx)?;
             self.write_uleb128(reg.into())
         }
     }
 
-    pub fn write_op_breg(&mut self, reg: u16) -> write::Result<()> {
+    fn write_op_breg(&mut self, reg: u16) -> write::Result<()> {
         if reg < 32 {
-            self.write_u8(gimli::constants::DW_OP_breg0.0 as u8 + reg as u8)
+            self.write_u8(gimli::constants::DW_OP_breg0.0 + reg as u8)
         } else {
             self.write_op(gimli::constants::DW_OP_bregx)?;
             self.write_uleb128(reg.into())
         }
     }
 
-    pub fn write_u8(&mut self, b: u8) -> write::Result<()> {
+    fn write_u8(&mut self, b: u8) -> write::Result<()> {
         write::Writer::write_u8(&mut self.0, b)
     }
 
-    pub fn write_u32(&mut self, b: u32) -> write::Result<()> {
+    fn write_u32(&mut self, b: u32) -> write::Result<()> {
         write::Writer::write_u32(&mut self.0, b)
     }
 
-    pub fn write_uleb128(&mut self, i: u64) -> write::Result<()> {
+    fn write_uleb128(&mut self, i: u64) -> write::Result<()> {
         write::Writer::write_uleb128(&mut self.0, i)
     }
 
-    pub fn write_sleb128(&mut self, i: i64) -> write::Result<()> {
+    fn write_sleb128(&mut self, i: i64) -> write::Result<()> {
         write::Writer::write_sleb128(&mut self.0, i)
     }
 
-    pub fn into_vec(self) -> Vec<u8> {
+    fn into_vec(self) -> Vec<u8> {
         self.0.into_vec()
+    }
+
+    fn gen_address_of_memory_base_pointer(
+        &mut self,
+        vmctx: VmctxBase,
+        memory_base: &ModuleMemoryOffset,
+    ) -> write::Result<()> {
+        match *memory_base {
+            ModuleMemoryOffset::Defined(offset) => match vmctx {
+                VmctxBase::Reg(reg) => {
+                    self.write_op_breg(reg)?;
+                    self.write_sleb128(offset.into())?;
+                }
+                VmctxBase::OnStack => {
+                    self.write_op(gimli::constants::DW_OP_consts)?;
+                    self.write_sleb128(offset.into())?;
+                    self.write_op(gimli::constants::DW_OP_plus)?;
+                }
+            },
+            ModuleMemoryOffset::Imported {
+                offset_to_vm_memory_definition,
+                offset_to_memory_base,
+            } => {
+                match vmctx {
+                    VmctxBase::Reg(reg) => {
+                        self.write_op_breg(reg)?;
+                        self.write_sleb128(offset_to_vm_memory_definition.into())?;
+                    }
+                    VmctxBase::OnStack => {
+                        if offset_to_vm_memory_definition > 0 {
+                            self.write_op(gimli::constants::DW_OP_consts)?;
+                            self.write_sleb128(offset_to_vm_memory_definition.into())?;
+                        }
+                        self.write_op(gimli::constants::DW_OP_plus)?;
+                    }
+                }
+                self.write_op(gimli::constants::DW_OP_deref)?;
+                if offset_to_memory_base > 0 {
+                    self.write_op(gimli::constants::DW_OP_consts)?;
+                    self.write_sleb128(offset_to_memory_base.into())?;
+                    self.write_op(gimli::constants::DW_OP_plus)?;
+                }
+            }
+            ModuleMemoryOffset::None => return Err(write::Error::InvalidAttributeValue),
+        }
+        Ok(())
     }
 }
 
@@ -145,9 +188,9 @@ fn translate_loc(
             }
             Some(writer.into_vec())
         }
-        LabelValueLoc::SPOffset(off) => {
+        LabelValueLoc::CFAOffset(off) => {
             let mut writer = ExpressionWriter::new();
-            writer.write_op_breg(X86_64::RSP.0)?;
+            writer.write_op(gimli::constants::DW_OP_fbreg)?;
             writer.write_sleb128(off)?;
             if !add_stack_value {
                 writer.write_op(gimli::constants::DW_OP_deref)?;
@@ -164,34 +207,16 @@ fn append_memory_deref(
     isa: &dyn TargetIsa,
 ) -> Result<bool> {
     let mut writer = ExpressionWriter::new();
-    // FIXME for imported memory
-    match vmctx_loc {
-        LabelValueLoc::Reg(r) => {
-            let reg = isa.map_regalloc_reg_to_dwarf(r)?;
-            writer.write_op_breg(reg)?;
-            let memory_offset = match frame_info.vmctx_memory_offset() {
-                Some(offset) => offset,
-                None => {
-                    return Ok(false);
-                }
-            };
-            writer.write_sleb128(memory_offset)?;
-        }
-        LabelValueLoc::SPOffset(off) => {
-            writer.write_op_breg(X86_64::RSP.0)?;
+    let vmctx_base = match vmctx_loc {
+        LabelValueLoc::Reg(r) => VmctxBase::Reg(isa.map_regalloc_reg_to_dwarf(r)?),
+        LabelValueLoc::CFAOffset(off) => {
+            writer.write_op(gimli::constants::DW_OP_fbreg)?;
             writer.write_sleb128(off)?;
             writer.write_op(gimli::constants::DW_OP_deref)?;
-            writer.write_op(gimli::constants::DW_OP_consts)?;
-            let memory_offset = match frame_info.vmctx_memory_offset() {
-                Some(offset) => offset,
-                None => {
-                    return Ok(false);
-                }
-            };
-            writer.write_sleb128(memory_offset)?;
-            writer.write_op(gimli::constants::DW_OP_plus)?;
+            VmctxBase::OnStack
         }
-    }
+    };
+    writer.gen_address_of_memory_base_pointer(vmctx_base, &frame_info.memory_offset)?;
     writer.write_op(gimli::constants::DW_OP_deref)?;
     writer.write_op(gimli::constants::DW_OP_swap)?;
     writer.write_op(gimli::constants::DW_OP_const4u)?;
@@ -225,16 +250,14 @@ impl CompiledExpression {
         addr_tr: &'a AddressTransform,
         frame_info: Option<&'a FunctionFrameInfo>,
         isa: &'a dyn TargetIsa,
-    ) -> impl Iterator<Item = Result<(write::Address, u64, write::Expression)>> + 'a {
+    ) -> impl Iterator<Item = Result<(write::Address, u64, write::Expression)>> + use<'a> {
         enum BuildWithLocalsResult<'a> {
             Empty,
             Simple(
                 Box<dyn Iterator<Item = (write::Address, u64)> + 'a>,
                 Vec<u8>,
             ),
-            Ranges(
-                Box<dyn Iterator<Item = Result<(DefinedFuncIndex, usize, usize, Vec<u8>)>> + 'a>,
-            ),
+            Ranges(Box<dyn Iterator<Item = Result<(usize, usize, usize, Vec<u8>)>> + 'a>),
         }
         impl Iterator for BuildWithLocalsResult<'_> {
             type Item = Result<(write::Address, u64, write::Expression)>;
@@ -245,10 +268,10 @@ impl CompiledExpression {
                         .next()
                         .map(|(addr, len)| Ok((addr, len, write::Expression::raw(code.to_vec())))),
                     BuildWithLocalsResult::Ranges(it) => it.next().map(|r| {
-                        r.map(|(func_index, start, end, code_buf)| {
+                        r.map(|(symbol, start, end, code_buf)| {
                             (
                                 write::Address::Symbol {
-                                    symbol: func_index.index(),
+                                    symbol,
                                     addend: start as i64,
                                 },
                                 (end - start) as u64,
@@ -279,7 +302,7 @@ impl CompiledExpression {
 
         // Some locals are present, preparing and divided ranges based on the scope
         // and frame_info data.
-        let mut ranges_builder = ValueLabelRangesBuilder::new(scope, addr_tr, frame_info);
+        let mut ranges_builder = ValueLabelRangesBuilder::new(scope, addr_tr, frame_info, isa);
         for p in self.parts.iter() {
             match p {
                 CompiledExpressionPart::Code(_)
@@ -344,7 +367,7 @@ impl CompiledExpression {
                                             true => gimli::constants::DW_OP_bra,
                                             false => gimli::constants::DW_OP_skip,
                                         }
-                                        .0 as u8,
+                                        .0,
                                     );
                                     code_buf.push(!0);
                                     code_buf.push(!0); // these will be relocated below
@@ -385,11 +408,11 @@ impl CompiledExpression {
 fn is_old_expression_format(buf: &[u8]) -> bool {
     // Heuristic to detect old variable expression format without DW_OP_fbreg:
     // DW_OP_plus_uconst op must be present, but not DW_OP_fbreg.
-    if buf.contains(&(gimli::constants::DW_OP_fbreg.0 as u8)) {
+    if buf.contains(&(gimli::constants::DW_OP_fbreg.0)) {
         // Stop check if DW_OP_fbreg exist.
         return false;
     }
-    buf.contains(&(gimli::constants::DW_OP_plus_uconst.0 as u8))
+    buf.contains(&(gimli::constants::DW_OP_plus_uconst.0))
 }
 
 pub fn compile_expression<R>(
@@ -570,7 +593,7 @@ where
             }
             Operation::WasmLocal { index } => {
                 flush_code_chunk!();
-                let label = ValueLabel::from_u32(index as u32);
+                let label = ValueLabel::from_u32(index);
                 push!(CompiledExpressionPart::Local {
                     label,
                     trailing: false,
@@ -628,13 +651,42 @@ where
 
 #[derive(Debug, Clone)]
 struct CachedValueLabelRange {
-    func_index: DefinedFuncIndex,
+    func_index: usize,
     start: usize,
     end: usize,
     label_location: HashMap<ValueLabel, LabelValueLoc>,
 }
 
+struct BuiltRangeSummary<'a> {
+    range: &'a CachedValueLabelRange,
+    isa: &'a dyn TargetIsa,
+}
+
+impl<'a> fmt::Debug for BuiltRangeSummary<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let range = self.range;
+        write!(f, "[")?;
+        let mut is_first = true;
+        for (value, value_loc) in &range.label_location {
+            if !is_first {
+                write!(f, ", ")?;
+            } else {
+                is_first = false;
+            }
+            write!(
+                f,
+                "{:?}:{:?}",
+                log_get_value_name(*value),
+                log_get_value_loc(*value_loc, self.isa)
+            )?;
+        }
+        write!(f, "]@[{}..{})", range.start, range.end)?;
+        Ok(())
+    }
+}
+
 struct ValueLabelRangesBuilder<'a, 'b> {
+    isa: &'a dyn TargetIsa,
     ranges: Vec<CachedValueLabelRange>,
     frame_info: Option<&'a FunctionFrameInfo<'b>>,
     processed_labels: HashSet<ValueLabel>,
@@ -645,6 +697,7 @@ impl<'a, 'b> ValueLabelRangesBuilder<'a, 'b> {
         scope: &[(u64, u64)], // wasm ranges
         addr_tr: &'a AddressTransform,
         frame_info: Option<&'a FunctionFrameInfo<'b>>,
+        isa: &'a dyn TargetIsa,
     ) -> Self {
         let mut ranges = Vec::new();
         for (wasm_start, wasm_end) in scope {
@@ -658,7 +711,17 @@ impl<'a, 'b> ValueLabelRangesBuilder<'a, 'b> {
             }
         }
         ranges.sort_unstable_by(|a, b| a.start.cmp(&b.start));
+
+        dbi_log!(
+            "Building ranges for values in scope: {}\n{:?}",
+            ranges
+                .iter()
+                .map(|r| format!("[{}..{})", r.start, r.end))
+                .join(" "),
+            log_get_value_ranges(frame_info.map(|f| f.value_ranges), isa)
+        );
         ValueLabelRangesBuilder {
+            isa,
             ranges,
             frame_info,
             processed_labels: HashSet::new(),
@@ -669,6 +732,7 @@ impl<'a, 'b> ValueLabelRangesBuilder<'a, 'b> {
         if self.processed_labels.contains(&label) {
             return;
         }
+        dbi_log!("Intersecting with {:?}", log_get_value_name(label));
         self.processed_labels.insert(label);
 
         let value_ranges = match self.frame_info.and_then(|fi| fi.value_ranges.get(&label)) {
@@ -730,12 +794,26 @@ impl<'a, 'b> ValueLabelRangesBuilder<'a, 'b> {
         }
     }
 
-    pub fn into_ranges(self) -> impl Iterator<Item = CachedValueLabelRange> {
+    pub fn into_ranges(self) -> impl Iterator<Item = CachedValueLabelRange> + use<> {
         // Ranges with not-enough labels are discarded.
         let processed_labels_len = self.processed_labels.len();
-        self.ranges
-            .into_iter()
-            .filter(move |r| r.label_location.len() == processed_labels_len)
+        let is_valid_range =
+            move |r: &CachedValueLabelRange| r.label_location.len() == processed_labels_len;
+
+        if dbi_log_enabled!() {
+            dbi_log!("Built ranges:");
+            for range in self.ranges.iter().filter(|r| is_valid_range(*r)) {
+                dbi_log!(
+                    "{:?}",
+                    BuiltRangeSummary {
+                        range,
+                        isa: self.isa
+                    }
+                );
+            }
+            dbi_log!("");
+        }
+        self.ranges.into_iter().filter(is_valid_range)
     }
 }
 
@@ -777,13 +855,16 @@ impl std::fmt::Debug for JumpTargetMarker {
 }
 
 #[cfg(test)]
+#[expect(trivial_numeric_casts, reason = "macro-generated code")]
 mod tests {
     use super::{
         compile_expression, AddressTransform, CompiledExpression, CompiledExpressionPart,
         FunctionFrameInfo, JumpTargetMarker, ValueLabel, ValueLabelsRanges,
     };
-    use crate::CompiledFunction;
-    use gimli::{self, constants, Encoding, EndianSlice, Expression, RunTimeEndian};
+    use crate::CompiledFunctionMetadata;
+    use cranelift_codegen::{isa::lookup, settings::Flags};
+    use gimli::{constants, Encoding, EndianSlice, Expression, RunTimeEndian};
+    use target_lexicon::triple;
     use wasmtime_environ::FilePos;
 
     macro_rules! dw_op {
@@ -1060,7 +1141,7 @@ mod tests {
             DW_OP_plus_uconst,
             1,
             DW_OP_skip,
-            (-11 as i8),
+            (-11_i8),
             (!0), // --> loop
             /* done */ DW_OP_stack_value
         );
@@ -1116,9 +1197,10 @@ mod tests {
         use cranelift_entity::PrimaryMap;
         use wasmtime_environ::InstructionAddressMap;
         use wasmtime_environ::WasmFileInfo;
+
         let mut module_map = PrimaryMap::new();
         let code_section_offset: u32 = 100;
-        let func = CompiledFunction {
+        let func = CompiledFunctionMetadata {
             address_map: FunctionAddressMap {
                 instructions: vec![
                     InstructionAddressMap {
@@ -1153,12 +1235,11 @@ mod tests {
             imported_func_count: 0,
             path: None,
         };
-        AddressTransform::new(&module_map, &fi)
+        AddressTransform::mock(&module_map, fi)
     }
 
     fn create_mock_value_ranges() -> (ValueLabelsRanges, (ValueLabel, ValueLabel, ValueLabel)) {
-        use cranelift_codegen::ir::LabelValueLoc;
-        use cranelift_codegen::ValueLocRange;
+        use cranelift_codegen::{LabelValueLoc, ValueLocRange};
         use cranelift_entity::EntityRef;
         use std::collections::HashMap;
         let mut value_ranges = HashMap::new();
@@ -1168,7 +1249,7 @@ mod tests {
         value_ranges.insert(
             value_0,
             vec![ValueLocRange {
-                loc: LabelValueLoc::SPOffset(0),
+                loc: LabelValueLoc::CFAOffset(0),
                 start: 0,
                 end: 25,
             }],
@@ -1176,7 +1257,7 @@ mod tests {
         value_ranges.insert(
             value_1,
             vec![ValueLocRange {
-                loc: LabelValueLoc::SPOffset(0),
+                loc: LabelValueLoc::CFAOffset(0),
                 start: 5,
                 end: 30,
             }],
@@ -1185,12 +1266,12 @@ mod tests {
             value_2,
             vec![
                 ValueLocRange {
-                    loc: LabelValueLoc::SPOffset(0),
+                    loc: LabelValueLoc::CFAOffset(0),
                     start: 0,
                     end: 10,
                 },
                 ValueLocRange {
-                    loc: LabelValueLoc::SPOffset(0),
+                    loc: LabelValueLoc::CFAOffset(0),
                     start: 20,
                     end: 30,
                 },
@@ -1203,28 +1284,35 @@ mod tests {
     fn test_debug_value_range_builder() {
         use super::ValueLabelRangesBuilder;
         use crate::debug::ModuleMemoryOffset;
-        use cranelift_codegen::ir::StackSlots;
-        use wasmtime_environ::{DefinedFuncIndex, EntityRef};
+
+        // Ignore this test if cranelift doesn't support the native platform.
+        if cranelift_native::builder().is_err() {
+            return;
+        }
+
+        let isa = lookup(triple!("x86_64"))
+            .expect("expect x86_64 ISA")
+            .finish(Flags::new(cranelift_codegen::settings::builder()))
+            .expect("Creating ISA");
 
         let addr_tr = create_mock_address_transform();
-        let sized_stack_slots = StackSlots::new();
         let (value_ranges, value_labels) = create_mock_value_ranges();
         let fi = FunctionFrameInfo {
             memory_offset: ModuleMemoryOffset::None,
-            sized_stack_slots: &sized_stack_slots,
             value_ranges: &value_ranges,
         };
 
         // No value labels, testing if entire function range coming through.
-        let builder = ValueLabelRangesBuilder::new(&[(10, 20)], &addr_tr, Some(&fi));
+        let builder = ValueLabelRangesBuilder::new(&[(10, 20)], &addr_tr, Some(&fi), isa.as_ref());
         let ranges = builder.into_ranges().collect::<Vec<_>>();
         assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0].func_index, DefinedFuncIndex::new(0));
+        assert_eq!(ranges[0].func_index, 0);
         assert_eq!(ranges[0].start, 0);
         assert_eq!(ranges[0].end, 30);
 
         // Two labels (val0@0..25 and val1@5..30), their common lifetime intersect at 5..25.
-        let mut builder = ValueLabelRangesBuilder::new(&[(10, 20)], &addr_tr, Some(&fi));
+        let mut builder =
+            ValueLabelRangesBuilder::new(&[(10, 20)], &addr_tr, Some(&fi), isa.as_ref());
         builder.process_label(value_labels.0);
         builder.process_label(value_labels.1);
         let ranges = builder.into_ranges().collect::<Vec<_>>();
@@ -1234,7 +1322,8 @@ mod tests {
 
         // Adds val2 with complex lifetime @0..10 and @20..30 to the previous test, and
         // also narrows range.
-        let mut builder = ValueLabelRangesBuilder::new(&[(11, 17)], &addr_tr, Some(&fi));
+        let mut builder =
+            ValueLabelRangesBuilder::new(&[(11, 17)], &addr_tr, Some(&fi), isa.as_ref());
         builder.process_label(value_labels.0);
         builder.process_label(value_labels.1);
         builder.process_label(value_labels.2);

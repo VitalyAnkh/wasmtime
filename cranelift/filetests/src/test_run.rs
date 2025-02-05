@@ -34,37 +34,56 @@ fn build_host_isa(
     infer_native_flags: bool,
     flags: settings::Flags,
     isa_flags: Vec<settings::Value>,
-) -> OwnedTargetIsa {
+) -> anyhow::Result<OwnedTargetIsa> {
     let mut builder = cranelift_native::builder_with_options(infer_native_flags)
-        .expect("Unable to build a TargetIsa for the current host");
+        .map_err(|e| anyhow::Error::msg(e))?;
 
     // Copy ISA Flags
     for value in isa_flags {
-        builder.set(value.name, &value.value_string()).unwrap();
+        builder.set(value.name, &value.value_string())?;
     }
 
-    builder.finish(flags).unwrap()
+    let isa = builder.finish(flags)?;
+    Ok(isa)
 }
 
 /// Checks if the host's ISA is compatible with the one requested by the test.
 fn is_isa_compatible(
     file_path: &str,
-    host: &dyn TargetIsa,
+    host: Option<&dyn TargetIsa>,
     requested: &dyn TargetIsa,
 ) -> Result<(), String> {
+    let host_triple = match host {
+        Some(host) => host.triple().clone(),
+        None => target_lexicon::Triple::host(),
+    };
     // If this test requests to run on a completely different
     // architecture than the host platform then we skip it entirely,
     // since we won't be able to natively execute machine code.
-    let host_arch = host.triple().architecture;
+    let host_arch = host_triple.architecture;
     let requested_arch = requested.triple().architecture;
 
     match (host_arch, requested_arch) {
+        // If the host matches the requested target, then that's all good.
         (host, requested) if host == requested => {}
+
+        // Allow minor differences in risc-v targets.
         (Architecture::Riscv64(_), Architecture::Riscv64(_)) => {}
+
+        // Any host can run pulley so long as the pointer width and endianness
+        // match.
+        (
+            _,
+            Architecture::Pulley32
+            | Architecture::Pulley64
+            | Architecture::Pulley32be
+            | Architecture::Pulley64be,
+        ) if host_triple.pointer_width() == requested.triple().pointer_width()
+            && host_triple.endianness() == requested.triple().endianness() => {}
+
         _ => {
             return Err(format!(
-                "skipped {}: host can't run {:?} programs",
-                file_path, requested_arch
+                "skipped {file_path}: host can't run {requested_arch:?} programs"
             ))
         }
     }
@@ -73,23 +92,51 @@ fn is_isa_compatible(
     // we can't natively support on the host.
     let requested_flags = requested.isa_flags();
     for req_value in requested_flags {
-        if let Some(requested) = req_value.as_bool() {
-            let available_in_host = host
-                .isa_flags()
-                .iter()
-                .find(|val| val.name == req_value.name)
-                .and_then(|val| val.as_bool())
-                .unwrap_or(false);
-
-            if requested && !available_in_host {
-                return Err(format!(
-                    "skipped {}: host does not support ISA flag {}",
-                    file_path, req_value.name
-                ));
-            }
-        } else {
-            unimplemented!("ISA flag {} of kind {:?}", req_value.name, req_value.kind());
+        // pointer_width for pulley already validated above
+        if req_value.name == "pointer_width" {
+            continue;
         }
+        let requested = match req_value.as_bool() {
+            Some(requested) => requested,
+            None => unimplemented!("ISA flag {} of kind {:?}", req_value.name, req_value.kind()),
+        };
+        let host_isa_flags = match host {
+            Some(host) => host.isa_flags(),
+            None => {
+                return Err(format!(
+                    "host not available on this platform for isa-specific flag"
+                ))
+            }
+        };
+        let available_in_host = host_isa_flags
+            .iter()
+            .find(|val| val.name == req_value.name)
+            .and_then(|val| val.as_bool())
+            .unwrap_or(false);
+
+        if !requested || available_in_host {
+            continue;
+        }
+
+        // The AArch64 feature `sign_return_address` is supported on all AArch64
+        // hosts, regardless of whether `cranelift-native` infers it or not. The
+        // instructions emitted with this feature enabled are interpreted as
+        // "hint" noop instructions on CPUs which don't support address
+        // authentication.
+        //
+        // Note that at this time `cranelift-native` will only enable
+        // `sign_return_address` for macOS (notably not Linux) because of a
+        // historical bug in libunwind which causes pointer address signing,
+        // when run on hardware that supports it, so segfault during unwinding.
+        if req_value.name == "sign_return_address" && matches!(host_arch, Architecture::Aarch64(_))
+        {
+            continue;
+        }
+
+        return Err(format!(
+            "skipped {}: host does not support ISA flag {}",
+            file_path, req_value.name
+        ));
     }
 
     Ok(())
@@ -100,11 +147,26 @@ fn compile_testfile(
     flags: &Flags,
     isa: &dyn TargetIsa,
 ) -> anyhow::Result<CompiledTestFile> {
-    // We can't use the requested ISA directly since it does not contain info
-    // about the operating system / calling convention / etc..
-    //
-    // Copy the requested ISA flags into the host ISA and use that.
-    let isa = build_host_isa(false, flags.clone(), isa.isa_flags());
+    let isa = match isa.triple().architecture {
+        // Convert `&dyn TargetIsa` to `OwnedTargetIsa` by re-making the ISA and
+        // applying pulley flags/etc.
+        Architecture::Pulley32
+        | Architecture::Pulley64
+        | Architecture::Pulley32be
+        | Architecture::Pulley64be => {
+            let mut builder = cranelift_codegen::isa::lookup(isa.triple().clone())?;
+            for value in isa.isa_flags() {
+                builder.set(value.name, &value.value_string()).unwrap();
+            }
+            builder.finish(flags.clone())?
+        }
+
+        // We can't use the requested ISA directly since it does not contain info
+        // about the operating system / calling convention / etc..
+        //
+        // Copy the requested ISA flags into the host ISA and use that.
+        _ => build_host_isa(false, flags.clone(), isa.isa_flags()).unwrap(),
+    };
 
     let mut tfc = TestFileCompiler::new(isa);
     tfc.add_testfile(testfile)?;
@@ -171,8 +233,8 @@ impl SubTest for TestRun {
         }
 
         // Check that the host machine can run this test case (i.e. has all extensions)
-        let host_isa = build_host_isa(true, flags.clone(), vec![]);
-        if let Err(e) = is_isa_compatible(file_path, host_isa.as_ref(), isa.unwrap()) {
+        let host_isa = build_host_isa(true, flags.clone(), vec![]).ok();
+        if let Err(e) = is_isa_compatible(file_path, host_isa.as_deref(), isa.unwrap()) {
             log::info!("{}", e);
             return Ok(());
         }

@@ -1,8 +1,6 @@
 //! Generate Cranelift compiler settings.
 
-use crate::generators::ModuleConfig;
 use arbitrary::{Arbitrary, Unstructured};
-use std::collections::HashMap;
 
 /// Choose between matching the host architecture or a cross-compilation target.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -10,7 +8,6 @@ pub enum CodegenSettings {
     /// Use the host's feature set.
     Native,
     /// Generate a modified flag set for the current host.
-    #[allow(dead_code)]
     Target {
         /// The target triple of the host.
         target: String,
@@ -21,59 +18,33 @@ pub enum CodegenSettings {
 
 impl CodegenSettings {
     /// Configure Wasmtime with these codegen settings.
-    pub fn configure(&self, config: &mut wasmtime::Config) {
+    pub fn configure(&self, config: &mut wasmtime_cli_flags::CommonOptions) {
         match self {
             CodegenSettings::Native => {}
             CodegenSettings::Target { target, flags } => {
-                config.target(target).unwrap();
+                config.target = Some(target.to_string());
                 for (key, value) in flags {
-                    unsafe {
-                        config.cranelift_flag_set(key, value);
-                    }
+                    config
+                        .codegen
+                        .cranelift
+                        .push((key.clone(), Some(value.clone())));
                 }
             }
         }
     }
 
-    /// Features such as sse4.2 are unconditionally enabled on the x86_64 target
-    /// because they are hard required for SIMD, but when SIMD is disabled, for
-    /// example, we support disabling these features.
-    ///
-    /// This method will take the wasm feature selection chosen, through
-    /// `module_config`, and possibly try to disable some more features by
-    /// reading more of the input.
-    pub fn maybe_disable_more_features(
-        &mut self,
-        module_config: &ModuleConfig,
-        u: &mut Unstructured<'_>,
-    ) -> arbitrary::Result<()> {
-        let flags = match self {
-            CodegenSettings::Target { flags, .. } => flags,
-            _ => return Ok(()),
-        };
-
-        if !module_config.config.simd_enabled {
-            // Note that regardless of architecture these booleans are generated
-            // to have test case failures unrelated to codegen setting input
-            // that fail on one architecture to fail on other architectures as
-            // well.
-            let new_flags = ["has_sse3", "has_ssse3", "has_sse41", "has_sse42"]
-                .into_iter()
-                .map(|name| Ok((name, u.arbitrary()?)))
-                .collect::<arbitrary::Result<HashMap<_, bool>>>()?;
-
-            for (name, val) in flags {
-                if let Some(new_value) = new_flags.get(name.as_str()) {
-                    *val = new_value.to_string();
-                }
-            }
+    /// Returns the flags used for codegen.
+    pub(crate) fn flags(&self) -> &[(String, String)] {
+        if let Self::Target { flags, .. } = self {
+            flags
+        } else {
+            &[]
         }
-        Ok(())
     }
 }
 
 impl<'a> Arbitrary<'a> for CodegenSettings {
-    #[allow(unused_macros, unused_variables)]
+    #[expect(unused_variables, reason = "macro-generated code")]
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         // Helper macro to enable clif features based on what the native host
         // supports. If the input says to enable a feature and the host doesn't
@@ -136,19 +107,11 @@ impl<'a> Arbitrary<'a> for CodegenSettings {
                 "x86_64" => {
                     test: is_x86_feature_detected,
 
-                    // These features are considered to be baseline required by
-                    // Wasmtime. Currently some SIMD code generation will
-                    // fail if these features are disabled, so unconditionally
-                    // enable them as we're not interested in fuzzing without
-                    // them.
-                    //
-                    // Note that these may still be disabled above in
-                    // `maybe_disable_more_features`.
-                    std:"sse3" => clif:"has_sse3" ratio: 1 in 1,
-                    std:"ssse3" => clif:"has_ssse3" ratio: 1 in 1,
-                    std:"sse4.1" => clif:"has_sse41" ratio: 1 in 1,
-                    std:"sse4.2" => clif:"has_sse42" ratio: 1 in 1,
-
+                    std:"cmpxchg16b" => clif:"has_cmpxchg16b",
+                    std:"sse3" => clif:"has_sse3",
+                    std:"ssse3" => clif:"has_ssse3",
+                    std:"sse4.1" => clif:"has_sse41",
+                    std:"sse4.2" => clif:"has_sse42",
                     std:"popcnt" => clif:"has_popcnt",
                     std:"avx" => clif:"has_avx",
                     std:"avx2" => clif:"has_avx2",
@@ -170,6 +133,7 @@ impl<'a> Arbitrary<'a> for CodegenSettings {
 
                     std: "bti" => clif: "use_bti",
                     std: "lse" => clif: "has_lse",
+                    std: "fp16" => clif: "has_fp16",
                     // even though the natural correspondence seems to be
                     // between "paca" and "has_pauth", the latter has no effect
                     // in isolation, so we actually use the setting that affects

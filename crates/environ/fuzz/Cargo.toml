@@ -4,14 +4,15 @@ version = "0.0.0"
 authors = ["Automatically generated"]
 publish = false
 edition.workspace = true
+rust-version.workspace = true
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
-arbitrary = { version = "1.1.0", features = ["derive"] }
+arbitrary = { workspace = true, features = ["derive"] }
 env_logger = { workspace = true }
-libfuzzer-sys = "0.4"
+libfuzzer-sys = { workspace = true }
 wasmparser = { workspace = true }
 wasmprinter = { workspace = true }
 wat = { workspace = true }
@@ -26,4 +27,8 @@ doc = false
 required-features = ["component-model"]
 
 [features]
-component-model = ["wasmtime-environ/component-model", "dep:component-fuzz-util"]
+component-model = [
+  "wasmtime-environ/component-model",
+  "wasmtime-environ/compile",
+  "dep:component-fuzz-util",
+]

@@ -1,11 +1,8 @@
 use crate::ir::types::*;
-use crate::ir::TrapCode;
+use crate::ir::{ExternalName, TrapCode};
 use crate::isa::aarch64::inst::*;
-use crate::isa::CallConv;
-use crate::settings;
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 
 #[cfg(test)]
 fn simm9_zero() -> SImm9 {
@@ -37,26 +34,24 @@ fn test_aarch64_binemit() {
     // Then:
     //
     //      $ echo "mov x1, x2" | aarch64inst.sh
-    insns.push((Inst::Ret { rets: vec![] }, "C0035FD6", "ret"));
+    insns.push((Inst::Ret {}, "C0035FD6", "ret"));
     insns.push((
         Inst::AuthenticatedRet {
-            key: APIKey::A,
+            key: APIKey::ASP,
             is_hint: true,
-            rets: vec![],
         },
         "BF2303D5C0035FD6",
         "autiasp ; ret",
     ));
     insns.push((
         Inst::AuthenticatedRet {
-            key: APIKey::B,
+            key: APIKey::BSP,
             is_hint: false,
-            rets: vec![],
         },
         "FF0F5FD6",
-        "retab",
+        "retabsp",
     ));
-    insns.push((Inst::Pacisp { key: APIKey::B }, "7F2303D5", "pacibsp"));
+    insns.push((Inst::Paci { key: APIKey::BSP }, "7F2303D5", "pacibsp"));
     insns.push((Inst::Xpaclri, "FF2003D5", "xpaclri"));
     insns.push((
         Inst::Bti {
@@ -70,7 +65,7 @@ fn test_aarch64_binemit() {
     insns.push((Inst::Csdb, "9F2203D5", "csdb"));
     insns.push((
         Inst::Udf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "1FC10000",
         "udf #0xc11f",
@@ -1087,6 +1082,30 @@ fn test_aarch64_binemit() {
         "msub x1, x2, x3, x4",
     ));
     insns.push((
+        Inst::AluRRRR {
+            alu_op: ALUOp3::UMAddL,
+            size: OperandSize::Size32,
+            rd: writable_xreg(1),
+            rn: xreg(2),
+            rm: xreg(3),
+            ra: xreg(4),
+        },
+        "4110A39B",
+        "umaddl x1, w2, w3, x4",
+    ));
+    insns.push((
+        Inst::AluRRRR {
+            alu_op: ALUOp3::SMAddL,
+            size: OperandSize::Size32,
+            rd: writable_xreg(1),
+            rn: xreg(2),
+            rm: xreg(3),
+            ra: xreg(4),
+        },
+        "4110239B",
+        "smaddl x1, w2, w3, x4",
+    ));
+    insns.push((
         Inst::AluRRR {
             alu_op: ALUOp::SMulH,
             size: OperandSize::Size64,
@@ -1532,7 +1551,6 @@ fn test_aarch64_binemit() {
             mem: AMode::RegScaled {
                 rn: xreg(2),
                 rm: xreg(3),
-                ty: I16,
             },
             flags: MemFlags::trusted(),
         },
@@ -1569,7 +1587,6 @@ fn test_aarch64_binemit() {
             mem: AMode::RegScaled {
                 rn: xreg(20),
                 rm: xreg(20),
-                ty: I16,
             },
             flags: MemFlags::trusted(),
         },
@@ -1606,7 +1623,6 @@ fn test_aarch64_binemit() {
             mem: AMode::RegScaled {
                 rn: xreg(2),
                 rm: xreg(12),
-                ty: I32,
             },
             flags: MemFlags::trusted(),
         },
@@ -1643,7 +1659,6 @@ fn test_aarch64_binemit() {
             mem: AMode::RegScaled {
                 rn: xreg(5),
                 rm: xreg(1),
-                ty: I32,
             },
             flags: MemFlags::trusted(),
         },
@@ -1716,7 +1731,6 @@ fn test_aarch64_binemit() {
             mem: AMode::RegScaled {
                 rn: xreg(2),
                 rm: xreg(3),
-                ty: I64,
             },
             flags: MemFlags::trusted(),
         },
@@ -1729,7 +1743,6 @@ fn test_aarch64_binemit() {
             mem: AMode::RegScaledExtended {
                 rn: xreg(2),
                 rm: xreg(3),
-                ty: I64,
                 extendop: ExtendOp::SXTW,
             },
             flags: MemFlags::trusted(),
@@ -1786,7 +1799,7 @@ fn test_aarch64_binemit() {
     insns.push((
         Inst::ULoad64 {
             rd: writable_xreg(1),
-            mem: AMode::FPOffset { off: 32768, ty: I8 },
+            mem: AMode::FPOffset { off: 32768 },
             flags: MemFlags::trusted(),
         },
         "100090D2A1EB70F8",
@@ -1795,10 +1808,7 @@ fn test_aarch64_binemit() {
     insns.push((
         Inst::ULoad64 {
             rd: writable_xreg(1),
-            mem: AMode::FPOffset {
-                off: -32768,
-                ty: I8,
-            },
+            mem: AMode::FPOffset { off: -32768 },
             flags: MemFlags::trusted(),
         },
         "F0FF8F92A1EB70F8",
@@ -1807,10 +1817,7 @@ fn test_aarch64_binemit() {
     insns.push((
         Inst::ULoad64 {
             rd: writable_xreg(1),
-            mem: AMode::FPOffset {
-                off: 1048576,
-                ty: I8,
-            }, // 2^20
+            mem: AMode::FPOffset { off: 1048576 }, // 2^20
             flags: MemFlags::trusted(),
         },
         "1002A0D2A1EB70F8",
@@ -1819,10 +1826,7 @@ fn test_aarch64_binemit() {
     insns.push((
         Inst::ULoad64 {
             rd: writable_xreg(1),
-            mem: AMode::FPOffset {
-                off: 1048576 + 1,
-                ty: I8,
-            }, // 2^20 + 1
+            mem: AMode::FPOffset { off: 1048576 + 1 }, // 2^20 + 1
             flags: MemFlags::trusted(),
         },
         "300080521002A072A1EB70F8",
@@ -1835,7 +1839,6 @@ fn test_aarch64_binemit() {
             mem: AMode::RegOffset {
                 rn: xreg(7),
                 off: 8,
-                ty: I64,
             },
             flags: MemFlags::trusted(),
         },
@@ -1849,7 +1852,6 @@ fn test_aarch64_binemit() {
             mem: AMode::RegOffset {
                 rn: xreg(7),
                 off: 1024,
-                ty: I64,
             },
             flags: MemFlags::trusted(),
         },
@@ -1863,7 +1865,6 @@ fn test_aarch64_binemit() {
             mem: AMode::RegOffset {
                 rn: xreg(7),
                 off: 1048576,
-                ty: I64,
             },
             flags: MemFlags::trusted(),
         },
@@ -1985,7 +1986,6 @@ fn test_aarch64_binemit() {
             mem: AMode::RegScaled {
                 rn: xreg(2),
                 rm: xreg(3),
-                ty: I64,
             },
             flags: MemFlags::trusted(),
         },
@@ -1998,7 +1998,6 @@ fn test_aarch64_binemit() {
             mem: AMode::RegScaledExtended {
                 rn: xreg(2),
                 rm: xreg(3),
-                ty: I64,
                 extendop: ExtendOp::UXTW,
             },
             flags: MemFlags::trusted(),
@@ -2046,7 +2045,10 @@ fn test_aarch64_binemit() {
         Inst::StoreP64 {
             rt: xreg(8),
             rt2: xreg(9),
-            mem: PairAMode::SignedOffset(xreg(10), simm7_scaled_zero(I64)),
+            mem: PairAMode::SignedOffset {
+                reg: xreg(10),
+                simm7: simm7_scaled_zero(I64),
+            },
             flags: MemFlags::trusted(),
         },
         "482500A9",
@@ -2056,7 +2058,10 @@ fn test_aarch64_binemit() {
         Inst::StoreP64 {
             rt: xreg(8),
             rt2: xreg(9),
-            mem: PairAMode::SignedOffset(xreg(10), SImm7Scaled::maybe_from_i64(504, I64).unwrap()),
+            mem: PairAMode::SignedOffset {
+                reg: xreg(10),
+                simm7: SImm7Scaled::maybe_from_i64(504, I64).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "48A51FA9",
@@ -2066,7 +2071,10 @@ fn test_aarch64_binemit() {
         Inst::StoreP64 {
             rt: xreg(8),
             rt2: xreg(9),
-            mem: PairAMode::SignedOffset(xreg(10), SImm7Scaled::maybe_from_i64(-64, I64).unwrap()),
+            mem: PairAMode::SignedOffset {
+                reg: xreg(10),
+                simm7: SImm7Scaled::maybe_from_i64(-64, I64).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "48253CA9",
@@ -2076,7 +2084,10 @@ fn test_aarch64_binemit() {
         Inst::StoreP64 {
             rt: xreg(21),
             rt2: xreg(28),
-            mem: PairAMode::SignedOffset(xreg(1), SImm7Scaled::maybe_from_i64(-512, I64).unwrap()),
+            mem: PairAMode::SignedOffset {
+                reg: xreg(1),
+                simm7: SImm7Scaled::maybe_from_i64(-512, I64).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "357020A9",
@@ -2086,7 +2097,9 @@ fn test_aarch64_binemit() {
         Inst::StoreP64 {
             rt: xreg(8),
             rt2: xreg(9),
-            mem: PairAMode::SPPreIndexed(SImm7Scaled::maybe_from_i64(-64, I64).unwrap()),
+            mem: PairAMode::SPPreIndexed {
+                simm7: SImm7Scaled::maybe_from_i64(-64, I64).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "E827BCA9",
@@ -2096,7 +2109,9 @@ fn test_aarch64_binemit() {
         Inst::StoreP64 {
             rt: xreg(15),
             rt2: xreg(16),
-            mem: PairAMode::SPPostIndexed(SImm7Scaled::maybe_from_i64(504, I64).unwrap()),
+            mem: PairAMode::SPPostIndexed {
+                simm7: SImm7Scaled::maybe_from_i64(504, I64).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "EFC39FA8",
@@ -2107,7 +2122,10 @@ fn test_aarch64_binemit() {
         Inst::LoadP64 {
             rt: writable_xreg(8),
             rt2: writable_xreg(9),
-            mem: PairAMode::SignedOffset(xreg(10), simm7_scaled_zero(I64)),
+            mem: PairAMode::SignedOffset {
+                reg: xreg(10),
+                simm7: simm7_scaled_zero(I64),
+            },
             flags: MemFlags::trusted(),
         },
         "482540A9",
@@ -2117,7 +2135,10 @@ fn test_aarch64_binemit() {
         Inst::LoadP64 {
             rt: writable_xreg(8),
             rt2: writable_xreg(9),
-            mem: PairAMode::SignedOffset(xreg(10), SImm7Scaled::maybe_from_i64(504, I64).unwrap()),
+            mem: PairAMode::SignedOffset {
+                reg: xreg(10),
+                simm7: SImm7Scaled::maybe_from_i64(504, I64).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "48A55FA9",
@@ -2127,7 +2148,10 @@ fn test_aarch64_binemit() {
         Inst::LoadP64 {
             rt: writable_xreg(8),
             rt2: writable_xreg(9),
-            mem: PairAMode::SignedOffset(xreg(10), SImm7Scaled::maybe_from_i64(-64, I64).unwrap()),
+            mem: PairAMode::SignedOffset {
+                reg: xreg(10),
+                simm7: SImm7Scaled::maybe_from_i64(-64, I64).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "48257CA9",
@@ -2137,7 +2161,10 @@ fn test_aarch64_binemit() {
         Inst::LoadP64 {
             rt: writable_xreg(8),
             rt2: writable_xreg(9),
-            mem: PairAMode::SignedOffset(xreg(10), SImm7Scaled::maybe_from_i64(-512, I64).unwrap()),
+            mem: PairAMode::SignedOffset {
+                reg: xreg(10),
+                simm7: SImm7Scaled::maybe_from_i64(-512, I64).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "482560A9",
@@ -2147,7 +2174,9 @@ fn test_aarch64_binemit() {
         Inst::LoadP64 {
             rt: writable_xreg(8),
             rt2: writable_xreg(9),
-            mem: PairAMode::SPPreIndexed(SImm7Scaled::maybe_from_i64(-64, I64).unwrap()),
+            mem: PairAMode::SPPreIndexed {
+                simm7: SImm7Scaled::maybe_from_i64(-64, I64).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "E827FCA9",
@@ -2157,7 +2186,9 @@ fn test_aarch64_binemit() {
         Inst::LoadP64 {
             rt: writable_xreg(8),
             rt2: writable_xreg(25),
-            mem: PairAMode::SPPostIndexed(SImm7Scaled::maybe_from_i64(504, I64).unwrap()),
+            mem: PairAMode::SPPostIndexed {
+                simm7: SImm7Scaled::maybe_from_i64(504, I64).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "E8E7DFA8",
@@ -2657,6 +2688,7 @@ fn test_aarch64_binemit() {
             rd: writable_vreg(14),
             rn: vreg(19),
             size: VectorSize::Size32x4,
+            lane: 0,
         },
         "6E06044E",
         "dup v14.4s, v19.s[0]",
@@ -2666,6 +2698,7 @@ fn test_aarch64_binemit() {
             rd: writable_vreg(18),
             rn: vreg(10),
             size: VectorSize::Size64x2,
+            lane: 0,
         },
         "5205084E",
         "dup v18.2d, v10.d[0]",
@@ -5868,147 +5901,147 @@ fn test_aarch64_binemit() {
 
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
-            kind: CondBrKind::NotZero(xreg(8)),
+            trap_code: TrapCode::STACK_OVERFLOW,
+            kind: CondBrKind::NotZero(xreg(8), OperandSize::Size64),
         },
-        "480000B41FC10000",
-        "cbz x8, 8 ; udf",
+        "280000B51FC10000",
+        "cbnz x8, #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
-            kind: CondBrKind::Zero(xreg(8)),
+            trap_code: TrapCode::STACK_OVERFLOW,
+            kind: CondBrKind::Zero(xreg(8), OperandSize::Size64),
         },
-        "480000B51FC10000",
-        "cbnz x8, 8 ; udf",
+        "280000B41FC10000",
+        "cbz x8, #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Ne),
         },
-        "400000541FC10000",
-        "b.eq 8 ; udf",
+        "210000541FC10000",
+        "b.ne #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Eq),
         },
-        "410000541FC10000",
-        "b.ne 8 ; udf",
+        "200000541FC10000",
+        "b.eq #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Lo),
         },
-        "420000541FC10000",
-        "b.hs 8 ; udf",
+        "230000541FC10000",
+        "b.lo #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Hs),
         },
-        "430000541FC10000",
-        "b.lo 8 ; udf",
+        "220000541FC10000",
+        "b.hs #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Pl),
         },
-        "440000541FC10000",
-        "b.mi 8 ; udf",
+        "250000541FC10000",
+        "b.pl #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Mi),
         },
-        "450000541FC10000",
-        "b.pl 8 ; udf",
+        "240000541FC10000",
+        "b.mi #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Vc),
         },
-        "460000541FC10000",
-        "b.vs 8 ; udf",
+        "270000541FC10000",
+        "b.vc #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Vs),
         },
-        "470000541FC10000",
-        "b.vc 8 ; udf",
+        "260000541FC10000",
+        "b.vs #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Ls),
         },
-        "480000541FC10000",
-        "b.hi 8 ; udf",
+        "290000541FC10000",
+        "b.ls #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Hi),
         },
-        "490000541FC10000",
-        "b.ls 8 ; udf",
+        "280000541FC10000",
+        "b.hi #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Lt),
         },
-        "4A0000541FC10000",
-        "b.ge 8 ; udf",
+        "2B0000541FC10000",
+        "b.lt #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Ge),
         },
-        "4B0000541FC10000",
-        "b.lt 8 ; udf",
+        "2A0000541FC10000",
+        "b.ge #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Le),
         },
-        "4C0000541FC10000",
-        "b.gt 8 ; udf",
+        "2D0000541FC10000",
+        "b.le #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Gt),
         },
-        "4D0000541FC10000",
-        "b.le 8 ; udf",
+        "2C0000541FC10000",
+        "b.gt #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Nv),
         },
-        "4E0000541FC10000",
-        "b.al 8 ; udf",
+        "2F0000541FC10000",
+        "b.nv #trap=stk_ovf",
     ));
     insns.push((
         Inst::TrapIf {
-            trap_code: TrapCode::Interrupt,
+            trap_code: TrapCode::STACK_OVERFLOW,
             kind: CondBrKind::Cond(Cond::Al),
         },
-        "4F0000541FC10000",
-        "b.nv 8 ; udf",
+        "2E0000541FC10000",
+        "b.al #trap=stk_ovf",
     ));
 
     insns.push((
@@ -6023,15 +6056,10 @@ fn test_aarch64_binemit() {
 
     insns.push((
         Inst::Call {
-            info: Box::new(CallInfo {
-                dest: ExternalName::testcase("test0"),
-                uses: smallvec![],
-                defs: smallvec![],
-                clobbers: PRegSet::empty(),
-                opcode: Opcode::Call,
-                caller_callconv: CallConv::SystemV,
-                callee_callconv: CallConv::SystemV,
-            }),
+            info: Box::new(CallInfo::empty(
+                ExternalName::testcase("test0"),
+                CallConv::SystemV,
+            )),
         },
         "00000094",
         "bl 0",
@@ -6039,15 +6067,7 @@ fn test_aarch64_binemit() {
 
     insns.push((
         Inst::CallInd {
-            info: Box::new(CallIndInfo {
-                rn: xreg(10),
-                uses: smallvec![],
-                defs: smallvec![],
-                clobbers: PRegSet::empty(),
-                opcode: Opcode::CallIndirect,
-                caller_callconv: CallConv::SystemV,
-                callee_callconv: CallConv::SystemV,
-            }),
+            info: Box::new(CallInfo::empty(xreg(10), CallConv::SystemV)),
         },
         "40013FD6",
         "blr x10",
@@ -6098,6 +6118,15 @@ fn test_aarch64_binemit() {
         },
         "8840601E",
         "fmov d8, d4",
+    ));
+
+    insns.push((
+        Inst::FpuMove32 {
+            rd: writable_vreg(8),
+            rn: vreg(4),
+        },
+        "8840201E",
+        "fmov s8, s4",
     ));
 
     insns.push((
@@ -6398,6 +6427,19 @@ fn test_aarch64_binemit() {
 
     insns.push((
         Inst::FpuRRRR {
+            fpu_op: FPUOp3::MSub,
+            size: ScalarSize::Size32,
+            rd: writable_vreg(15),
+            rn: vreg(30),
+            rm: vreg(31),
+            ra: vreg(1),
+        },
+        "CF871F1F",
+        "fmsub s15, s30, s31, s1",
+    ));
+
+    insns.push((
+        Inst::FpuRRRR {
             fpu_op: FPUOp3::MAdd,
             size: ScalarSize::Size64,
             rd: writable_vreg(15),
@@ -6407,6 +6449,45 @@ fn test_aarch64_binemit() {
         },
         "CF075F1F",
         "fmadd d15, d30, d31, d1",
+    ));
+
+    insns.push((
+        Inst::FpuRRRR {
+            fpu_op: FPUOp3::MSub,
+            size: ScalarSize::Size64,
+            rd: writable_vreg(15),
+            rn: vreg(30),
+            rm: vreg(31),
+            ra: vreg(1),
+        },
+        "CF875F1F",
+        "fmsub d15, d30, d31, d1",
+    ));
+
+    insns.push((
+        Inst::FpuRRRR {
+            fpu_op: FPUOp3::NMAdd,
+            size: ScalarSize::Size64,
+            rd: writable_vreg(15),
+            rn: vreg(30),
+            rm: vreg(31),
+            ra: vreg(1),
+        },
+        "CF077F1F",
+        "fnmadd d15, d30, d31, d1",
+    ));
+
+    insns.push((
+        Inst::FpuRRRR {
+            fpu_op: FPUOp3::NMSub,
+            size: ScalarSize::Size64,
+            rd: writable_vreg(15),
+            rn: vreg(30),
+            rm: vreg(31),
+            ra: vreg(1),
+        },
+        "CF877F1F",
+        "fnmsub d15, d30, d31, d1",
     ));
 
     insns.push((
@@ -6632,12 +6713,24 @@ fn test_aarch64_binemit() {
     ));
 
     insns.push((
+        Inst::FpuLoad16 {
+            rd: writable_vreg(16),
+            mem: AMode::RegScaled {
+                rn: xreg(8),
+                rm: xreg(9),
+            },
+            flags: MemFlags::trusted(),
+        },
+        "1079697C",
+        "ldr h16, [x8, x9, LSL #1]",
+    ));
+
+    insns.push((
         Inst::FpuLoad32 {
             rd: writable_vreg(16),
             mem: AMode::RegScaled {
                 rn: xreg(8),
                 rm: xreg(9),
-                ty: F32,
             },
             flags: MemFlags::trusted(),
         },
@@ -6651,7 +6744,6 @@ fn test_aarch64_binemit() {
             mem: AMode::RegScaled {
                 rn: xreg(8),
                 rm: xreg(9),
-                ty: F64,
             },
             flags: MemFlags::trusted(),
         },
@@ -6665,7 +6757,6 @@ fn test_aarch64_binemit() {
             mem: AMode::RegScaled {
                 rn: xreg(8),
                 rm: xreg(9),
-                ty: I128,
             },
             flags: MemFlags::trusted(),
         },
@@ -6710,12 +6801,24 @@ fn test_aarch64_binemit() {
     ));
 
     insns.push((
+        Inst::FpuStore16 {
+            rd: vreg(16),
+            mem: AMode::RegScaled {
+                rn: xreg(8),
+                rm: xreg(9),
+            },
+            flags: MemFlags::trusted(),
+        },
+        "1079297C",
+        "str h16, [x8, x9, LSL #1]",
+    ));
+
+    insns.push((
         Inst::FpuStore32 {
             rd: vreg(16),
             mem: AMode::RegScaled {
                 rn: xreg(8),
                 rm: xreg(9),
-                ty: F32,
             },
             flags: MemFlags::trusted(),
         },
@@ -6729,7 +6832,6 @@ fn test_aarch64_binemit() {
             mem: AMode::RegScaled {
                 rn: xreg(8),
                 rm: xreg(9),
-                ty: F64,
             },
             flags: MemFlags::trusted(),
         },
@@ -6743,7 +6845,6 @@ fn test_aarch64_binemit() {
             mem: AMode::RegScaled {
                 rn: xreg(8),
                 rm: xreg(9),
-                ty: I128,
             },
             flags: MemFlags::trusted(),
         },
@@ -6755,7 +6856,10 @@ fn test_aarch64_binemit() {
         Inst::FpuLoadP64 {
             rt: writable_vreg(0),
             rt2: writable_vreg(31),
-            mem: PairAMode::SignedOffset(xreg(0), simm7_scaled_zero(F64)),
+            mem: PairAMode::SignedOffset {
+                reg: xreg(0),
+                simm7: simm7_scaled_zero(F64),
+            },
             flags: MemFlags::trusted(),
         },
         "007C406D",
@@ -6766,7 +6870,9 @@ fn test_aarch64_binemit() {
         Inst::FpuLoadP64 {
             rt: writable_vreg(19),
             rt2: writable_vreg(11),
-            mem: PairAMode::SPPreIndexed(SImm7Scaled::maybe_from_i64(-512, F64).unwrap()),
+            mem: PairAMode::SPPreIndexed {
+                simm7: SImm7Scaled::maybe_from_i64(-512, F64).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "F32FE06D",
@@ -6777,7 +6883,9 @@ fn test_aarch64_binemit() {
         Inst::FpuLoadP64 {
             rt: writable_vreg(7),
             rt2: writable_vreg(20),
-            mem: PairAMode::SPPostIndexed(SImm7Scaled::maybe_from_i64(64, F64).unwrap()),
+            mem: PairAMode::SPPostIndexed {
+                simm7: SImm7Scaled::maybe_from_i64(64, F64).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "E753C46C",
@@ -6788,10 +6896,10 @@ fn test_aarch64_binemit() {
         Inst::FpuStoreP64 {
             rt: vreg(4),
             rt2: vreg(26),
-            mem: PairAMode::SignedOffset(
-                stack_reg(),
-                SImm7Scaled::maybe_from_i64(504, F64).unwrap(),
-            ),
+            mem: PairAMode::SignedOffset {
+                reg: stack_reg(),
+                simm7: SImm7Scaled::maybe_from_i64(504, F64).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "E4EB1F6D",
@@ -6802,7 +6910,9 @@ fn test_aarch64_binemit() {
         Inst::FpuStoreP64 {
             rt: vreg(16),
             rt2: vreg(8),
-            mem: PairAMode::SPPreIndexed(SImm7Scaled::maybe_from_i64(48, F64).unwrap()),
+            mem: PairAMode::SPPreIndexed {
+                simm7: SImm7Scaled::maybe_from_i64(48, F64).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "F023836D",
@@ -6813,7 +6923,9 @@ fn test_aarch64_binemit() {
         Inst::FpuStoreP64 {
             rt: vreg(5),
             rt2: vreg(6),
-            mem: PairAMode::SPPostIndexed(SImm7Scaled::maybe_from_i64(-32, F64).unwrap()),
+            mem: PairAMode::SPPostIndexed {
+                simm7: SImm7Scaled::maybe_from_i64(-32, F64).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "E51BBE6C",
@@ -6824,7 +6936,10 @@ fn test_aarch64_binemit() {
         Inst::FpuLoadP128 {
             rt: writable_vreg(0),
             rt2: writable_vreg(17),
-            mem: PairAMode::SignedOffset(xreg(3), simm7_scaled_zero(I8X16)),
+            mem: PairAMode::SignedOffset {
+                reg: xreg(3),
+                simm7: simm7_scaled_zero(I8X16),
+            },
             flags: MemFlags::trusted(),
         },
         "604440AD",
@@ -6835,7 +6950,9 @@ fn test_aarch64_binemit() {
         Inst::FpuLoadP128 {
             rt: writable_vreg(29),
             rt2: writable_vreg(9),
-            mem: PairAMode::SPPreIndexed(SImm7Scaled::maybe_from_i64(-1024, I8X16).unwrap()),
+            mem: PairAMode::SPPreIndexed {
+                simm7: SImm7Scaled::maybe_from_i64(-1024, I8X16).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "FD27E0AD",
@@ -6846,7 +6963,9 @@ fn test_aarch64_binemit() {
         Inst::FpuLoadP128 {
             rt: writable_vreg(10),
             rt2: writable_vreg(20),
-            mem: PairAMode::SPPostIndexed(SImm7Scaled::maybe_from_i64(256, I8X16).unwrap()),
+            mem: PairAMode::SPPostIndexed {
+                simm7: SImm7Scaled::maybe_from_i64(256, I8X16).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "EA53C8AC",
@@ -6857,10 +6976,10 @@ fn test_aarch64_binemit() {
         Inst::FpuStoreP128 {
             rt: vreg(9),
             rt2: vreg(31),
-            mem: PairAMode::SignedOffset(
-                stack_reg(),
-                SImm7Scaled::maybe_from_i64(1008, I8X16).unwrap(),
-            ),
+            mem: PairAMode::SignedOffset {
+                reg: stack_reg(),
+                simm7: SImm7Scaled::maybe_from_i64(1008, I8X16).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "E9FF1FAD",
@@ -6871,7 +6990,9 @@ fn test_aarch64_binemit() {
         Inst::FpuStoreP128 {
             rt: vreg(27),
             rt2: vreg(13),
-            mem: PairAMode::SPPreIndexed(SImm7Scaled::maybe_from_i64(-192, I8X16).unwrap()),
+            mem: PairAMode::SPPreIndexed {
+                simm7: SImm7Scaled::maybe_from_i64(-192, I8X16).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "FB37BAAD",
@@ -6882,7 +7003,9 @@ fn test_aarch64_binemit() {
         Inst::FpuStoreP128 {
             rt: vreg(18),
             rt2: vreg(22),
-            mem: PairAMode::SPPostIndexed(SImm7Scaled::maybe_from_i64(304, I8X16).unwrap()),
+            mem: PairAMode::SPPostIndexed {
+                simm7: SImm7Scaled::maybe_from_i64(304, I8X16).unwrap(),
+            },
             flags: MemFlags::trusted(),
         },
         "F2DB89AC",
@@ -6890,21 +7013,14 @@ fn test_aarch64_binemit() {
     ));
 
     insns.push((
-        Inst::LoadFpuConst64 {
-            rd: writable_vreg(16),
-            const_data: 1.0_f64.to_bits(),
+        Inst::FpuCSel16 {
+            rd: writable_vreg(1),
+            rn: vreg(2),
+            rm: vreg(3),
+            cond: Cond::Hi,
         },
-        "5000005C03000014000000000000F03F",
-        "ldr d16, pc+8 ; b 12 ; data.f64 1",
-    ));
-
-    insns.push((
-        Inst::LoadFpuConst128 {
-            rd: writable_vreg(5),
-            const_data: 0x0f0e0d0c0b0a09080706050403020100,
-        },
-        "4500009C05000014000102030405060708090A0B0C0D0E0F",
-        "ldr q5, pc+8 ; b 20 ; data.f128 0x0f0e0d0c0b0a09080706050403020100",
+        "418CE31E",
+        "fcsel h1, h2, h3, hi",
     ));
 
     insns.push((
@@ -7815,19 +7931,15 @@ fn test_aarch64_binemit() {
     let flags = settings::Flags::new(settings::builder());
     let emit_info = EmitInfo::new(flags);
     for (insn, expected_encoding, expected_printing) in insns {
-        println!(
-            "AArch64: {:?}, {}, {}",
-            insn, expected_encoding, expected_printing
-        );
+        println!("AArch64: {insn:?}, {expected_encoding}, {expected_printing}");
 
         // Check the printed text is as expected.
-        let actual_printing =
-            insn.print_with_state(&mut EmitState::default(), &mut AllocationConsumer::new(&[]));
+        let actual_printing = insn.print_with_state(&mut EmitState::default());
         assert_eq!(expected_printing, actual_printing);
 
         let mut buffer = MachBuffer::new();
-        insn.emit(&[], &mut buffer, &emit_info, &mut Default::default());
-        let buffer = buffer.finish();
+        insn.emit(&mut buffer, &emit_info, &mut Default::default());
+        let buffer = buffer.finish(&Default::default(), &mut Default::default());
         let actual_encoding = &buffer.stringify_code_bytes();
         assert_eq!(expected_encoding, actual_encoding);
     }

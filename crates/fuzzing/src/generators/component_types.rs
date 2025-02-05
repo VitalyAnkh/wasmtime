@@ -3,7 +3,7 @@
 //!
 //! Each case includes a list of arbitrary interface types to use as parameters, plus another one to use as a
 //! result, and a component which exports a function and imports a function.  The exported function forwards its
-//! parameters to the imported one and forwards the result back to the caller.  This serves to excercise Wasmtime's
+//! parameters to the imported one and forwards the result back to the caller.  This serves to exercise Wasmtime's
 //! lifting and lowering code and verify the values remain intact during both processes.
 
 use arbitrary::{Arbitrary, Unstructured};
@@ -46,163 +46,125 @@ pub fn arbitrary_val(ty: &component::Type, input: &mut Unstructured) -> arbitrar
                 Ok(ControlFlow::Continue(()))
             })?;
 
-            list.new_val(values.into()).unwrap()
+            Val::List(values.into())
         }
-        Type::Record(record) => record
-            .new_val(
-                record
-                    .fields()
-                    .map(|field| Ok((field.name, arbitrary_val(&field.ty, input)?)))
-                    .collect::<arbitrary::Result<Vec<_>>>()?,
-            )
-            .unwrap(),
-        Type::Tuple(tuple) => tuple
-            .new_val(
-                tuple
-                    .types()
-                    .map(|ty| arbitrary_val(&ty, input))
-                    .collect::<arbitrary::Result<_>>()?,
-            )
-            .unwrap(),
+        Type::Record(record) => Val::Record(
+            record
+                .fields()
+                .map(|field| Ok((field.name.to_string(), arbitrary_val(&field.ty, input)?)))
+                .collect::<arbitrary::Result<_>>()?,
+        ),
+        Type::Tuple(tuple) => Val::Tuple(
+            tuple
+                .types()
+                .map(|ty| arbitrary_val(&ty, input))
+                .collect::<arbitrary::Result<_>>()?,
+        ),
         Type::Variant(variant) => {
             let cases = variant.cases().collect::<Vec<_>>();
             let case = input.choose(&cases)?;
             let payload = match &case.ty {
-                Some(ty) => Some(arbitrary_val(ty, input)?),
+                Some(ty) => Some(Box::new(arbitrary_val(ty, input)?)),
                 None => None,
             };
-            variant.new_val(case.name, payload).unwrap()
+            Val::Variant(case.name.to_string(), payload)
         }
         Type::Enum(en) => {
             let names = en.names().collect::<Vec<_>>();
             let name = input.choose(&names)?;
-            en.new_val(name).unwrap()
-        }
-        Type::Union(un) => {
-            let mut types = un.types();
-            let discriminant = input.int_in_range(0..=types.len() - 1)?;
-            un.new_val(
-                discriminant.try_into().unwrap(),
-                arbitrary_val(&types.nth(discriminant).unwrap(), input)?,
-            )
-            .unwrap()
+            Val::Enum(name.to_string())
         }
         Type::Option(option) => {
             let discriminant = input.int_in_range(0..=1)?;
-            option
-                .new_val(match discriminant {
-                    0 => None,
-                    1 => Some(arbitrary_val(&option.ty(), input)?),
-                    _ => unreachable!(),
-                })
-                .unwrap()
+            Val::Option(match discriminant {
+                0 => None,
+                1 => Some(Box::new(arbitrary_val(&option.ty(), input)?)),
+                _ => unreachable!(),
+            })
         }
         Type::Result(result) => {
             let discriminant = input.int_in_range(0..=1)?;
-            result
-                .new_val(match discriminant {
-                    0 => Ok(match result.ok() {
-                        Some(ty) => Some(arbitrary_val(&ty, input)?),
-                        None => None,
-                    }),
-                    1 => Err(match result.err() {
-                        Some(ty) => Some(arbitrary_val(&ty, input)?),
-                        None => None,
-                    }),
-                    _ => unreachable!(),
-                })
-                .unwrap()
+            Val::Result(match discriminant {
+                0 => Ok(match result.ok() {
+                    Some(ty) => Some(Box::new(arbitrary_val(&ty, input)?)),
+                    None => None,
+                }),
+                1 => Err(match result.err() {
+                    Some(ty) => Some(Box::new(arbitrary_val(&ty, input)?)),
+                    None => None,
+                }),
+                _ => unreachable!(),
+            })
         }
-        Type::Flags(flags) => flags
-            .new_val(
-                &flags
-                    .names()
-                    .filter_map(|name| {
-                        input
-                            .arbitrary()
-                            .map(|p| if p { Some(name) } else { None })
-                            .transpose()
-                    })
-                    .collect::<arbitrary::Result<Box<[_]>>>()?,
-            )
-            .unwrap(),
+        Type::Flags(flags) => Val::Flags(
+            flags
+                .names()
+                .filter_map(|name| {
+                    input
+                        .arbitrary()
+                        .map(|p| if p { Some(name.to_string()) } else { None })
+                        .transpose()
+                })
+                .collect::<arbitrary::Result<_>>()?,
+        ),
+
+        // Resources aren't fuzzed at this time.
+        Type::Own(_) | Type::Borrow(_) => unreachable!(),
     })
 }
 
-macro_rules! define_static_api_test {
-    ($name:ident $(($param:ident $param_name:ident $param_expected_name:ident))*) => {
-        #[allow(unused_parens)]
-        /// Generate zero or more sets of arbitrary argument and result values and execute the test using those
-        /// values, asserting that they flow from host-to-guest and guest-to-host unchanged.
-        pub fn $name<'a, $($param,)* R>(
-            input: &mut Unstructured<'a>,
-            declarations: &Declarations,
-        ) -> arbitrary::Result<()>
-        where
-            $($param: Lift + Lower + Clone + PartialEq + Debug + Arbitrary<'a> + 'static,)*
-            R: ComponentNamedList + Lift + Lower + Clone + PartialEq + Debug + Arbitrary<'a> + 'static
-        {
-            crate::init_fuzzing();
+/// Generate zero or more sets of arbitrary argument and result values and execute the test using those
+/// values, asserting that they flow from host-to-guest and guest-to-host unchanged.
+pub fn static_api_test<'a, P, R>(
+    input: &mut Unstructured<'a>,
+    declarations: &Declarations,
+) -> arbitrary::Result<()>
+where
+    P: ComponentNamedList + Lift + Lower + Clone + PartialEq + Debug + Arbitrary<'a> + 'static,
+    R: ComponentNamedList + Lift + Lower + Clone + PartialEq + Debug + Arbitrary<'a> + 'static,
+{
+    crate::init_fuzzing();
 
-            let mut config = Config::new();
-            config.wasm_component_model(true);
-            config.debug_adapter_modules(input.arbitrary()?);
-            let engine = Engine::new(&config).unwrap();
-            let wat = declarations.make_component();
-            let wat = wat.as_bytes();
-            crate::oracles::log_wasm(wat);
-            let component = Component::new(&engine, wat).unwrap();
-            let mut linker = Linker::new(&engine);
-            linker
-                .root()
-                .func_wrap(
-                    IMPORT_FUNCTION,
-                    |cx: StoreContextMut<'_, Box<dyn Any>>,
-                    ($($param_name,)*): ($($param,)*)|
-                    {
-                        log::trace!("received parameters {:?}", ($(&$param_name,)*));
-                        let data: &($($param,)* R,) =
-                            cx.data().downcast_ref().unwrap();
-                        let ($($param_expected_name,)* result,) = data;
-                        $(assert_eq!($param_name, *$param_expected_name);)*
-                        log::trace!("returning result {:?}", result);
-                        Ok(result.clone())
-                    },
-                )
-                .unwrap();
-            let mut store: Store<Box<dyn Any>> = Store::new(&engine, Box::new(()));
-            let instance = linker.instantiate(&mut store, &component).unwrap();
-            let func = instance
-                .get_typed_func::<($($param,)*), R>(&mut store, EXPORT_FUNCTION)
-                .unwrap();
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    config.wasm_component_model_multiple_returns(true);
+    config.debug_adapter_modules(input.arbitrary()?);
+    let engine = Engine::new(&config).unwrap();
+    let wat = declarations.make_component();
+    let wat = wat.as_bytes();
+    crate::oracles::log_wasm(wat);
+    let component = Component::new(&engine, wat).unwrap();
+    let mut linker = Linker::new(&engine);
+    linker
+        .root()
+        .func_wrap(
+            IMPORT_FUNCTION,
+            |cx: StoreContextMut<'_, Box<dyn Any>>, params: P| {
+                log::trace!("received parameters {params:?}");
+                let data: &(P, R) = cx.data().downcast_ref().unwrap();
+                let (expected_params, result) = data;
+                assert_eq!(params, *expected_params);
+                log::trace!("returning result {:?}", result);
+                Ok(result.clone())
+            },
+        )
+        .unwrap();
+    let mut store: Store<Box<dyn Any>> = Store::new(&engine, Box::new(()));
+    let instance = linker.instantiate(&mut store, &component).unwrap();
+    let func = instance
+        .get_typed_func::<P, R>(&mut store, EXPORT_FUNCTION)
+        .unwrap();
 
-            while input.arbitrary()? {
-                $(let $param_name = input.arbitrary::<$param>()?;)*
-                let result = input.arbitrary::<R>()?;
-                *store.data_mut() = Box::new((
-                    $($param_name.clone(),)*
-                    result.clone(),
-                ));
-                log::trace!(
-                    "passing in parameters {:?}",
-                    ($(&$param_name,)*),
-                );
-                let actual = func.call(&mut store, ($($param_name,)*)).unwrap();
-                log::trace!("got result {:?}", actual);
-                assert_eq!(actual, result);
-                func.post_return(&mut store).unwrap();
-            }
-
-            Ok(())
-        }
+    while input.arbitrary()? {
+        let params = input.arbitrary::<P>()?;
+        let result = input.arbitrary::<R>()?;
+        *store.data_mut() = Box::new((params.clone(), result.clone()));
+        log::trace!("passing in parameters {params:?}");
+        let actual = func.call(&mut store, params).unwrap();
+        log::trace!("got result {:?}", actual);
+        assert_eq!(actual, result);
+        func.post_return(&mut store).unwrap();
     }
-}
 
-define_static_api_test!(static_api_test0);
-define_static_api_test!(static_api_test1 (P0 p0 p0_expected));
-define_static_api_test!(static_api_test2 (P0 p0 p0_expected) (P1 p1 p1_expected));
-define_static_api_test!(static_api_test3 (P0 p0 p0_expected) (P1 p1 p1_expected) (P2 p2 p2_expected));
-define_static_api_test!(static_api_test4 (P0 p0 p0_expected) (P1 p1 p1_expected) (P2 p2 p2_expected)
-                        (P3 p3 p3_expected));
-define_static_api_test!(static_api_test5 (P0 p0 p0_expected) (P1 p1 p1_expected) (P2 p2 p2_expected)
-                        (P3 p3 p3_expected) (P4 p4 p4_expected));
+    Ok(())
+}

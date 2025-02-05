@@ -4,7 +4,7 @@
 //! node-internal data references some other storage (e.g., offsets into
 //! an array or pool of shared data).
 
-use hashbrown::raw::RawTable;
+use hashbrown::hash_table::HashTable;
 use std::hash::{Hash, Hasher};
 
 /// Trait that allows for equality comparison given some external
@@ -59,7 +59,7 @@ struct BucketData<K, V> {
 
 /// A HashMap that takes external context for all operations.
 pub struct CtxHashMap<K, V> {
-    raw: RawTable<BucketData<K, V>>,
+    raw: HashTable<BucketData<K, V>>,
 }
 
 impl<K, V> CtxHashMap<K, V> {
@@ -67,7 +67,7 @@ impl<K, V> CtxHashMap<K, V> {
     /// capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            raw: RawTable::with_capacity(capacity),
+            raw: HashTable::with_capacity(capacity),
         }
     }
 }
@@ -76,7 +76,7 @@ fn compute_hash<Ctx, K>(ctx: &Ctx, k: &K) -> u32
 where
     Ctx: CtxHash<K>,
 {
-    let mut hasher = crate::fx::FxHasher::default();
+    let mut hasher = rustc_hash::FxHasher::default();
     ctx.ctx_hash(&mut hasher, k);
     hasher.finish() as u32
 }
@@ -89,17 +89,14 @@ impl<K, V> CtxHashMap<K, V> {
         Ctx: CtxEq<K, K> + CtxHash<K>,
     {
         let hash = compute_hash(ctx, &k);
-        match self.raw.find(hash as u64, |bucket| {
+        match self.raw.find_mut(hash as u64, |bucket| {
             hash == bucket.hash && ctx.ctx_eq(&bucket.k, &k)
         }) {
-            Some(bucket) => {
-                let data = unsafe { bucket.as_mut() };
-                Some(std::mem::replace(&mut data.v, v))
-            }
+            Some(bucket) => Some(std::mem::replace(&mut bucket.v, v)),
             None => {
                 let data = BucketData { hash, k, v };
                 self.raw
-                    .insert_entry(hash as u64, data, |bucket| bucket.hash as u64);
+                    .insert_unique(hash as u64, data, |bucket| bucket.hash as u64);
                 None
             }
         }
@@ -115,17 +112,13 @@ impl<K, V> CtxHashMap<K, V> {
             .find(hash as u64, |bucket| {
                 hash == bucket.hash && ctx.ctx_eq(&bucket.k, k)
             })
-            .map(|bucket| {
-                let data = unsafe { bucket.as_ref() };
-                &data.v
-            })
+            .map(|bucket| &bucket.v)
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::hash::Hash;
 
     #[derive(Clone, Copy, Debug)]
     struct Key {

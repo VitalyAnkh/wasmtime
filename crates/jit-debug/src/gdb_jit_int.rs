@@ -2,10 +2,10 @@
 //! the __jit_debug_register_code() and __jit_debug_descriptor to register
 //! or unregister generated object images with debuggers.
 
-use once_cell::sync::Lazy;
 use std::pin::Pin;
 use std::ptr;
 use std::sync::Mutex;
+use wasmtime_versioned_export_macros::versioned_link;
 
 #[repr(C)]
 struct JITCodeEntry {
@@ -27,7 +27,8 @@ struct JITDescriptor {
     first_entry: *mut JITCodeEntry,
 }
 
-extern "C" {
+unsafe extern "C" {
+    #[versioned_link]
     fn wasmtime_jit_debug_descriptor() -> *mut JITDescriptor;
     fn __jit_debug_register_code();
 }
@@ -38,9 +39,9 @@ extern "C" {
 ///
 /// The GDB_REGISTRATION lock is needed for GdbJitImageRegistration to protect
 /// access to the __jit_debug_descriptor within this process.
-static GDB_REGISTRATION: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(Default::default()));
+static GDB_REGISTRATION: Mutex<()> = Mutex::new(());
 
-/// Registeration for JIT image
+/// Registration for JIT image
 pub struct GdbJitImageRegistration {
     entry: Pin<Box<JITCodeEntry>>,
     file: Pin<Box<[u8]>>,

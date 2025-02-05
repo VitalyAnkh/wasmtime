@@ -1,11 +1,11 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::fmt::{Display, LowerHex};
-use wasmtime::{ExternRef, Val};
-use wast::core::{HeapType, NanPattern, V128Pattern, WastArgCore, WastRetCore};
-use wast::token::{Float32, Float64};
+use wasmtime::{AnyRef, ExternRef, Store, Val};
+use wast::core::{AbstractHeapType, HeapType, NanPattern, V128Pattern, WastArgCore, WastRetCore};
+use wast::token::{F32, F64};
 
 /// Translate from a `script::Value` to a `RuntimeValue`.
-pub fn val(v: &WastArgCore<'_>) -> Result<Val> {
+pub fn val<T>(store: &mut Store<T>, v: &WastArgCore<'_>) -> Result<Val> {
     use wast::core::WastArgCore::*;
 
     Ok(match v {
@@ -13,10 +13,29 @@ pub fn val(v: &WastArgCore<'_>) -> Result<Val> {
         I64(x) => Val::I64(*x),
         F32(x) => Val::F32(x.bits),
         F64(x) => Val::F64(x.bits),
-        V128(x) => Val::V128(u128::from_le_bytes(x.to_le_bytes())),
-        RefNull(HeapType::Extern) => Val::ExternRef(None),
-        RefNull(HeapType::Func) => Val::FuncRef(None),
-        RefExtern(x) => Val::ExternRef(Some(ExternRef::new(*x))),
+        V128(x) => Val::V128(u128::from_le_bytes(x.to_le_bytes()).into()),
+        RefNull(HeapType::Abstract {
+            ty: AbstractHeapType::Extern,
+            shared: false,
+        }) => Val::ExternRef(None),
+        RefNull(HeapType::Abstract {
+            ty: AbstractHeapType::Func,
+            shared: false,
+        }) => Val::FuncRef(None),
+        RefNull(HeapType::Abstract {
+            ty: AbstractHeapType::Any,
+            shared: false,
+        }) => Val::AnyRef(None),
+        RefNull(HeapType::Abstract {
+            shared: false,
+            ty: AbstractHeapType::None,
+        }) => Val::AnyRef(None),
+        RefExtern(x) => Val::ExternRef(Some(ExternRef::new(store, *x)?)),
+        RefHost(x) => {
+            let x = ExternRef::new(&mut *store, *x)?;
+            let x = AnyRef::convert_extern(&mut *store, x)?;
+            Val::AnyRef(Some(x))
+        }
         other => bail!("couldn't convert {:?} to a runtime value", other),
     })
 }
@@ -37,48 +56,124 @@ fn extract_lane_as_i64(bytes: u128, lane: usize) -> i64 {
     (bytes >> (lane * 64)) as i64
 }
 
-pub fn match_val(actual: &Val, expected: &WastRetCore) -> Result<()> {
+pub fn match_val<T>(store: &mut Store<T>, actual: &Val, expected: &WastRetCore) -> Result<()> {
     match (actual, expected) {
+        (_, WastRetCore::Either(expected)) => {
+            for expected in expected {
+                if match_val(store, actual, expected).is_ok() {
+                    return Ok(());
+                }
+            }
+            match_val(store, actual, &expected[0])
+        }
+
         (Val::I32(a), WastRetCore::I32(b)) => match_int(a, b),
         (Val::I64(a), WastRetCore::I64(b)) => match_int(a, b),
+
         // Note that these float comparisons are comparing bits, not float
         // values, so we're testing for bit-for-bit equivalence
         (Val::F32(a), WastRetCore::F32(b)) => match_f32(*a, b),
         (Val::F64(a), WastRetCore::F64(b)) => match_f64(*a, b),
-        (Val::V128(a), WastRetCore::V128(b)) => match_v128(*a, b),
-        (Val::ExternRef(x), WastRetCore::RefNull(Some(HeapType::Extern))) => {
-            if let Some(x) = x {
-                let x = x
-                    .data()
-                    .downcast_ref::<u32>()
-                    .expect("only u32 externrefs created in wast test suites");
-                bail!("expected null externref, found {}", x);
-            } else {
-                Ok(())
-            }
+        (Val::V128(a), WastRetCore::V128(b)) => match_v128(a.as_u128(), b),
+
+        // Null references.
+        (
+            Val::FuncRef(None) | Val::ExternRef(None) | Val::AnyRef(None),
+            WastRetCore::RefNull(_),
+        )
+        | (Val::ExternRef(None), WastRetCore::RefExtern(None)) => Ok(()),
+
+        // Null and non-null mismatches.
+        (Val::ExternRef(None), WastRetCore::RefExtern(Some(_))) => {
+            bail!("expected non-null reference, found null")
         }
-        (Val::ExternRef(x), WastRetCore::RefExtern(y)) => {
-            if let Some(x) = x {
-                let x = x
-                    .data()
-                    .downcast_ref::<u32>()
-                    .expect("only u32 externrefs created in wast test suites");
-                if x == y {
-                    Ok(())
-                } else {
-                    bail!("expected {} found {}", y, x);
+        (
+            Val::ExternRef(Some(x)),
+            WastRetCore::RefNull(Some(HeapType::Abstract {
+                ty: AbstractHeapType::Extern,
+                shared: false,
+            })),
+        ) => {
+            match x.data(store)?.map(|x| {
+                x.downcast_ref::<u32>()
+                    .expect("only u32 externrefs created in wast test suites")
+            }) {
+                None => {
+                    bail!("expected null externref, found non-null externref without host data")
                 }
-            } else {
-                bail!("expected non-null externref, found null")
+                Some(x) => bail!("expected null externref, found non-null externref of {x}"),
             }
         }
-        (Val::FuncRef(x), WastRetCore::RefNull(_)) => {
-            if x.is_none() {
+        (Val::ExternRef(Some(_)) | Val::FuncRef(Some(_)), WastRetCore::RefNull(_)) => {
+            bail!("expected null, found non-null reference: {actual:?}")
+        }
+
+        // Non-null references.
+        (Val::FuncRef(Some(_)), WastRetCore::RefFunc(_)) => Ok(()),
+        (Val::ExternRef(Some(_)), WastRetCore::RefExtern(None)) => Ok(()),
+        (Val::ExternRef(Some(x)), WastRetCore::RefExtern(Some(y))) => {
+            let x = x
+                .data(store)?
+                .ok_or_else(|| {
+                    anyhow!("expected an externref of a u32, found externref without host data")
+                })?
+                .downcast_ref::<u32>()
+                .expect("only u32 externrefs created in wast test suites");
+            if x == y {
                 Ok(())
             } else {
-                bail!("expected null funcref, found non-null")
+                bail!("expected {} found {}", y, x);
             }
         }
+
+        (Val::AnyRef(Some(_)), WastRetCore::RefAny) => Ok(()),
+        (Val::AnyRef(Some(x)), WastRetCore::RefEq) => {
+            if x.is_eqref(store)? {
+                Ok(())
+            } else {
+                bail!("expected an eqref, found {x:?}");
+            }
+        }
+        (Val::AnyRef(Some(x)), WastRetCore::RefI31) => {
+            if x.is_i31(store)? {
+                Ok(())
+            } else {
+                bail!("expected a `(ref i31)`, found {x:?}");
+            }
+        }
+        (Val::AnyRef(Some(x)), WastRetCore::RefStruct) => {
+            if x.is_struct(store)? {
+                Ok(())
+            } else {
+                bail!("expected a struct reference, found {x:?}")
+            }
+        }
+        (Val::AnyRef(Some(x)), WastRetCore::RefArray) => {
+            if x.is_array(store)? {
+                Ok(())
+            } else {
+                bail!("expected a array reference, found {x:?}")
+            }
+        }
+        (Val::AnyRef(Some(x)), WastRetCore::RefHost(y)) => {
+            let x = ExternRef::convert_any(&mut *store, *x)?;
+            let x = x
+                .data(&mut *store)?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "expected anyref of externref of u32, found anyref that is \
+                         not a converted externref"
+                    )
+                })?
+                .downcast_ref::<u32>()
+                .expect("only u32 externrefs created in wast test suites");
+            if x == y {
+                Ok(())
+            } else {
+                bail!("expected anyref of externref of {y}, found anyref of externref of {x}")
+            }
+        }
+
         _ => bail!(
             "don't know how to compare {:?} and {:?} yet",
             actual,
@@ -103,7 +198,7 @@ where
     }
 }
 
-pub fn match_f32(actual: u32, expected: &NanPattern<Float32>) -> Result<()> {
+pub fn match_f32(actual: u32, expected: &NanPattern<F32>) -> Result<()> {
     match expected {
         // Check if an f32 (as u32 bits to avoid possible quieting when moving values in registers, e.g.
         // https://developer.arm.com/documentation/ddi0344/i/neon-and-vfp-programmers-model/modes-of-operation/default-nan-mode?lang=en)
@@ -168,7 +263,7 @@ pub fn match_f32(actual: u32, expected: &NanPattern<Float32>) -> Result<()> {
     }
 }
 
-pub fn match_f64(actual: u64, expected: &NanPattern<Float64>) -> Result<()> {
+pub fn match_f64(actual: u64, expected: &NanPattern<F64>) -> Result<()> {
     match expected {
         // Check if an f64 (as u64 bits to avoid possible quieting when moving values in registers, e.g.
         // https://developer.arm.com/documentation/ddi0344/i/neon-and-vfp-programmers-model/modes-of-operation/default-nan-mode?lang=en)
@@ -331,14 +426,14 @@ fn match_v128(actual: u128, expected: &V128Pattern) -> Result<()> {
         V128Pattern::F32x4(expected) => {
             for (i, expected) in expected.iter().enumerate() {
                 let a = extract_lane_as_i32(actual, i) as u32;
-                match_f32(a, expected).with_context(|| format!("difference in lane {}", i))?;
+                match_f32(a, expected).with_context(|| format!("difference in lane {i}"))?;
             }
             Ok(())
         }
         V128Pattern::F64x2(expected) => {
             for (i, expected) in expected.iter().enumerate() {
                 let a = extract_lane_as_i64(actual, i) as u64;
-                match_f64(a, expected).with_context(|| format!("difference in lane {}", i))?;
+                match_f64(a, expected).with_context(|| format!("difference in lane {i}"))?;
             }
             Ok(())
         }

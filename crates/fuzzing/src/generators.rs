@@ -9,6 +9,7 @@
 //! `Arbitrary` trait for the wrapped external tool.
 
 pub mod api;
+mod async_config;
 mod codegen_settings;
 pub mod component_types;
 mod config;
@@ -17,18 +18,23 @@ mod memory;
 mod module;
 mod pooling_config;
 mod single_inst_module;
-mod spec_test;
 mod stacks;
 pub mod table_ops;
 mod value;
+mod wast_test;
 
+pub use async_config::AsyncConfig;
 pub use codegen_settings::CodegenSettings;
+pub use config::CompilerStrategy;
 pub use config::{Config, WasmtimeConfig};
 pub use instance_allocation_strategy::InstanceAllocationStrategy;
-pub use memory::{MemoryConfig, NormalMemoryConfig, UnalignedMemory, UnalignedMemoryCreator};
+pub use memory::{
+    HeapImage, MemoryAccesses, MemoryConfig, NormalMemoryConfig, UnalignedMemory,
+    UnalignedMemoryCreator,
+};
 pub use module::ModuleConfig;
 pub use pooling_config::PoolingAllocationConfig;
 pub use single_inst_module::SingleInstModule;
-pub use spec_test::SpecTest;
 pub use stacks::Stacks;
 pub use value::{DiffValue, DiffValueType};
+pub use wast_test::WastTest;

@@ -7,7 +7,7 @@
 ;; A variant of the main lowering constructor term, used for branches.
 ;; The only difference is that it gets an extra argument holding a vector
 ;; of branch targets to be used.
-(decl partial lower_branch (Inst VecMachLabel) Unit)
+(decl partial lower_branch (Inst MachLabelSlice) Unit)
 
 
 ;;;; Rules for `iconst` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -18,7 +18,7 @@
 
 ;;;; Rules for `f32const` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(rule (lower (f32const (u64_from_ieee32 x)))
+(rule (lower (f32const (u32_from_ieee32 x)))
       (imm $F32 x))
 
 
@@ -32,12 +32,6 @@
 
 (rule (lower (has_type ty (vconst (u128_from_constant x))))
       (vec_imm ty (be_vec_const ty x)))
-
-
-;;;; Rules for `null` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(rule (lower (has_type ty (null)))
-      (imm ty 0))
 
 
 ;;;; Rules for `nop` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -137,6 +131,14 @@
         (vec_pack_lane_order (vec_widen_type ty)
                              (vec_add ty x (vec_lshr_by_byte x size))
                              (vec_add ty y (vec_lshr_by_byte y size)))))
+
+;; special case for the `i32x4.dot_i16x8_s` wasm instruction
+(rule 1 (lower
+        (has_type dst_ty (iadd_pairwise
+                           (imul (swiden_low x @ (value_type src_ty)) (swiden_low y))
+                           (imul (swiden_high x) (swiden_high y)))))
+      (vec_add dst_ty (vec_smul_even src_ty x y)
+                      (vec_smul_odd src_ty x y)))
 
 
 ;;;; Rules for `isub` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -239,9 +241,19 @@
 ;;;; Rules for `umax` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Unsigned maximum of two scalar integers - expand to icmp + select.
-(rule 1 (lower (has_type (ty_int ty) (umax x y)))
-      (let ((cond ProducesBool (icmp_val $false (IntCC.UnsignedLessThan) x y)))
-        (select_bool_reg ty cond y x)))
+(rule 2 (lower (has_type (fits_in_64 ty) (umax x y)))
+      (let ((x_ext Reg (put_in_reg_zext32 x))
+            (y_ext Reg (put_in_reg_zext32 y))
+            (cond ProducesBool (bool (icmpu_reg (ty_ext32 ty) x_ext y_ext)
+                                     (intcc_as_cond (IntCC.UnsignedLessThan)))))
+        (select_bool_reg ty cond y_ext x_ext)))
+
+;; Unsigned maximum of two 128-bit integers - expand to icmp + select.
+(rule 1 (lower (has_type $I128 (umax x y)))
+      (let ((x_reg Reg (put_in_reg x))
+            (y_reg Reg (put_in_reg y))
+            (cond ProducesBool (vec_int128_ucmphi y_reg x_reg)))
+        (select_bool_reg $I128 cond y_reg x_reg)))
 
 ;; Unsigned maximum of two vector registers.
 (rule 0 (lower (has_type (ty_vec128 ty) (umax x y)))
@@ -251,9 +263,19 @@
 ;;;; Rules for `umin` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Unsigned minimum of two scalar integers - expand to icmp + select.
-(rule 1 (lower (has_type (ty_int ty) (umin x y)))
-      (let ((cond ProducesBool (icmp_val $false (IntCC.UnsignedGreaterThan) x y)))
-        (select_bool_reg ty cond y x)))
+(rule 2 (lower (has_type (fits_in_64 ty) (umin x y)))
+      (let ((x_ext Reg (put_in_reg_zext32 x))
+            (y_ext Reg (put_in_reg_zext32 y))
+            (cond ProducesBool (bool (icmpu_reg (ty_ext32 ty) x_ext y_ext)
+                                     (intcc_as_cond (IntCC.UnsignedGreaterThan)))))
+        (select_bool_reg ty cond y_ext x_ext)))
+
+;; Unsigned maximum of two 128-bit integers - expand to icmp + select.
+(rule 1 (lower (has_type $I128 (umin x y)))
+      (let ((x_reg Reg (put_in_reg x))
+            (y_reg Reg (put_in_reg y))
+            (cond ProducesBool (vec_int128_ucmphi x_reg y_reg)))
+        (select_bool_reg $I128 cond y_reg x_reg)))
 
 ;; Unsigned minimum of two vector registers.
 (rule 0 (lower (has_type (ty_vec128 ty) (umin x y)))
@@ -263,9 +285,19 @@
 ;;;; Rules for `smax` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Signed maximum of two scalar integers - expand to icmp + select.
-(rule 1 (lower (has_type (ty_int ty) (smax x y)))
-      (let ((cond ProducesBool (icmp_val $false (IntCC.SignedLessThan) x y)))
-        (select_bool_reg ty cond y x)))
+(rule 2 (lower (has_type (fits_in_64 ty) (smax x y)))
+      (let ((x_ext Reg (put_in_reg_sext32 x))
+            (y_ext Reg (put_in_reg_sext32 y))
+            (cond ProducesBool (bool (icmps_reg (ty_ext32 ty) x_ext y_ext)
+                                     (intcc_as_cond (IntCC.SignedLessThan)))))
+        (select_bool_reg ty cond y_ext x_ext)))
+
+;; Signed maximum of two 128-bit integers - expand to icmp + select.
+(rule 1 (lower (has_type $I128 (smax x y)))
+      (let ((x_reg Reg (put_in_reg x))
+            (y_reg Reg (put_in_reg y))
+            (cond ProducesBool (vec_int128_scmphi y_reg x_reg)))
+        (select_bool_reg $I128 cond y_reg x_reg)))
 
 ;; Signed maximum of two vector registers.
 (rule (lower (has_type (ty_vec128 ty) (smax x y)))
@@ -275,9 +307,19 @@
 ;;;; Rules for `smin` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Signed minimum of two scalar integers - expand to icmp + select.
-(rule 1 (lower (has_type (ty_int ty) (smin x y)))
-      (let ((cond ProducesBool (icmp_val $false (IntCC.SignedGreaterThan) x y)))
-        (select_bool_reg ty cond y x)))
+(rule 2 (lower (has_type (fits_in_64 ty) (smin x y)))
+      (let ((x_ext Reg (put_in_reg_sext32 x))
+            (y_ext Reg (put_in_reg_sext32 y))
+            (cond ProducesBool (bool (icmps_reg (ty_ext32 ty) x_ext y_ext)
+                                     (intcc_as_cond (IntCC.SignedGreaterThan)))))
+        (select_bool_reg ty cond y_ext x_ext)))
+
+;; Signed maximum of two 128-bit integers - expand to icmp + select.
+(rule 1 (lower (has_type $I128 (smin x y)))
+      (let ((x_reg Reg (put_in_reg x))
+            (y_reg Reg (put_in_reg y))
+            (cond ProducesBool (vec_int128_scmphi x_reg y_reg)))
+        (select_bool_reg $I128 cond y_reg x_reg)))
 
 ;; Signed minimum of two vector registers.
 (rule (lower (has_type (ty_vec128 ty) (smin x y)))
@@ -360,13 +402,22 @@
             (y_hi Reg (vec_extract_lane $I64X2 y 0 (zero_reg)))
             (y_lo Reg (vec_extract_lane $I64X2 y 1 (zero_reg)))
             (lo_pair RegPair (umul_wide x_lo y_lo))
-            (res_lo Reg (copy_reg $I64 (regpair_lo lo_pair)))
-            (res_hi_1 Reg (copy_reg $I64 (regpair_hi lo_pair)))
+            (res_lo Reg (regpair_lo lo_pair))
+            (res_hi_1 Reg (regpair_hi lo_pair))
             (res_hi_2 Reg (mul_reg $I64 x_lo y_hi))
             (res_hi_3 Reg (mul_reg $I64 x_hi y_lo))
             (res_hi Reg (add_reg $I64 res_hi_3 (add_reg $I64 res_hi_2 res_hi_1))))
         (mov_to_vec128 $I64X2 res_hi res_lo)))
 
+;; Special-case the lowering of a 128-bit multiply where the operands are sign
+;; or zero extended. This maps directly to `umul_wide` and `smul_wide`.
+(rule 16 (lower (has_type $I128 (imul (uextend x) (uextend y))))
+  (let ((pair RegPair (umul_wide (put_in_reg_zext64 x) (put_in_reg_zext64 y))))
+    (mov_to_vec128 $I64X2 (regpair_hi pair) (regpair_lo pair))))
+
+(rule 16 (lower (has_type $I128 (imul (sextend x) (sextend y))))
+  (let ((pair RegPair (smul_wide (put_in_reg_sext64 x) (put_in_reg_sext64 y))))
+    (mov_to_vec128 $I64X2 (regpair_hi pair) (regpair_lo pair))))
 
 ;;;; Rules for `umulhi` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -387,7 +438,7 @@
 ;; Multiply high part unsigned, 64-bit types.  (Uses umul_wide.)
 (rule (lower (has_type $I64 (umulhi x y)))
       (let ((pair RegPair (umul_wide x y)))
-        (copy_reg $I64 (regpair_hi pair))))
+        (regpair_hi pair)))
 
 ;; Multiply high part unsigned, vector types with 8-, 16-, or 32-bit elements.
 (rule (lower (has_type $I8X16 (umulhi x y))) (vec_umulhi $I8X16 x y))
@@ -399,10 +450,10 @@
 (rule (lower (has_type $I64X2 (umulhi x y)))
       (let ((pair_0 RegPair (umul_wide (vec_extract_lane $I64X2 x 0 (zero_reg))
                                        (vec_extract_lane $I64X2 y 0 (zero_reg))))
-            (res_0 Reg (copy_reg $I64 (regpair_hi pair_0)))
+            (res_0 Reg (regpair_hi pair_0))
             (pair_1 RegPair (umul_wide (vec_extract_lane $I64X2 x 1 (zero_reg))
                                        (vec_extract_lane $I64X2 y 1 (zero_reg))))
-            (res_1 Reg (copy_reg $I64 (regpair_hi pair_1))))
+            (res_1 Reg (regpair_hi pair_1)))
         (mov_to_vec128 $I64X2 res_0 res_1)))
 
 
@@ -425,7 +476,7 @@
 ;; Multiply high part signed, 64-bit types.  (Uses smul_wide.)
 (rule (lower (has_type $I64 (smulhi x y)))
       (let ((pair RegPair (smul_wide x y)))
-        (copy_reg $I64 (regpair_hi pair))))
+        (regpair_hi pair)))
 
 ;; Multiply high part signed, vector types with 8-, 16-, or 32-bit elements.
 (rule (lower (has_type $I8X16 (smulhi x y))) (vec_smulhi $I8X16 x y))
@@ -440,17 +491,8 @@
             (res_0 Reg (copy_reg $I64 (regpair_hi pair_0)))
             (pair_1 RegPair (smul_wide (vec_extract_lane $I64X2 x 1 (zero_reg))
                                        (vec_extract_lane $I64X2 y 1 (zero_reg))))
-            (res_1 Reg (copy_reg $I64 (regpair_hi pair_1))))
+            (res_1 Reg (regpair_hi pair_1)))
         (mov_to_vec128 $I64X2 res_0 res_1)))
-
-
-;;;; Rules for `widening_pairwise_dot_product_s` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; Widening pairwise dot product of two vector registers.
-(rule (lower (has_type dst_ty (widening_pairwise_dot_product_s
-                                 x @ (value_type src_ty) y)))
-      (vec_add dst_ty (vec_smul_even src_ty x y)
-                      (vec_smul_odd src_ty x y)))
 
 
 ;;;; Rules for `sqmul_round_sat` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -495,9 +537,9 @@
 
 ;; Implement `udiv`.
 (rule (lower (has_type (fits_in_64 ty) (udiv x y)))
-      (let (;; Look at the divisor to determine whether we need to generate
+      (let (
+            ;; Look at the divisor to determine whether we need to generate
             ;; an explicit division-by zero check.
-            (DZcheck bool (zero_divisor_check_needed y))
             ;; Load up the dividend, by loading the input (possibly zero-
             ;; extended) input into the low half of the register pair,
             ;; and setting the high half to zero.
@@ -506,49 +548,20 @@
             ;; Load up the divisor, zero-extended if necessary.
             (ext_y Reg (put_in_reg_zext32 y))
             (ext_ty Type (ty_ext32 ty))
-            ;; Now actually perform the division-by zero check if necessary.
-            ;; This cannot be done earlier than here, because the check
-            ;; requires an already extended divisor value.
-            (_ Reg (maybe_trap_if_zero_divisor DZcheck ext_ty ext_y))
             ;; Emit the actual divide instruction.
             (pair RegPair (udivmod ext_ty ext_x ext_y)))
         ;; The quotient can be found in the low half of the result.
-        (copy_reg ty (regpair_lo pair))))
+        (regpair_lo pair)))
 
 ;; Implement `urem`.  Same as `udiv`, but finds the remainder in
 ;; the high half of the result register pair instead.
 (rule (lower (has_type (fits_in_64 ty) (urem x y)))
-      (let ((DZcheck bool (zero_divisor_check_needed y))
-            (ext_x RegPair (regpair (imm (ty_ext32 ty) 0)
+      (let ((ext_x RegPair (regpair (imm (ty_ext32 ty) 0)
                                     (put_in_reg_zext32 x)))
             (ext_y Reg (put_in_reg_zext32 y))
             (ext_ty Type (ty_ext32 ty))
-            (_ Reg (maybe_trap_if_zero_divisor DZcheck ext_ty ext_y))
             (pair RegPair (udivmod ext_ty ext_x ext_y)))
-        (copy_reg ty (regpair_hi pair))))
-
-;; Determine whether we need to perform a divide-by-zero-check.
-;;
-;; If the `avoid_div_traps` flag is false, we never need to perform
-;; that check; we can rely on the divide instruction itself to trap.
-;;
-;; If the `avoid_div_traps` flag is true, we perform the check explicitly.
-;; This still can be omittted if the divisor is a non-zero immediate.
-(decl zero_divisor_check_needed (Value) bool)
-(rule 2 (zero_divisor_check_needed (i64_from_value x))
-      (if (i64_nonzero x))
-      $false)
-(rule 1 (zero_divisor_check_needed (value_type (allow_div_traps))) $false)
-(rule 0 (zero_divisor_check_needed _) $true)
-
-;; Perform the divide-by-zero check if required.
-;; This is simply a compare-and-trap of the (extended) divisor against 0.
-(decl maybe_trap_if_zero_divisor (bool Type Reg) Reg)
-(rule (maybe_trap_if_zero_divisor $false _ _) (invalid_reg))
-(rule (maybe_trap_if_zero_divisor $true ext_ty reg)
-      (icmps_simm16_and_trap ext_ty reg 0
-                             (intcc_as_cond (IntCC.Equal))
-                             (trap_code_division_by_zero)))
+        (regpair_hi pair)))
 
 
 ;;;; Rules for `sdiv` and `srem` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -569,45 +582,41 @@
 
 ;; Implement `sdiv`.
 (rule (lower (has_type (fits_in_64 ty) (sdiv x y)))
-      (let (;; Look at the divisor to determine whether we need to generate
+      (let (
+            ;; Look at the divisor to determine whether we need to generate
             ;; explicit division-by-zero and/or integer-overflow checks.
-            (DZcheck bool (zero_divisor_check_needed y))
             (OFcheck bool (div_overflow_check_needed y))
             ;; Load up the dividend (sign-extended to 64-bit)
             (ext_x Reg (put_in_reg_sext64 x))
             ;; Load up the divisor (sign-extended if necessary).
             (ext_y Reg (put_in_reg_sext32 y))
             (ext_ty Type (ty_ext32 ty))
-            ;; Perform division-by-zero check (same as for `udiv`).
-            (_ Reg (maybe_trap_if_zero_divisor DZcheck ext_ty ext_y))
             ;; Perform integer-overflow check if necessary.
             (_ Reg (maybe_trap_if_sdiv_overflow OFcheck ext_ty ty ext_x ext_y))
             ;; Emit the actual divide instruction.
             (pair RegPair (sdivmod ext_ty ext_x ext_y)))
         ;; The quotient can be found in the low half of the result.
-        (copy_reg ty (regpair_lo pair))))
+        (regpair_lo pair)))
 
 ;; Implement `srem`.  Same as `sdiv`, but finds the remainder in
 ;; the high half of the result register pair instead.  Also, handle
 ;; the integer overflow case differently, see below.
 (rule (lower (has_type (fits_in_64 ty) (srem x y)))
-      (let ((DZcheck bool (zero_divisor_check_needed y))
-            (OFcheck bool (div_overflow_check_needed y))
+      (let ((OFcheck bool (div_overflow_check_needed y))
             (ext_x Reg (put_in_reg_sext64 x))
             (ext_y Reg (put_in_reg_sext32 y))
             (ext_ty Type (ty_ext32 ty))
-            (_ Reg (maybe_trap_if_zero_divisor DZcheck ext_ty ext_y))
             (checked_x Reg (maybe_avoid_srem_overflow OFcheck ext_ty ext_x ext_y))
             (pair RegPair (sdivmod ext_ty checked_x ext_y)))
-        (copy_reg ty (regpair_hi pair))))
+        (regpair_hi pair)))
 
 ;; Determine whether we need to perform an integer-overflow check.
 ;;
 ;; We never rely on the divide instruction itself to trap; while that trap
 ;; would indeed happen, we have no way of signalling two different trap
-;; conditions from the same instruction.  By explicity checking for the
+;; conditions from the same instruction.  By explicitly checking for the
 ;; integer-overflow case ahead of time, any hardware trap in the divide
-;; instruction is guaranteed to indicate divison-by-zero.
+;; instruction is guaranteed to indicate division-by-zero.
 ;;
 ;; In addition, for types smaller than 64 bits we would have to perform
 ;; the check explicitly anyway, since the instruction provides a 64-bit
@@ -619,8 +628,8 @@
 (decl div_overflow_check_needed (Value) bool)
 (rule 1 (div_overflow_check_needed (i64_from_value x))
       (if (i64_not_neg1 x))
-      $false)
-(rule (div_overflow_check_needed _) $true)
+      false)
+(rule (div_overflow_check_needed _) true)
 
 ;; Perform the integer-overflow check if necessary.   This implements:
 ;;
@@ -632,8 +641,8 @@
 ;;
 ;; instead, using a single conditional trap instruction.
 (decl maybe_trap_if_sdiv_overflow (bool Type Type Reg Reg) Reg)
-(rule (maybe_trap_if_sdiv_overflow $false ext_ty _ _ _) (invalid_reg))
-(rule (maybe_trap_if_sdiv_overflow $true ext_ty ty x y)
+(rule (maybe_trap_if_sdiv_overflow false ext_ty _ _ _) (invalid_reg))
+(rule (maybe_trap_if_sdiv_overflow true ext_ty ty x y)
       (let ((int_max Reg (imm ext_ty (int_max ty)))
             (reg Reg (and_reg ext_ty (xor_reg ext_ty int_max x) y)))
         (icmps_simm16_and_trap ext_ty reg -1
@@ -660,9 +669,9 @@
 ;; at all in this case, but that would require introducing
 ;; control flow.)
 (decl maybe_avoid_srem_overflow (bool Type Reg Reg) Reg)
-(rule (maybe_avoid_srem_overflow $false _ x _) x)
-(rule (maybe_avoid_srem_overflow $true $I32 x _) x)
-(rule (maybe_avoid_srem_overflow $true $I64 x y)
+(rule (maybe_avoid_srem_overflow false _ x _) x)
+(rule (maybe_avoid_srem_overflow true $I32 x _) x)
+(rule (maybe_avoid_srem_overflow true $I64 x y)
       (with_flags_reg (icmps_simm16 $I64 y -1)
                       (cmov_imm $I64 (intcc_as_cond (IntCC.Equal)) 0 x)))
 
@@ -892,14 +901,14 @@
       (put_in_reg_zext64 x))
 
 ;; 128-bit target types.
-(rule (lower (has_type (vr128_ty ty) (uextend x @ (value_type $I8))))
-      (vec_insert_lane $I8X16 (vec_imm ty 0) x 15 (zero_reg)))
-(rule (lower (has_type (vr128_ty ty) (uextend x @ (value_type $I16))))
-      (vec_insert_lane $I16X8 (vec_imm ty 0) x 7 (zero_reg)))
-(rule (lower (has_type (vr128_ty ty) (uextend x @ (value_type $I32))))
-      (vec_insert_lane $I32X4 (vec_imm ty 0) x 3 (zero_reg)))
-(rule (lower (has_type (vr128_ty ty) (uextend x @ (value_type $I64))))
-      (vec_insert_lane $I64X2 (vec_imm ty 0) x 1 (zero_reg)))
+(rule (lower (has_type $I128 (uextend x @ (value_type $I8))))
+      (vec_insert_lane $I8X16 (vec_imm $I128 0) x 15 (zero_reg)))
+(rule (lower (has_type $I128 (uextend x @ (value_type $I16))))
+      (vec_insert_lane $I16X8 (vec_imm $I128 0) x 7 (zero_reg)))
+(rule (lower (has_type $I128 (uextend x @ (value_type $I32))))
+      (vec_insert_lane $I32X4 (vec_imm $I128 0) x 3 (zero_reg)))
+(rule (lower (has_type $I128 (uextend x @ (value_type $I64))))
+      (vec_insert_lane $I64X2 (vec_imm $I128 0) x 1 (zero_reg)))
 
 
 ;;;; Rules for `sextend` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -913,9 +922,9 @@
       (put_in_reg_sext64 x))
 
 ;; 128-bit target types.
-(rule (lower (has_type (vr128_ty ty) (sextend x)))
+(rule (lower (has_type $I128 (sextend x)))
       (let ((x_ext Reg (put_in_reg_sext64 x)))
-        (mov_to_vec128 ty (ashr_imm $I64 x_ext 63) x_ext)))
+        (mov_to_vec128 $I128 (ashr_imm $I64 x_ext 63) x_ext)))
 
 
 ;;;; Rules for `snarrow` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -1130,12 +1139,12 @@
 (rule (lower (has_type (vr128_ty ty) (bitselect x y z)))
       (vec_select ty y z x))
 
+;; Special-case some float-selection instructions for min/max
+(rule 3 (lower (has_type (ty_vec128 ty) (bitselect (bitcast _ (fcmp (FloatCC.LessThan) x y)) x y)))
+        (fmin_pseudo_reg ty y x))
+(rule 4 (lower (has_type (ty_vec128 ty) (bitselect (bitcast _ (fcmp (FloatCC.LessThan) y x)) x y)))
+        (fmax_pseudo_reg ty y x))
 
-;;;; Rules for `vselect` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; Vector select.
-(rule (lower (has_type (ty_vec128 ty) (vselect x y z)))
-      (vec_select ty y z x))
 
 
 ;;;; Rules for `bmask` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -1193,7 +1202,7 @@
 (rule (clz_offset $I8 x) (add_simm16 $I8 x -56))
 (rule (clz_offset $I16 x) (add_simm16 $I16 x -48))
 (rule (clz_offset $I32 x) (add_simm16 $I32 x -32))
-(rule (clz_offset $I64 x) (copy_reg $I64 x))
+(rule (clz_offset $I64 x) x)
 
 ;; Count leading zeros, via FLOGR on an input zero-extended to 64 bits,
 ;; with the result compensated for the extra bits.
@@ -1392,20 +1401,6 @@
       (fmax_reg ty x y))
 
 
-;;;; Rules for `fmin_pseudo` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; Minimum of two registers.
-(rule (lower (has_type ty (fmin_pseudo x y)))
-      (fmin_pseudo_reg ty x y))
-
-
-;;;; Rules for `fmax_pseudo` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; Maximum of two registers.
-(rule (lower (has_type ty (fmax_pseudo x y)))
-      (fmax_pseudo_reg ty x y))
-
-
 ;;;; Rules for `fcopysign` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Copysign of two registers.
@@ -1587,14 +1582,6 @@
       (fcvt_from_sint_reg $F64X2 (FpuRoundMode.ToNearestTiesToEven) x))
 
 
-;;;; Rules for `fcvt_low_from_sint` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; Convert the low half of a $I32X4 to a $F64X2.
-(rule (lower (has_type $F64X2 (fcvt_low_from_sint x @ (value_type $I32X4))))
-      (fcvt_from_sint_reg $F64X2 (FpuRoundMode.ToNearestTiesToEven)
-                          (vec_unpacks_low_lane_order $I32X4 x)))
-
-
 ;;;; Rules for `fcvt_to_uint` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Convert a scalar floating-point value in a register to an unsigned integer.
@@ -1746,17 +1733,21 @@
 
 ;; Bitcast between types residing in GPRs is a no-op.
 (rule 1 (lower (has_type (gpr32_ty _)
-                         (bitcast _ x @ (value_type (gpr32_ty _))))) x)
+                         (bitcast _ x @ (value_type (gpr32_ty _)))))
+      x)
 (rule 2 (lower (has_type (gpr64_ty _)
-                         (bitcast _ x @ (value_type (gpr64_ty _))))) x)
+                         (bitcast _ x @ (value_type (gpr64_ty _)))))
+      x)
 
 ;; Bitcast between types residing in FPRs is a no-op.
 (rule 3 (lower (has_type (ty_scalar_float _)
-                         (bitcast _ x @ (value_type (ty_scalar_float _))))) x)
+                         (bitcast _ x @ (value_type (ty_scalar_float _)))))
+      x)
 
 ;; Bitcast between types residing in VRs is a no-op if lane count is unchanged.
 (rule 5 (lower (has_type (multi_lane bits count)
-                         (bitcast _ x @ (value_type (multi_lane bits count))))) x)
+                         (bitcast _ x @ (value_type (multi_lane bits count)))))
+      x)
 
 ;; Bitcast between types residing in VRs with different lane counts is a
 ;; no-op if the operation's MemFlags indicate a byte order compatible with
@@ -2289,10 +2280,12 @@
 (decl lib_call_tls_get_offset (Reg Reg SymbolReloc) Reg)
 (rule (lib_call_tls_get_offset got got_offset symbol)
       (let ((tls_offset WritableReg (temp_writable_reg $I64))
-            (libcall LibCallInfo (lib_call_info_tls_get_offset tls_offset got got_offset symbol))
-            (_ Unit (lib_accumulate_outgoing_args_size libcall))
-            (_ InstOutput (side_effect (lib_call libcall))))
+            (_ Unit (abi_for_elf_tls_get_offset))
+            (_ Unit (emit (MInst.ElfTlsGetOffset tls_offset got got_offset symbol))))
         tls_offset))
+
+(decl abi_for_elf_tls_get_offset () Unit)
+(extern constructor abi_for_elf_tls_get_offset abi_for_elf_tls_get_offset)
 
 ;; Helper to extract the current thread pointer from %a0/%a1.
 (decl thread_pointer () Reg)
@@ -2328,14 +2321,6 @@
 
 ;; Load 64-bit little-endian integers.
 (rule -1 (lower (has_type $I64 (load flags @ (littleendian) addr offset)))
-      (loadrev64 (lower_address flags addr offset)))
-
-;; Load 64-bit big-endian references.
-(rule (lower (has_type $R64 (load flags @ (bigendian) addr offset)))
-      (load64 (lower_address flags addr offset)))
-
-;; Load 64-bit little-endian references.
-(rule -1 (lower (has_type $R64 (load flags @ (littleendian) addr offset)))
       (loadrev64 (lower_address flags addr offset)))
 
 ;; Load 32-bit big-endian floating-point values (as vector lane).
@@ -2654,10 +2639,6 @@
 
 ;; Store 64-bit integer type, main lowering entry point.
 (rule (lower (store flags val @ (value_type $I64) addr offset))
-      (side_effect (istore64_impl flags val addr offset)))
-
-;; Store 64-bit reference type, main lowering entry point.
-(rule (lower (store flags val @ (value_type $R64) addr offset))
       (side_effect (istore64_impl flags val addr offset)))
 
 ;; Store 32-bit big-endian floating-point type (as vector lane).
@@ -3300,7 +3281,7 @@
 ;; integer comparison and immediately lower it to a 0/1 integer result.
 ;; In this case, it is safe to sink memory loads.
 (rule -1 (lower (has_type (fits_in_64 ty) (icmp int_cc x y)))
-      (lower_bool ty (icmp_val $true int_cc x y)))
+      (lower_bool ty (icmp_val true int_cc x y)))
 
 
 ;; Return a `ProducesBool` to implement any integer comparison.
@@ -3334,17 +3315,17 @@
       (icmps_simm32 (ty_ext32 ty) (put_in_reg_sext32 x) y))
 
 ;; Compare (signed) a register and memory (32/64-bit types).
-(rule 4 (icmps_val $true x @ (value_type (fits_in_64 ty)) (sinkable_load_32_64 y))
+(rule 4 (icmps_val true x @ (value_type (fits_in_64 ty)) (sinkable_load_32_64 y))
       (icmps_mem ty x (sink_load y)))
 
 ;; Compare (signed) a register and memory (16-bit types).
-(rule 5 (icmps_val $true x @ (value_type (fits_in_64 ty)) (sinkable_load_16 y))
+(rule 5 (icmps_val true x @ (value_type (fits_in_64 ty)) (sinkable_load_16 y))
       (icmps_mem_sext16 (ty_ext32 ty) (put_in_reg_sext32 x) (sink_load y)))
 
 ;; Compare (signed) a register and sign-extended memory.
-(rule 4 (icmps_val $true x @ (value_type (fits_in_64 ty)) (sinkable_sload16 y))
+(rule 4 (icmps_val true x @ (value_type (fits_in_64 ty)) (sinkable_sload16 y))
       (icmps_mem_sext16 ty x (sink_sload16 y)))
-(rule 4 (icmps_val $true x @ (value_type (fits_in_64 ty)) (sinkable_sload32 y))
+(rule 4 (icmps_val true x @ (value_type (fits_in_64 ty)) (sinkable_sload32 y))
       (icmps_mem_sext32 ty x (sink_sload32 y)))
 
 
@@ -3364,13 +3345,13 @@
       (icmpu_uimm32 (ty_ext32 ty) (put_in_reg_zext32 x) y))
 
 ;; Compare (unsigned) a register and memory (32/64-bit types).
-(rule 4 (icmpu_val $true x @ (value_type (fits_in_64 ty)) (sinkable_load_32_64 y))
+(rule 4 (icmpu_val true x @ (value_type (fits_in_64 ty)) (sinkable_load_32_64 y))
       (icmpu_mem ty x (sink_load y)))
 
 ;; Compare (unsigned) a register and memory (16-bit types).
 ;; Note that the ISA only provides instructions with a PC-relative memory
 ;; address here, so we need to check whether the sinkable load matches this.
-(rule 3 (icmpu_val $true x @ (value_type (fits_in_64 ty))
+(rule 3 (icmpu_val true x @ (value_type (fits_in_64 ty))
                  (sinkable_load_16 ld))
       (if-let y (load_sym ld))
       (icmpu_mem_zext16 (ty_ext32 ty) (put_in_reg_zext32 x) (sink_load y)))
@@ -3378,11 +3359,11 @@
 ;; Compare (unsigned) a register and zero-extended memory.
 ;; Note that the ISA only provides instructions with a PC-relative memory
 ;; address here, so we need to check whether the sinkable load matches this.
-(rule 3 (icmpu_val $true x @ (value_type (fits_in_64 ty))
+(rule 3 (icmpu_val true x @ (value_type (fits_in_64 ty))
                  (sinkable_uload16 ld))
       (if-let y (uload16_sym ld))
       (icmpu_mem_zext16 ty x (sink_uload16 y)))
-(rule 3 (icmpu_val $true x @ (value_type (fits_in_64 ty)) (sinkable_uload32 y))
+(rule 3 (icmpu_val true x @ (value_type (fits_in_64 ty)) (sinkable_uload32 y))
       (icmpu_mem_zext32 ty x (sink_uload32 y)))
 
 
@@ -3692,20 +3673,6 @@
         (vec_extract_lane $I64X2 (vec_bitpermute x mask) 0 (zero_reg))))
 
 
-;;;; Rules for `is_null` and `is_invalid`  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; Null references are represented by the constant value 0.
-(rule (lower (has_type $I8 (is_null x @ (value_type $R64))))
-      (lower_bool $I8 (bool (icmps_simm16 $I64 x 0)
-                            (intcc_as_cond (IntCC.Equal)))))
-
-
-;; Invalid references are represented by the constant value -1.
-(rule (lower (has_type $I8 (is_invalid x @ (value_type $R64))))
-      (lower_bool $I8 (bool (icmps_simm16 $I64 x -1)
-                            (intcc_as_cond (IntCC.Equal)))))
-
-
 ;;;; Rules for `select` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Return a `ProducesBool` to capture the fact that the input value is nonzero.
@@ -3713,7 +3680,7 @@
 ;; instruction, directly use that compare. Note that it is not safe to sink
 ;; memory loads here, see the `icmp` comment.
 (decl value_nonzero (Value) ProducesBool)
-(rule (value_nonzero (icmp int_cc x y)) (icmp_val $false int_cc x y))
+(rule (value_nonzero (icmp int_cc x y)) (icmp_val false int_cc x y))
 (rule (value_nonzero (fcmp float_cc x y)) (fcmp_val float_cc x y))
 (rule -1 (value_nonzero val @ (value_type (gpr32_ty ty)))
       (bool (icmps_simm16 $I32 (put_in_reg_sext32 val) 0)
@@ -3729,6 +3696,12 @@
 (rule (lower (has_type ty (select val_cond val_true val_false)))
       (select_bool_reg ty (value_nonzero val_cond)
                        (put_in_reg val_true) (put_in_reg val_false)))
+
+;; Special-case some float-selection instructions for min/max
+(rule 1 (lower (has_type (ty_scalar_float ty) (select (maybe_uextend (fcmp (FloatCC.LessThan) x y)) x y)))
+        (fmin_pseudo_reg ty y x))
+(rule 2 (lower (has_type (ty_scalar_float ty) (select (maybe_uextend (fcmp (FloatCC.LessThan) y x)) x y)))
+        (fmax_pseudo_reg ty y x))
 
 
 ;;;; Rules for `select_spectre_guard` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3746,28 +3719,25 @@
 
 ;; Unconditional branch.  The target is found as first (and only) element in
 ;; the list of the current block's branch targets passed as `targets`.
-(rule (lower_branch (jump _) targets)
-      (emit_side_effect (jump_impl (vec_element targets 0))))
+(rule (lower_branch (jump _) (single_target label))
+      (emit_side_effect (jump_impl label)))
 
 
 ;;;; Rules for `br_table` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Jump table.  `targets` contains the default target followed by the
 ;; list of branch targets per index value.
-(rule (lower_branch (br_table val_idx _) targets)
+(rule (lower_branch (br_table val_idx _) (jump_table_targets default targets))
       (let ((idx Reg (put_in_reg_zext64 val_idx))
-            ;; Bounds-check the index and branch to default.
-            ;; This is an internal branch that is not a terminator insn.
-            ;; Instead, the default target is listed a potential target
-            ;; in the final JTSequence, which is the block terminator.
+            ;; Bounds-check the index and create a ProducesBool that
+            ;; denotes the "default target" condition.
             (cond ProducesBool
-              (bool (icmpu_uimm32 $I64 idx (vec_length_minus1 targets))
-                    (intcc_as_cond (IntCC.UnsignedGreaterThanOrEqual))))
-            (_ Unit (emit_side_effect (oneway_cond_br_bool cond
-                                        (vec_element targets 0)))))
+              (bool (icmpu_uimm32 $I64 idx (jump_table_size targets))
+                    (intcc_as_cond (IntCC.UnsignedGreaterThanOrEqual)))))
         ;; Scale the index by the element size, and then emit the
         ;; compound instruction that does:
         ;;
+        ;; [cond branch to default]
         ;; larl %r1, <jt-base>
         ;; agf %r1, 0(%r1, %rScaledIndex)
         ;; br %r1
@@ -3779,7 +3749,8 @@
         ;; PC-rel offset to the jumptable would be incorrect.
         ;; (The alternative is to introduce a relocation pass
         ;; for inlined jumptables, which is much worse, IMHO.)
-        (emit_side_effect (jt_sequence (lshl_imm $I64 idx 2) targets))))
+        (let ((shifted_idx Reg (lshl_imm $I64 idx 2)))
+          (emit_side_effect (jt_sequence_default_bool shifted_idx default cond targets)))))
 
 
 ;;;; Rules for `brif` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3787,21 +3758,13 @@
 ;; Two-way conditional branch on nonzero.  `targets` contains:
 ;; - element 0: target if the condition is true (i.e. value is nonzero)
 ;; - element 1: target if the condition is false (i.e. value is zero)
-(rule (lower_branch (brif val_cond _ _) targets)
-      (emit_side_effect (cond_br_bool (value_nonzero val_cond)
-                                      (vec_element targets 0)
-                                      (vec_element targets 1))))
+(rule (lower_branch (brif val_cond _ _) (two_targets then else))
+      (emit_side_effect (cond_br_bool (value_nonzero val_cond) then else)))
 
 
 ;;;; Rules for `trap` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (trap trap_code))
-      (side_effect (trap_impl trap_code)))
-
-
-;;;; Rules for `resumable_trap` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(rule (lower (resumable_trap trap_code))
       (side_effect (trap_impl trap_code)))
 
 
@@ -3814,12 +3777,6 @@
 ;;;; Rules for `trapnz` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (trapnz val trap_code))
-      (side_effect (trap_if_bool (value_nonzero val) trap_code)))
-
-
-;;;; Rules for `resumable_trapnz` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(rule (lower (resumable_trapnz val trap_code))
       (side_effect (trap_if_bool (value_nonzero val) trap_code)))
 
 
@@ -3840,7 +3797,7 @@
 ;; a condition mask of 2 | 1.
 ;;
 ;; As this does not match any of the encodings used with a normal integer
-;; comparsion, this cannot be represented by any IntCC value.  We need to
+;; comparison, this cannot be represented by any IntCC value.  We need to
 ;; remap the IntCC::UnsignedGreaterThan value that we have here as result
 ;; of the unsigned_add_overflow_condition call to the correct mask.
 
@@ -3900,7 +3857,7 @@
 ;;;; Rules for `return` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (return args))
-      (lower_return (range 0 (value_slice_len args)) args))
+      (lower_return args))
 
 
 ;;;; Rules for `call` and `call_indirect` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3908,21 +3865,19 @@
 ;; Direct call to an in-range function.
 (rule 1 (lower (call (func_ref_data sig_ref name (reloc_distance_near)) args))
       (let ((abi Sig (abi_sig sig_ref))
-            (_ Unit (abi_accumulate_outgoing_args_size abi))
             (uses CallArgList (lower_call_args abi (range 0 (abi_num_args abi)) args))
             (defs CallRetList (defs_init abi))
-            (_ InstOutput (side_effect (abi_call abi name uses defs (Opcode.Call)))))
+            (_ InstOutput (side_effect (abi_call abi name uses defs))))
         (lower_call_rets abi defs (range (abi_first_ret sig_ref abi)
                                          (abi_num_rets abi)) (output_builder_new))))
 
 ;; Direct call to an out-of-range function (implicitly via pointer).
 (rule (lower (call (func_ref_data sig_ref name _) args))
       (let ((abi Sig (abi_sig sig_ref))
-            (_ Unit (abi_accumulate_outgoing_args_size abi))
             (uses CallArgList (lower_call_args abi (range 0 (abi_num_args abi)) args))
             (defs CallRetList (defs_init abi))
             (target Reg (load_symbol_reloc (SymbolReloc.Absolute name 0)))
-            (_ InstOutput (side_effect (abi_call_ind abi target uses defs (Opcode.Call)))))
+            (_ InstOutput (side_effect (abi_call_ind abi target uses defs))))
         (lower_call_rets abi defs (range (abi_first_ret sig_ref abi)
                                          (abi_num_rets abi)) (output_builder_new))))
 
@@ -3930,10 +3885,9 @@
 (rule (lower (call_indirect sig_ref ptr args))
       (let ((abi Sig (abi_sig sig_ref))
             (target Reg (put_in_reg ptr))
-            (_ Unit (abi_accumulate_outgoing_args_size abi))
             (uses CallArgList (lower_call_args abi (range 0 (abi_num_args abi)) args))
             (defs CallRetList (defs_init abi))
-            (_ InstOutput (side_effect (abi_call_ind abi target uses defs (Opcode.CallIndirect)))))
+            (_ InstOutput (side_effect (abi_call_ind abi target uses defs))))
         (lower_call_rets abi defs (range (abi_first_ret sig_ref abi)
                                          (abi_num_rets abi)) (output_builder_new))))
 
@@ -3941,44 +3895,89 @@
 (decl lower_call_args (Sig Range ValueSlice) CallArgList)
 (rule (lower_call_args abi range args)
       (let ((uses CallArgListBuilder (args_builder_new))
-            (_ InstOutput (lower_call_args_buffer abi range args))
-            (_ InstOutput (lower_call_args_slots abi uses range args))
-            (_ InstOutput (lower_call_ret_arg abi uses)))
+            (stack MemArg (abi_call_stack_args abi))
+            (_ InstOutput (lower_call_args_buffer abi stack range args))
+            (_ InstOutput (lower_call_args_slots abi uses stack range args))
+            (_ InstOutput (lower_call_ret_arg abi uses stack)))
         (args_builder_finish uses)))
-
-;; Lower function arguments (part 1): prepare buffer copies.
-(decl lower_call_args_buffer (Sig Range ValueSlice) InstOutput)
-(rule (lower_call_args_buffer abi (range_empty) _) (output_none))
-(rule (lower_call_args_buffer abi (range_unwrap head tail) args)
-      (let ((_ InstOutput (copy_to_buffer 0 (abi_get_arg abi head)
-                                          (value_slice_get args head))))
-        (lower_call_args_buffer abi tail args)))
-
-;; Lower function arguments (part 2): set up registers / stack slots.
-(decl lower_call_args_slots (Sig CallArgListBuilder Range ValueSlice) InstOutput)
-(rule (lower_call_args_slots abi _ (range_empty) _) (output_none))
-(rule (lower_call_args_slots abi uses (range_unwrap head tail) args)
-      (let ((_ InstOutput (copy_to_arg uses (abi_lane_order abi)
-                                       0 (abi_get_arg abi head)
-                                       (value_slice_get args head))))
-        (lower_call_args_slots abi uses tail args)))
-
-;; Lower function arguments (part 3): implicit return-area pointer.
-(decl lower_call_ret_arg (Sig CallArgListBuilder) InstOutput)
-(rule (lower_call_ret_arg (abi_no_ret_arg) _) (output_none))
-(rule 1 (lower_call_ret_arg abi @ (abi_ret_arg (abi_arg_only_slot slot)) uses)
-      (let ((mem MemArg (memarg_stack_off (abi_sized_stack_arg_space abi) 0)))
-        (copy_reg_to_arg_slot uses (abi_lane_order abi) 0 slot (load_addr mem))))
 
 ;; Lower function return values by collecting them from registers / stack slots.
 (decl lower_call_rets (Sig CallRetList Range InstOutputBuilder) InstOutput)
 (rule (lower_call_rets abi _ (range_empty) builder) (output_builder_finish builder))
 (rule (lower_call_rets abi defs (range_unwrap head tail) builder)
       (let ((ret ValueRegs (copy_from_arg defs (abi_lane_order abi)
-                                          (abi_sized_stack_arg_space abi)
+                                          (abi_call_stack_rets abi)
                                           (abi_get_ret abi head)))
             (_ Unit (output_builder_push builder ret)))
         (lower_call_rets abi defs tail builder)))
+
+
+;;;; Rules for `return_call` and `return_call_indirect` ;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Direct tail call to an in-range function.
+(rule 1 (lower (return_call (func_ref_data sig_ref name (reloc_distance_near)) args))
+      (let ((abi Sig (abi_sig sig_ref))
+            (uses CallArgList (lower_return_call_args abi (range 0 (abi_num_args abi)) args)))
+        (side_effect (abi_return_call abi name uses))))
+
+;; Direct tail call to an out-of-range function (implicitly via pointer).
+(rule (lower (return_call (func_ref_data sig_ref name _) args))
+      (let ((abi Sig (abi_sig sig_ref))
+            (uses CallArgList (lower_return_call_args abi (range 0 (abi_num_args abi)) args))
+            (target Reg (load_symbol_reloc (SymbolReloc.Absolute name 0))))
+        (side_effect (abi_return_call_ind abi target uses))))
+
+;; Indirect tail call.
+(rule (lower (return_call_indirect sig_ref ptr args))
+      (let ((abi Sig (abi_sig sig_ref))
+            (target Reg (put_in_reg ptr))
+            (uses CallArgList (lower_return_call_args abi (range 0 (abi_num_args abi)) args)))
+        (side_effect (abi_return_call_ind abi target uses))))
+
+;; Lower tail call function arguments.
+(decl lower_return_call_args (Sig Range ValueSlice) CallArgList)
+(rule (lower_return_call_args abi range args)
+      (let ((uses CallArgListBuilder (args_builder_new))
+            (stack MemArg (abi_return_call_stack_args abi))
+            (_ InstOutput (lower_call_args_buffer abi stack range args))
+            (_ InstOutput (lower_call_args_slots abi uses stack range args))
+            (_ InstOutput (lower_return_call_ret_arg abi uses stack)))
+        (args_builder_finish uses)))
+
+
+;;;; Common helpers for argument lowering ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Lower function arguments (part 1): prepare buffer copies.
+(decl lower_call_args_buffer (Sig MemArg Range ValueSlice) InstOutput)
+(rule (lower_call_args_buffer abi _ (range_empty) _) (output_none))
+(rule (lower_call_args_buffer abi stack (range_unwrap head tail) args)
+      (let ((_ InstOutput (copy_to_buffer stack (abi_get_arg abi head)
+                                          (value_slice_get args head))))
+        (lower_call_args_buffer abi stack tail args)))
+
+;; Lower function arguments (part 2): set up registers / stack slots.
+(decl lower_call_args_slots (Sig CallArgListBuilder MemArg Range ValueSlice) InstOutput)
+(rule (lower_call_args_slots abi _ _ (range_empty) _) (output_none))
+(rule (lower_call_args_slots abi uses stack (range_unwrap head tail) args)
+      (let ((_ InstOutput (copy_to_arg uses (abi_lane_order abi)
+                                       stack (abi_get_arg abi head)
+                                       (value_slice_get args head))))
+        (lower_call_args_slots abi uses stack tail args)))
+
+;; Lower function arguments (part 3): implicit return-area pointer (call).
+(decl lower_call_ret_arg (Sig CallArgListBuilder MemArg) InstOutput)
+(rule (lower_call_ret_arg (abi_no_ret_arg) _ _) (output_none))
+(rule 1 (lower_call_ret_arg abi @ (abi_ret_arg (abi_arg_only_slot slot)) uses stack)
+      (copy_reg_to_arg_slot uses (abi_lane_order abi)
+                            stack slot (load_addr (abi_call_stack_rets abi))))
+
+;; Lower function arguments (part 3): implicit return-area pointer (return call).
+(decl lower_return_call_ret_arg (Sig CallArgListBuilder MemArg) InstOutput)
+(rule (lower_return_call_ret_arg (abi_no_ret_arg) _ _) (output_none))
+(rule 1 (lower_return_call_ret_arg abi @ (abi_ret_arg (abi_arg_only_slot slot)) uses stack)
+      (copy_reg_to_arg_slot uses (abi_lane_order abi)
+                            stack slot (abi_unwrap_ret_area_ptr)))
+
 
 ;;;; Rules for `get_{frame,stack}_pointer` and `get_return_address` ;;;;;;;;;;;;
 
@@ -3986,9 +3985,7 @@
       (sp))
 
 (rule (lower (get_frame_pointer))
-      (load64 (memarg_stack_off 0 0)))
+      (load64 (memarg_frame_pointer_offset)))
 
 (rule (lower (get_return_address))
-      ;; The return address is 14 pointer-sized slots above the initial SP. So
-      ;; our offset is `14 * 8 = 112`.
-      (load64 (memarg_initial_sp_offset 112)))
+      (load64 (memarg_return_address_offset)))

@@ -10,22 +10,18 @@
 //! single ISA instance.
 
 use crate::alias_analysis::AliasAnalysis;
-use crate::dce::do_dce;
 use crate::dominator_tree::DominatorTree;
 use crate::egraph::EgraphPass;
 use crate::flowgraph::ControlFlowGraph;
 use crate::ir::Function;
 use crate::isa::TargetIsa;
 use crate::legalizer::simple_legalize;
-use crate::licm::do_licm;
 use crate::loop_analysis::LoopAnalysis;
 use crate::machinst::{CompiledCode, CompiledCodeStencil};
 use crate::nan_canonicalization::do_nan_canonicalization;
 use crate::remove_constant_phis::do_remove_constant_phis;
 use crate::result::{CodegenResult, CompileResult};
 use crate::settings::{FlagsOrIsa, OptLevel};
-use crate::simple_gvn::do_simple_gvn;
-use crate::simple_preopt::do_preopt;
 use crate::trace;
 use crate::unreachable_code::eliminate_unreachable_code;
 use crate::verifier::{verify_context, VerifierErrors, VerifierResult};
@@ -33,6 +29,8 @@ use crate::{timing, CompileError};
 #[cfg(feature = "souper-harvest")]
 use alloc::string::String;
 use alloc::vec::Vec;
+use cranelift_control::ControlPlane;
+use target_lexicon::Architecture;
 
 #[cfg(feature = "souper-harvest")]
 use crate::souper_harvest::do_souper_harvest;
@@ -98,6 +96,12 @@ impl Context {
         self.compiled_code.as_ref()
     }
 
+    /// Returns the compilation result for this function, available after any `compile` function
+    /// has been called.
+    pub fn take_compiled_code(&mut self) -> Option<CompiledCode> {
+        self.compiled_code.take()
+    }
+
     /// Set the flag to request a disassembly when compiling with a
     /// `MachBackend` backend.
     pub fn set_disasm(&mut self, val: bool) {
@@ -105,27 +109,14 @@ impl Context {
     }
 
     /// Compile the function, and emit machine code into a `Vec<u8>`.
-    ///
-    /// Run the function through all the passes necessary to generate
-    /// code for the target ISA represented by `isa`, as well as the
-    /// final step of emitting machine code into a `Vec<u8>`. The
-    /// machine code is not relocated. Instead, any relocations can be
-    /// obtained from `compiled_code()`.
-    ///
-    /// Performs any optimizations that are enabled, unless
-    /// `optimize()` was already invoked.
-    ///
-    /// This function calls `compile`, taking care to resize `mem` as
-    /// needed.
-    ///
-    /// Returns information about the function's code and read-only
-    /// data.
+    #[deprecated = "use Context::compile"]
     pub fn compile_and_emit(
         &mut self,
         isa: &dyn TargetIsa,
         mem: &mut Vec<u8>,
+        ctrl_plane: &mut ControlPlane,
     ) -> CompileResult<&CompiledCode> {
-        let compiled_code = self.compile(isa)?;
+        let compiled_code = self.compile(isa, ctrl_plane)?;
         mem.extend_from_slice(compiled_code.code_buffer());
         Ok(compiled_code)
     }
@@ -133,14 +124,18 @@ impl Context {
     /// Internally compiles the function into a stencil.
     ///
     /// Public only for testing and fuzzing purposes.
-    pub fn compile_stencil(&mut self, isa: &dyn TargetIsa) -> CodegenResult<CompiledCodeStencil> {
+    pub fn compile_stencil(
+        &mut self,
+        isa: &dyn TargetIsa,
+        ctrl_plane: &mut ControlPlane,
+    ) -> CodegenResult<CompiledCodeStencil> {
         let _tt = timing::compile();
 
         self.verify_if(isa)?;
 
-        self.optimize(isa)?;
+        self.optimize(isa, ctrl_plane)?;
 
-        isa.compile_function(&self.func, self.want_disasm)
+        isa.compile_function(&self.func, &self.domtree, self.want_disasm, ctrl_plane)
     }
 
     /// Optimize the function, performing all compilation steps up to
@@ -148,7 +143,11 @@ impl Context {
     /// allocation.
     ///
     /// Public only for testing purposes.
-    pub fn optimize(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
+    pub fn optimize(
+        &mut self,
+        isa: &dyn TargetIsa,
+        ctrl_plane: &mut ControlPlane,
+    ) -> CodegenResult<()> {
         log::debug!(
             "Number of CLIF instructions to optimize: {}",
             self.func.dfg.num_insts()
@@ -166,58 +165,48 @@ impl Context {
         );
 
         self.compute_cfg();
-        if !isa.flags().use_egraphs() && opt_level != OptLevel::None {
-            self.preopt(isa)?;
-        }
         if isa.flags().enable_nan_canonicalization() {
             self.canonicalize_nans(isa)?;
         }
 
         self.legalize(isa)?;
 
-        if !isa.flags().use_egraphs() && opt_level != OptLevel::None {
-            self.compute_domtree();
-            self.compute_loop_analysis();
-            self.licm(isa)?;
-            self.simple_gvn(isa)?;
-        }
-
         self.compute_domtree();
         self.eliminate_unreachable_code(isa)?;
-
-        if opt_level != OptLevel::None {
-            self.dce(isa)?;
-        }
-
         self.remove_constant_phis(isa)?;
 
+        self.func.dfg.resolve_all_aliases();
+
         if opt_level != OptLevel::None {
-            if isa.flags().use_egraphs() {
-                self.egraph_pass()?;
-            } else if isa.flags().enable_alias_analysis() {
-                for _ in 0..2 {
-                    self.replace_redundant_loads()?;
-                    self.simple_gvn(isa)?;
-                }
-            }
+            self.egraph_pass(isa, ctrl_plane)?;
         }
 
         Ok(())
     }
 
-    /// Compile the function.
+    /// Compile the function,
     ///
-    /// Run the function through all the passes necessary to generate code for the target ISA
-    /// represented by `isa`. This does not include the final step of emitting machine code into a
-    /// code sink.
+    /// Run the function through all the passes necessary to generate
+    /// code for the target ISA represented by `isa`. The generated
+    /// machine code is not relocated. Instead, any relocations can be
+    /// obtained from `compiled_code.buffer.relocs()`.
     ///
-    /// Returns information about the function's code and read-only data.
-    pub fn compile(&mut self, isa: &dyn TargetIsa) -> CompileResult<&CompiledCode> {
-        let _tt = timing::compile();
-        let stencil = self.compile_stencil(isa).map_err(|error| CompileError {
-            inner: error,
-            func: &self.func,
-        })?;
+    /// Performs any optimizations that are enabled, unless
+    /// `optimize()` was already invoked.
+    ///
+    /// Returns the generated machine code as well as information about
+    /// the function's code and read-only data.
+    pub fn compile(
+        &mut self,
+        isa: &dyn TargetIsa,
+        ctrl_plane: &mut ControlPlane,
+    ) -> CompileResult<&CompiledCode> {
+        let stencil = self
+            .compile_stencil(isa, ctrl_plane)
+            .map_err(|error| CompileError {
+                inner: error,
+                func: &self.func,
+            })?;
         Ok(self
             .compiled_code
             .insert(stencil.apply_params(&self.func.params)))
@@ -246,6 +235,8 @@ impl Context {
     /// Run the verifier on the function.
     ///
     /// Also check that the dominator tree and control flow graph are consistent with the function.
+    ///
+    /// TODO: rename to "CLIF validate" or similar.
     pub fn verify<'a, FOI: Into<FlagsOrIsa<'a>>>(&self, fisa: FOI) -> VerifierResult<()> {
         let mut errors = VerifierErrors::default();
         let _ = verify_context(&self.func, &self.cfg, &self.domtree, fisa, &mut errors);
@@ -266,13 +257,6 @@ impl Context {
         Ok(())
     }
 
-    /// Perform dead-code elimination on the function.
-    pub fn dce<'a, FOI: Into<FlagsOrIsa<'a>>>(&mut self, fisa: FOI) -> CodegenResult<()> {
-        do_dce(&mut self.func, &mut self.domtree);
-        self.verify_if(fisa)?;
-        Ok(())
-    }
-
     /// Perform constant-phi removal on the function.
     pub fn remove_constant_phis<'a, FOI: Into<FlagsOrIsa<'a>>>(
         &mut self,
@@ -283,16 +267,17 @@ impl Context {
         Ok(())
     }
 
-    /// Perform pre-legalization rewrites on the function.
-    pub fn preopt(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
-        do_preopt(&mut self.func, isa);
-        self.verify_if(isa)?;
-        Ok(())
-    }
-
     /// Perform NaN canonicalizing rewrites on the function.
     pub fn canonicalize_nans(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
-        do_nan_canonicalization(&mut self.func);
+        // Currently only RiscV64 is the only arch that may not have vector support.
+        let has_vector_support = match isa.triple().architecture {
+            Architecture::Riscv64(_) => match isa.isa_flags().iter().find(|f| f.name == "has_v") {
+                Some(value) => value.as_bool().unwrap_or(false),
+                None => false,
+            },
+            _ => true,
+        };
+        do_nan_canonicalization(&mut self.func, has_vector_support);
         self.verify_if(isa)
     }
 
@@ -304,7 +289,7 @@ impl Context {
         self.loop_analysis.clear();
 
         // Run some specific legalizations only.
-        simple_legalize(&mut self.func, &mut self.cfg, isa);
+        simple_legalize(&mut self.func, isa);
         self.verify_if(isa)
     }
 
@@ -328,23 +313,6 @@ impl Context {
     pub fn flowgraph(&mut self) {
         self.compute_cfg();
         self.compute_domtree()
-    }
-
-    /// Perform simple GVN on the function.
-    pub fn simple_gvn<'a, FOI: Into<FlagsOrIsa<'a>>>(&mut self, fisa: FOI) -> CodegenResult<()> {
-        do_simple_gvn(&mut self.func, &mut self.domtree);
-        self.verify_if(fisa)
-    }
-
-    /// Perform LICM on the function.
-    pub fn licm(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
-        do_licm(
-            &mut self.func,
-            &mut self.cfg,
-            &mut self.domtree,
-            &mut self.loop_analysis,
-        );
-        self.verify_if(isa)
     }
 
     /// Perform unreachable code elimination.
@@ -378,11 +346,21 @@ impl Context {
     }
 
     /// Run optimizations via the egraph infrastructure.
-    pub fn egraph_pass(&mut self) -> CodegenResult<()> {
+    pub fn egraph_pass<'a, FOI>(
+        &mut self,
+        fisa: FOI,
+        ctrl_plane: &mut ControlPlane,
+    ) -> CodegenResult<()>
+    where
+        FOI: Into<FlagsOrIsa<'a>>,
+    {
+        let _tt = timing::egraph();
+
         trace!(
             "About to optimize with egraph phase:\n{}",
             self.func.display()
         );
+        let fisa = fisa.into();
         self.compute_loop_analysis();
         let mut alias_analysis = AliasAnalysis::new(&self.func, &self.domtree);
         let mut pass = EgraphPass::new(
@@ -390,10 +368,14 @@ impl Context {
             &self.domtree,
             &self.loop_analysis,
             &mut alias_analysis,
+            &fisa.flags,
+            ctrl_plane,
         );
         pass.run();
-        log::info!("egraph stats: {:?}", pass.stats);
+        log::debug!("egraph stats: {:?}", pass.stats);
+        trace!("pinned_union_count: {}", pass.eclasses.pinned_union_count);
         trace!("After egraph optimization:\n{}", self.func.display());
-        Ok(())
+
+        self.verify_if(fisa)
     }
 }

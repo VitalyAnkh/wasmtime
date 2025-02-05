@@ -23,6 +23,11 @@ impl SpecInterpreter {
         config.threads_enabled = false;
         config.bulk_memory_enabled = false;
         config.reference_types_enabled = false;
+        config.tail_call_enabled = false;
+        config.relaxed_simd_enabled = false;
+        config.custom_page_sizes_enabled = false;
+        config.wide_arithmetic_enabled = false;
+        config.extended_const_enabled = false;
 
         Self
     }
@@ -39,9 +44,9 @@ impl DiffEngine for SpecInterpreter {
         Ok(Box::new(SpecInstance { instance }))
     }
 
-    fn assert_error_match(&self, trap: &Trap, err: &Error) {
+    fn assert_error_match(&self, err: &Error, trap: &Trap) {
         // TODO: implement this for the spec interpreter
-        drop((trap, err));
+        let _ = (trap, err);
     }
 
     fn is_stack_overflow(&self, err: &Error) -> bool {
@@ -76,7 +81,7 @@ impl DiffInstance for SpecInstance {
         if let Ok(Global(g)) = export(&self.instance, name) {
             Some(g.into())
         } else {
-            panic!("expected an exported global value at name `{}`", name)
+            panic!("expected an exported global value at name `{name}`")
         }
     }
 
@@ -85,7 +90,7 @@ impl DiffInstance for SpecInstance {
         if let Ok(Memory(m)) = export(&self.instance, name) {
             Some(m)
         } else {
-            panic!("expected an exported memory at name `{}`", name)
+            panic!("expected an exported memory at name `{name}`")
         }
     }
 }
@@ -98,7 +103,9 @@ impl From<&DiffValue> for SpecValue {
             DiffValue::F32(n) => SpecValue::F32(n as i32),
             DiffValue::F64(n) => SpecValue::F64(n as i64),
             DiffValue::V128(n) => SpecValue::V128(n.to_le_bytes().to_vec()),
-            DiffValue::FuncRef { .. } | DiffValue::ExternRef { .. } => unimplemented!(),
+            DiffValue::FuncRef { .. } | DiffValue::ExternRef { .. } | DiffValue::AnyRef { .. } => {
+                unimplemented!()
+            }
         }
     }
 }
@@ -135,10 +142,15 @@ pub fn setup_ocaml_runtime() {
     wasm_spec_interpreter::setup_ocaml_runtime();
 }
 
-#[test]
-fn smoke() {
-    if !wasm_spec_interpreter::support_compiled_in() {
-        return;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoke() {
+        if !wasm_spec_interpreter::support_compiled_in() {
+            return;
+        }
+        crate::oracles::engine::smoke_test_engine(|_, config| Ok(SpecInterpreter::new(config)))
     }
-    crate::oracles::engine::smoke_test_engine(|_, config| Ok(SpecInterpreter::new(config)))
 }

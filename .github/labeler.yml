@@ -52,8 +52,12 @@
 "isle":
   - "cranelift/isle/**"
   - "**.isle"
-  - "cranelift/codegen/src/isa/x64/lower/isle.rs"
-  - "cranelift/codegen/src/isa/x64/lower/isle/**"
+  - "cranelift/codegen/src/isa/*/lower/isle.rs"
+  - "cranelift/codegen/src/isa/*/lower/isle/**"
+  - "cranelift/codegen/src/opts/*"
+
+"pulley":
+  - "pulley/**"
 
 "wasi":
   - "crates/wasi/**"
@@ -75,8 +79,12 @@
   - "docs/**"
 
 "wasmtime:ref-types":
-  - "crates/wasmtime/src/ref.rs"
-  - "crates/runtime/src/externref.rs"
+  - "crates/cranelift/src/gc.rs"
+  - "crates/cranelift/src/gc/**"
+  - "crates/wasmtime/src/runtime/gc.rs"
+  - "crates/wasmtime/src/runtime/gc/**"
+  - "crates/wasmtime/src/runtime/vm/gc.rs"
+  - "crates/wasmtime/src/runtime/vm/gc/**"
 
 "winch":
   - "winch/**"

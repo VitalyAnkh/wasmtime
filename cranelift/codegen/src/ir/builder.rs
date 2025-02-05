@@ -218,7 +218,7 @@ mod tests {
     use crate::cursor::{Cursor, FuncCursor};
     use crate::ir::condcodes::*;
     use crate::ir::types::*;
-    use crate::ir::{Function, InstBuilder, Opcode, TrapCode, ValueDef};
+    use crate::ir::{Function, InstBuilder, ValueDef};
 
     #[test]
     fn types() {
@@ -266,7 +266,10 @@ mod tests {
 
     #[test]
     #[should_panic]
+    #[cfg(debug_assertions)]
     fn panics_when_inserting_wrong_opcode() {
+        use crate::ir::{Opcode, TrapCode};
+
         let mut func = Function::new();
         let block0 = func.dfg.make_block();
         let mut pos = FuncCursor::new(&mut func);
@@ -274,6 +277,6 @@ mod tests {
 
         // We are trying to create a Opcode::Return with the InstData::Trap, which is obviously wrong
         pos.ins()
-            .Trap(Opcode::Return, I32, TrapCode::BadConversionToInteger);
+            .Trap(Opcode::Return, I32, TrapCode::BAD_CONVERSION_TO_INTEGER);
     }
 }

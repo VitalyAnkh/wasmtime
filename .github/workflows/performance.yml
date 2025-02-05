@@ -31,7 +31,9 @@ jobs:
         || ('bbouvier' == github.event.comment.user.login)
         || ('bjorn3' == github.event.comment.user.login)
         || ('cfallin' == github.event.comment.user.login)
+        || ('elliottt' == github.event.comment.user.login)
         || ('fitzgen' == github.event.comment.user.login)
+        || ('jameysharp' == github.event.comment.user.login)
         || ('jlb6740' == github.event.comment.user.login)
         || ('sparker-arm' == github.event.comment.user.login)
         || ('uweigand' == github.event.comment.user.login))
@@ -72,7 +74,7 @@ jobs:
           cargo build --release
 
       - name: Checkout patch from bytecodealliance/wasmtime (pushed and triggering on this perf repo)
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           submodules: true
           path: wasmtime_commit
@@ -87,7 +89,7 @@ jobs:
           cp target/release/libwasmtime_bench_api.so /tmp/wasmtime_commit.so
 
       - name: Checkout main from bytecodealliance/wasmtime
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           ref: 'main'
           repository: 'bytecodealliance/wasmtime'

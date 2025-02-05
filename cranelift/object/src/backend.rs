@@ -1,26 +1,25 @@
 //! Defines `ObjectModule`.
 
 use anyhow::anyhow;
+use cranelift_codegen::binemit::{Addend, CodeOffset, Reloc};
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::isa::{OwnedTargetIsa, TargetIsa};
-use cranelift_codegen::{self, ir, MachReloc};
-use cranelift_codegen::{
-    binemit::{Addend, CodeOffset, Reloc},
-    CodegenError,
-};
+use cranelift_codegen::{ir, FinalizedMachReloc};
+use cranelift_control::ControlPlane;
 use cranelift_module::{
-    DataContext, DataDescription, DataId, FuncId, Init, Linkage, Module, ModuleCompiledFunction,
-    ModuleDeclarations, ModuleError, ModuleExtName, ModuleReloc, ModuleResult,
+    DataDescription, DataId, FuncId, Init, Linkage, Module, ModuleDeclarations, ModuleError,
+    ModuleReloc, ModuleRelocTarget, ModuleResult,
 };
 use log::info;
 use object::write::{
     Object, Relocation, SectionId, StandardSection, Symbol, SymbolId, SymbolSection,
 };
 use object::{
-    RelocationEncoding, RelocationKind, SectionKind, SymbolFlags, SymbolKind, SymbolScope,
+    RelocationEncoding, RelocationFlags, RelocationKind, SectionKind, SymbolFlags, SymbolKind,
+    SymbolScope,
 };
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::convert::TryInto;
 use std::mem;
 use target_lexicon::PointerWidth;
 
@@ -34,16 +33,17 @@ pub struct ObjectBuilder {
     name: Vec<u8>,
     libcall_names: Box<dyn Fn(ir::LibCall) -> String + Send + Sync>,
     per_function_section: bool,
+    per_data_object_section: bool,
 }
 
 impl ObjectBuilder {
     /// Create a new `ObjectBuilder` using the given Cranelift target, that
     /// can be passed to [`ObjectModule::new`].
     ///
-    /// The `libcall_names` function provides a way to translate `cranelift_codegen`'s [ir::LibCall]
+    /// The `libcall_names` function provides a way to translate `cranelift_codegen`'s [`ir::LibCall`]
     /// enum to symbols. LibCalls are inserted in the IR as part of the legalization for certain
     /// floating point instructions, and for stack probes. If you don't know what to use for this
-    /// argument, use [cranelift_module::default_libcall_names]().
+    /// argument, use [`cranelift_module::default_libcall_names`].
     pub fn new<V: Into<Vec<u8>>>(
         isa: OwnedTargetIsa,
         name: V,
@@ -81,11 +81,24 @@ impl ObjectBuilder {
                         binary_format,
                     )));
                 }
-                // FIXME(#4994) get the right variant from the TargetIsa
+
+                // FIXME(#4994): Get the right float ABI variant from the TargetIsa
+                let mut eflags = object::elf::EF_RISCV_FLOAT_ABI_DOUBLE;
+
+                // Set the RVC eflag if we have the C extension enabled.
+                let has_c = isa
+                    .isa_flags()
+                    .iter()
+                    .filter(|f| f.name == "has_zca" || f.name == "has_zcd")
+                    .all(|f| f.as_bool().unwrap_or_default());
+                if has_c {
+                    eflags |= object::elf::EF_RISCV_RVC;
+                }
+
                 file_flags = object::FileFlags::Elf {
                     os_abi: object::elf::ELFOSABI_NONE,
                     abi_version: 0,
-                    e_flags: object::elf::EF_RISCV_RVC | object::elf::EF_RISCV_FLOAT_ABI_DOUBLE,
+                    e_flags: eflags,
                 };
                 object::Architecture::Riscv64
             }
@@ -110,12 +123,19 @@ impl ObjectBuilder {
             name: name.into(),
             libcall_names,
             per_function_section: false,
+            per_data_object_section: false,
         })
     }
 
     /// Set if every function should end up in their own section.
     pub fn per_function_section(&mut self, per_function_section: bool) -> &mut Self {
         self.per_function_section = per_function_section;
+        self
+    }
+
+    /// Set if every data object should end up in their own section.
+    pub fn per_data_object_section(&mut self, per_data_object_section: bool) -> &mut Self {
+        self.per_data_object_section = per_data_object_section;
         self
     }
 }
@@ -133,9 +153,9 @@ pub struct ObjectModule {
     libcalls: HashMap<ir::LibCall, SymbolId>,
     libcall_names: Box<dyn Fn(ir::LibCall) -> String + Send + Sync>,
     known_symbols: HashMap<ir::KnownSymbol, SymbolId>,
+    known_labels: HashMap<(FuncId, CodeOffset), SymbolId>,
     per_function_section: bool,
-    anon_func_number: u64,
-    anon_data_number: u64,
+    per_data_object_section: bool,
 }
 
 impl ObjectModule {
@@ -143,6 +163,7 @@ impl ObjectModule {
     pub fn new(builder: ObjectBuilder) -> Self {
         let mut object = Object::new(builder.binary_format, builder.architecture, builder.endian);
         object.flags = builder.flags;
+        object.set_subsections_via_symbols();
         object.add_file_symbol(builder.name);
         Self {
             isa: builder.isa,
@@ -154,9 +175,9 @@ impl ObjectModule {
             libcalls: HashMap::new(),
             libcall_names: builder.libcall_names,
             known_symbols: HashMap::new(),
+            known_labels: HashMap::new(),
             per_function_section: builder.per_function_section,
-            anon_func_number: 0,
-            anon_data_number: 0,
+            per_data_object_section: builder.per_data_object_section,
         }
     }
 }
@@ -218,16 +239,15 @@ impl Module for ObjectModule {
     }
 
     fn declare_anonymous_function(&mut self, signature: &ir::Signature) -> ModuleResult<FuncId> {
-        // Symbols starting with .L are completely omitted from the symbol table after linking.
-        // Using hexadecimal instead of decimal for slightly smaller symbol names and often slightly
-        // faster linking.
-        let name = format!(".Lfn{:x}", self.anon_func_number);
-        self.anon_func_number += 1;
-
         let id = self.declarations.declare_anonymous_function(signature)?;
 
         let symbol_id = self.object.add_symbol(Symbol {
-            name: name.as_bytes().to_vec(),
+            name: self
+                .declarations
+                .get_function_decl(id)
+                .linkage_name(id)
+                .into_owned()
+                .into_bytes(),
             value: 0,
             size: 0,
             kind: SymbolKind::Text,
@@ -286,12 +306,6 @@ impl Module for ObjectModule {
     }
 
     fn declare_anonymous_data(&mut self, writable: bool, tls: bool) -> ModuleResult<DataId> {
-        // Symbols starting with .L are completely omitted from the symbol table after linking.
-        // Using hexadecimal instead of decimal for slightly smaller symbol names and often slightly
-        // faster linking.
-        let name = format!(".Ldata{:x}", self.anon_data_number);
-        self.anon_data_number += 1;
-
         let id = self.declarations.declare_anonymous_data(writable, tls)?;
 
         let kind = if tls {
@@ -301,7 +315,12 @@ impl Module for ObjectModule {
         };
 
         let symbol_id = self.object.add_symbol(Symbol {
-            name: name.as_bytes().to_vec(),
+            name: self
+                .declarations
+                .get_data_decl(id)
+                .linkage_name(id)
+                .into_owned()
+                .into_bytes(),
             value: 0,
             size: 0,
             kind,
@@ -315,22 +334,22 @@ impl Module for ObjectModule {
         Ok(id)
     }
 
-    fn define_function(
+    fn define_function_with_control_plane(
         &mut self,
         func_id: FuncId,
         ctx: &mut cranelift_codegen::Context,
-    ) -> ModuleResult<ModuleCompiledFunction> {
+        ctrl_plane: &mut ControlPlane,
+    ) -> ModuleResult<()> {
         info!("defining function {}: {}", func_id, ctx.func.display());
-        let mut code: Vec<u8> = Vec::new();
 
-        let res = ctx.compile_and_emit(self.isa(), &mut code)?;
-        let alignment = res.alignment as u64;
+        let res = ctx.compile(self.isa(), ctrl_plane)?;
+        let alignment = res.buffer.alignment as u64;
 
         self.define_function_bytes(
             func_id,
             &ctx.func,
             alignment,
-            &code,
+            ctx.compiled_code().unwrap().code_buffer(),
             ctx.compiled_code().unwrap().buffer.relocs(),
         )
     }
@@ -341,46 +360,41 @@ impl Module for ObjectModule {
         func: &ir::Function,
         alignment: u64,
         bytes: &[u8],
-        relocs: &[MachReloc],
-    ) -> ModuleResult<ModuleCompiledFunction> {
+        relocs: &[FinalizedMachReloc],
+    ) -> ModuleResult<()> {
         info!("defining function {} with bytes", func_id);
-        let total_size: u32 = match bytes.len().try_into() {
-            Ok(total_size) => total_size,
-            _ => Err(CodegenError::CodeTooLarge)?,
-        };
-
         let decl = self.declarations.get_function_decl(func_id);
+        let decl_name = decl.linkage_name(func_id);
         if !decl.linkage.is_definable() {
-            return Err(ModuleError::InvalidImportDefinition(decl.name.clone()));
+            return Err(ModuleError::InvalidImportDefinition(decl_name.into_owned()));
         }
 
         let &mut (symbol, ref mut defined) = self.functions[func_id].as_mut().unwrap();
         if *defined {
-            return Err(ModuleError::DuplicateDefinition(decl.name.clone()));
+            return Err(ModuleError::DuplicateDefinition(decl_name.into_owned()));
         }
         *defined = true;
 
         let align = alignment
-            .max(self.isa.function_alignment() as u64)
+            .max(self.isa.function_alignment().minimum.into())
             .max(self.isa.symbol_alignment());
-        let (section, offset) = if self.per_function_section {
-            let symbol_name = self.object.symbol(symbol).name.clone();
-            let (section, offset) =
-                self.object
-                    .add_subsection(StandardSection::Text, &symbol_name, bytes, align);
-            self.object.symbol_mut(symbol).section = SymbolSection::Section(section);
-            self.object.symbol_mut(symbol).value = offset;
-            (section, offset)
+        let section = if self.per_function_section {
+            // FIXME pass empty symbol name once add_subsection produces `.text` as section name
+            // instead of `.text.` when passed an empty symbol name. (object#748) Until then pass
+            // `subsection` to produce `.text.subsection` as section name to reduce confusion.
+            self.object
+                .add_subsection(StandardSection::Text, b"subsection")
         } else {
-            let section = self.object.section_id(StandardSection::Text);
-            let offset = self.object.add_symbol_data(symbol, section, bytes, align);
-            (section, offset)
+            self.object.section_id(StandardSection::Text)
         };
+        let offset = self.object.add_symbol_data(symbol, section, bytes, align);
 
         if !relocs.is_empty() {
             let relocs = relocs
                 .iter()
-                .map(|record| self.process_reloc(&ModuleReloc::from_mach_reloc(&record, func)))
+                .map(|record| {
+                    self.process_reloc(&ModuleReloc::from_mach_reloc(&record, func, func_id))
+                })
                 .collect();
             self.relocs.push(SymbolRelocs {
                 section,
@@ -389,18 +403,22 @@ impl Module for ObjectModule {
             });
         }
 
-        Ok(ModuleCompiledFunction { size: total_size })
+        Ok(())
     }
 
-    fn define_data(&mut self, data_id: DataId, data_ctx: &DataContext) -> ModuleResult<()> {
+    fn define_data(&mut self, data_id: DataId, data: &DataDescription) -> ModuleResult<()> {
         let decl = self.declarations.get_data_decl(data_id);
         if !decl.linkage.is_definable() {
-            return Err(ModuleError::InvalidImportDefinition(decl.name.clone()));
+            return Err(ModuleError::InvalidImportDefinition(
+                decl.linkage_name(data_id).into_owned(),
+            ));
         }
 
         let &mut (symbol, ref mut defined) = self.data_objects[data_id].as_mut().unwrap();
         if *defined {
-            return Err(ModuleError::DuplicateDefinition(decl.name.clone()));
+            return Err(ModuleError::DuplicateDefinition(
+                decl.linkage_name(data_id).into_owned(),
+            ));
         }
         *defined = true;
 
@@ -412,15 +430,14 @@ impl Module for ObjectModule {
             data_relocs: _,
             ref custom_segment_section,
             align,
-        } = data_ctx.description();
+        } = data;
 
         let pointer_reloc = match self.isa.triple().pointer_width().unwrap() {
             PointerWidth::U16 => unimplemented!("16bit pointers"),
             PointerWidth::U32 => Reloc::Abs4,
             PointerWidth::U64 => Reloc::Abs8,
         };
-        let relocs = data_ctx
-            .description()
+        let relocs = data
             .all_relocs(pointer_reloc)
             .map(|record| self.process_reloc(&record))
             .collect::<Vec<_>>();
@@ -441,7 +458,15 @@ impl Module for ObjectModule {
             } else {
                 StandardSection::ReadOnlyDataWithRel
             };
-            self.object.section_id(section_kind)
+            if self.per_data_object_section {
+                // FIXME pass empty symbol name once add_subsection produces `.text` as section name
+                // instead of `.text.` when passed an empty symbol name. (object#748) Until then
+                // pass `subsection` to produce `.text.subsection` as section name to reduce
+                // confusion.
+                self.object.add_subsection(section_kind, b"subsection")
+            } else {
+                self.object.section_id(section_kind)
+            }
         } else {
             if decl.tls {
                 return Err(cranelift_module::ModuleError::Backend(anyhow::anyhow!(
@@ -457,7 +482,7 @@ impl Module for ObjectModule {
                 } else if relocs.is_empty() {
                     SectionKind::ReadOnlyData
                 } else {
-                    SectionKind::Data
+                    SectionKind::ReadOnlyDataWithRel
                 },
             )
         };
@@ -493,9 +518,7 @@ impl ObjectModule {
             for &ObjectRelocRecord {
                 offset,
                 ref name,
-                kind,
-                encoding,
-                size,
+                flags,
                 addend,
             } in &symbol.relocs
             {
@@ -505,9 +528,7 @@ impl ObjectModule {
                         symbol.section,
                         Relocation {
                             offset: symbol.offset + u64::from(offset),
-                            size,
-                            kind,
-                            encoding,
+                            flags,
                             symbol: target_symbol,
                             addend,
                         },
@@ -534,9 +555,9 @@ impl ObjectModule {
 
     /// This should only be called during finish because it creates
     /// symbols for missing libcalls.
-    fn get_symbol(&mut self, name: &ModuleExtName) -> SymbolId {
+    fn get_symbol(&mut self, name: &ModuleRelocTarget) -> SymbolId {
         match *name {
-            ModuleExtName::User { .. } => {
+            ModuleRelocTarget::User { .. } => {
                 if ModuleDeclarations::is_function(name) {
                     let id = FuncId::from_name(name);
                     self.functions[id].unwrap().0
@@ -545,7 +566,7 @@ impl ObjectModule {
                     self.data_objects[id].unwrap().0
                 }
             }
-            ModuleExtName::LibCall(ref libcall) => {
+            ModuleRelocTarget::LibCall(ref libcall) => {
                 let name = (self.libcall_names)(*libcall);
                 if let Some(symbol) = self.object.symbol_id(name.as_bytes()) {
                     symbol
@@ -568,7 +589,7 @@ impl ObjectModule {
             }
             // These are "magic" names well-known to the linker.
             // They require special treatment.
-            ModuleExtName::KnownSymbol(ref known_symbol) => {
+            ModuleRelocTarget::KnownSymbol(ref known_symbol) => {
                 if let Some(symbol) = self.known_symbols.get(known_symbol) {
                     *symbol
                 } else {
@@ -598,45 +619,87 @@ impl ObjectModule {
                     symbol
                 }
             }
+
+            ModuleRelocTarget::FunctionOffset(func_id, offset) => {
+                match self.known_labels.entry((func_id, offset)) {
+                    Entry::Occupied(o) => *o.get(),
+                    Entry::Vacant(v) => {
+                        let func_symbol_id = self.functions[func_id].unwrap().0;
+                        let func_symbol = self.object.symbol(func_symbol_id);
+
+                        let name = format!(".L{}_{}", func_id.as_u32(), offset);
+                        let symbol_id = self.object.add_symbol(Symbol {
+                            name: name.as_bytes().to_vec(),
+                            value: func_symbol.value + offset as u64,
+                            size: 0,
+                            kind: SymbolKind::Label,
+                            scope: SymbolScope::Compilation,
+                            weak: false,
+                            section: SymbolSection::Section(func_symbol.section.id().unwrap()),
+                            flags: SymbolFlags::None,
+                        });
+
+                        v.insert(symbol_id);
+                        symbol_id
+                    }
+                }
+            }
         }
     }
 
     fn process_reloc(&self, record: &ModuleReloc) -> ObjectRelocRecord {
-        let mut addend = record.addend;
-        let (kind, encoding, size) = match record.kind {
-            Reloc::Abs4 => (RelocationKind::Absolute, RelocationEncoding::Generic, 32),
-            Reloc::Abs8 => (RelocationKind::Absolute, RelocationEncoding::Generic, 64),
-            Reloc::X86PCRel4 => (RelocationKind::Relative, RelocationEncoding::Generic, 32),
-            Reloc::X86CallPCRel4 => (RelocationKind::Relative, RelocationEncoding::X86Branch, 32),
+        let flags = match record.kind {
+            Reloc::Abs4 => RelocationFlags::Generic {
+                kind: RelocationKind::Absolute,
+                encoding: RelocationEncoding::Generic,
+                size: 32,
+            },
+            Reloc::Abs8 => RelocationFlags::Generic {
+                kind: RelocationKind::Absolute,
+                encoding: RelocationEncoding::Generic,
+                size: 64,
+            },
+            Reloc::X86PCRel4 => RelocationFlags::Generic {
+                kind: RelocationKind::Relative,
+                encoding: RelocationEncoding::Generic,
+                size: 32,
+            },
+            Reloc::X86CallPCRel4 => RelocationFlags::Generic {
+                kind: RelocationKind::Relative,
+                encoding: RelocationEncoding::X86Branch,
+                size: 32,
+            },
             // TODO: Get Cranelift to tell us when we can use
             // R_X86_64_GOTPCRELX/R_X86_64_REX_GOTPCRELX.
-            Reloc::X86CallPLTRel4 => (
-                RelocationKind::PltRelative,
-                RelocationEncoding::X86Branch,
-                32,
-            ),
-            Reloc::X86SecRel => (
-                RelocationKind::SectionOffset,
-                RelocationEncoding::Generic,
-                32,
-            ),
-            Reloc::X86GOTPCRel4 => (RelocationKind::GotRelative, RelocationEncoding::Generic, 32),
-            Reloc::Arm64Call => (
-                RelocationKind::Relative,
-                RelocationEncoding::AArch64Call,
-                26,
-            ),
+            Reloc::X86CallPLTRel4 => RelocationFlags::Generic {
+                kind: RelocationKind::PltRelative,
+                encoding: RelocationEncoding::X86Branch,
+                size: 32,
+            },
+            Reloc::X86SecRel => RelocationFlags::Generic {
+                kind: RelocationKind::SectionOffset,
+                encoding: RelocationEncoding::Generic,
+                size: 32,
+            },
+            Reloc::X86GOTPCRel4 => RelocationFlags::Generic {
+                kind: RelocationKind::GotRelative,
+                encoding: RelocationEncoding::Generic,
+                size: 32,
+            },
+            Reloc::Arm64Call => RelocationFlags::Generic {
+                kind: RelocationKind::Relative,
+                encoding: RelocationEncoding::AArch64Call,
+                size: 26,
+            },
             Reloc::ElfX86_64TlsGd => {
                 assert_eq!(
                     self.object.format(),
                     object::BinaryFormat::Elf,
                     "ElfX86_64TlsGd is not supported for this file format"
                 );
-                (
-                    RelocationKind::Elf(object::elf::R_X86_64_TLSGD),
-                    RelocationEncoding::Generic,
-                    32,
-                )
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_X86_64_TLSGD,
+                }
             }
             Reloc::MachOX86_64Tlv => {
                 assert_eq!(
@@ -644,89 +707,118 @@ impl ObjectModule {
                     object::BinaryFormat::MachO,
                     "MachOX86_64Tlv is not supported for this file format"
                 );
-                addend += 4; // X86_64_RELOC_TLV has an implicit addend of -4
-                (
-                    RelocationKind::MachO {
-                        value: object::macho::X86_64_RELOC_TLV,
-                        relative: true,
-                    },
-                    RelocationEncoding::Generic,
-                    32,
-                )
+                RelocationFlags::MachO {
+                    r_type: object::macho::X86_64_RELOC_TLV,
+                    r_pcrel: true,
+                    r_length: 2,
+                }
             }
-            Reloc::Aarch64TlsGdAdrPage21 => {
+            Reloc::MachOAarch64TlsAdrPage21 => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::MachO,
+                    "MachOAarch64TlsAdrPage21 is not supported for this file format"
+                );
+                RelocationFlags::MachO {
+                    r_type: object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21,
+                    r_pcrel: true,
+                    r_length: 2,
+                }
+            }
+            Reloc::MachOAarch64TlsAdrPageOff12 => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::MachO,
+                    "MachOAarch64TlsAdrPageOff12 is not supported for this file format"
+                );
+                RelocationFlags::MachO {
+                    r_type: object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12,
+                    r_pcrel: false,
+                    r_length: 2,
+                }
+            }
+            Reloc::Aarch64TlsDescAdrPage21 => {
                 assert_eq!(
                     self.object.format(),
                     object::BinaryFormat::Elf,
-                    "Aarch64TlsGdAdrPrel21 is not supported for this file format"
+                    "Aarch64TlsDescAdrPage21 is not supported for this file format"
                 );
-                (
-                    RelocationKind::Elf(object::elf::R_AARCH64_TLSGD_ADR_PAGE21),
-                    RelocationEncoding::Generic,
-                    21,
-                )
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_TLSDESC_ADR_PAGE21,
+                }
             }
-            Reloc::Aarch64TlsGdAddLo12Nc => {
+            Reloc::Aarch64TlsDescLd64Lo12 => {
                 assert_eq!(
                     self.object.format(),
                     object::BinaryFormat::Elf,
-                    "Aarch64TlsGdAddLo12Nc is not supported for this file format"
+                    "Aarch64TlsDescLd64Lo12 is not supported for this file format"
                 );
-                (
-                    RelocationKind::Elf(object::elf::R_AARCH64_TLSGD_ADD_LO12_NC),
-                    RelocationEncoding::Generic,
-                    12,
-                )
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_TLSDESC_LD64_LO12,
+                }
             }
+            Reloc::Aarch64TlsDescAddLo12 => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "Aarch64TlsDescAddLo12 is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_TLSDESC_ADD_LO12,
+                }
+            }
+            Reloc::Aarch64TlsDescCall => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "Aarch64TlsDescCall is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_TLSDESC_CALL,
+                }
+            }
+
             Reloc::Aarch64AdrGotPage21 => match self.object.format() {
-                object::BinaryFormat::Elf => (
-                    RelocationKind::Elf(object::elf::R_AARCH64_ADR_GOT_PAGE),
-                    RelocationEncoding::Generic,
-                    21,
-                ),
-                object::BinaryFormat::MachO => (
-                    RelocationKind::MachO {
-                        value: object::macho::ARM64_RELOC_GOT_LOAD_PAGE21,
-                        relative: true,
-                    },
-                    RelocationEncoding::Generic,
-                    21,
-                ),
+                object::BinaryFormat::Elf => RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_ADR_GOT_PAGE,
+                },
+                object::BinaryFormat::MachO => RelocationFlags::MachO {
+                    r_type: object::macho::ARM64_RELOC_GOT_LOAD_PAGE21,
+                    r_pcrel: true,
+                    r_length: 2,
+                },
                 _ => unimplemented!("Aarch64AdrGotPage21 is not supported for this file format"),
             },
             Reloc::Aarch64Ld64GotLo12Nc => match self.object.format() {
-                object::BinaryFormat::Elf => (
-                    RelocationKind::Elf(object::elf::R_AARCH64_LD64_GOT_LO12_NC),
-                    RelocationEncoding::Generic,
-                    12,
-                ),
-                object::BinaryFormat::MachO => (
-                    RelocationKind::MachO {
-                        value: object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12,
-                        relative: false,
-                    },
-                    RelocationEncoding::Generic,
-                    12,
-                ),
+                object::BinaryFormat::Elf => RelocationFlags::Elf {
+                    r_type: object::elf::R_AARCH64_LD64_GOT_LO12_NC,
+                },
+                object::BinaryFormat::MachO => RelocationFlags::MachO {
+                    r_type: object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12,
+                    r_pcrel: false,
+                    r_length: 2,
+                },
                 _ => unimplemented!("Aarch64Ld64GotLo12Nc is not supported for this file format"),
             },
-            Reloc::S390xPCRel32Dbl => (RelocationKind::Relative, RelocationEncoding::S390xDbl, 32),
-            Reloc::S390xPLTRel32Dbl => (
-                RelocationKind::PltRelative,
-                RelocationEncoding::S390xDbl,
-                32,
-            ),
+            Reloc::S390xPCRel32Dbl => RelocationFlags::Generic {
+                kind: RelocationKind::Relative,
+                encoding: RelocationEncoding::S390xDbl,
+                size: 32,
+            },
+            Reloc::S390xPLTRel32Dbl => RelocationFlags::Generic {
+                kind: RelocationKind::PltRelative,
+                encoding: RelocationEncoding::S390xDbl,
+                size: 32,
+            },
             Reloc::S390xTlsGd64 => {
                 assert_eq!(
                     self.object.format(),
                     object::BinaryFormat::Elf,
                     "S390xTlsGd64 is not supported for this file format"
                 );
-                (
-                    RelocationKind::Elf(object::elf::R_390_TLS_GD64),
-                    RelocationEncoding::Generic,
-                    64,
-                )
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_390_TLS_GD64,
+                }
             }
             Reloc::S390xTlsGdCall => {
                 assert_eq!(
@@ -734,23 +826,49 @@ impl ObjectModule {
                     object::BinaryFormat::Elf,
                     "S390xTlsGdCall is not supported for this file format"
                 );
-                (
-                    RelocationKind::Elf(object::elf::R_390_TLS_GDCALL),
-                    RelocationEncoding::Generic,
-                    0,
-                )
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_390_TLS_GDCALL,
+                }
             }
-            Reloc::RiscvCall => {
+            Reloc::RiscvCallPlt => {
                 assert_eq!(
                     self.object.format(),
                     object::BinaryFormat::Elf,
-                    "RiscvCall is not supported for this file format"
+                    "RiscvCallPlt is not supported for this file format"
                 );
-                (
-                    RelocationKind::Elf(object::elf::R_RISCV_CALL),
-                    RelocationEncoding::Generic,
-                    0,
-                )
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_RISCV_CALL_PLT,
+                }
+            }
+            Reloc::RiscvTlsGdHi20 => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "RiscvTlsGdHi20 is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_RISCV_TLS_GD_HI20,
+                }
+            }
+            Reloc::RiscvPCRelLo12I => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "RiscvPCRelLo12I is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_RISCV_PCREL_LO12_I,
+                }
+            }
+            Reloc::RiscvGotHi20 => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "RiscvGotHi20 is not supported for this file format"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_RISCV_GOT_HI20,
+                }
             }
             // FIXME
             reloc => unimplemented!("{:?}", reloc),
@@ -759,10 +877,8 @@ impl ObjectModule {
         ObjectRelocRecord {
             offset: record.offset,
             name: record.name.clone(),
-            kind,
-            encoding,
-            size,
-            addend,
+            flags,
+            addend: record.addend,
         }
     }
 }
@@ -822,9 +938,7 @@ struct SymbolRelocs {
 #[derive(Clone)]
 struct ObjectRelocRecord {
     offset: CodeOffset,
-    name: ModuleExtName,
-    kind: RelocationKind,
-    encoding: RelocationEncoding,
-    size: u8,
+    name: ModuleRelocTarget,
+    flags: RelocationFlags,
     addend: Addend,
 }

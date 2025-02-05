@@ -11,7 +11,7 @@ use core::str::FromStr;
 
 use cranelift_entity::EntityRef as _;
 #[cfg(feature = "enable-serde")]
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 
 use super::entities::UserExternalNameRef;
 use super::function::FunctionParameters;
@@ -40,6 +40,14 @@ impl UserFuncName {
     /// Create a new external name from a user-defined external function reference.
     pub fn user(namespace: u32, index: u32) -> Self {
         Self::User(UserExternalName::new(namespace, index))
+    }
+
+    /// Get a `UserExternalName` if this is a user-defined name.
+    pub fn get_user(&self) -> Option<&UserExternalName> {
+        match self {
+            UserFuncName::User(user) => Some(user),
+            UserFuncName::Testcase(_) => None,
+        }
     }
 }
 
@@ -97,7 +105,7 @@ impl fmt::Display for TestcaseName {
 
 impl fmt::Debug for TestcaseName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
     }
 }
 
@@ -196,8 +204,8 @@ impl<'a> fmt::Display for DisplayableExternalName<'a> {
                 }
             }
             ExternalName::TestCase(testcase) => testcase.fmt(f),
-            ExternalName::LibCall(lc) => write!(f, "%{}", lc),
-            ExternalName::KnownSymbol(ks) => write!(f, "%{}", ks),
+            ExternalName::LibCall(lc) => write!(f, "%{lc}"),
+            ExternalName::KnownSymbol(ks) => write!(f, "%{ks}"),
         }
     }
 }

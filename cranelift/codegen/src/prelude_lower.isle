@@ -17,8 +17,19 @@
 ;; (Mutable) builder to incrementally construct an `InstOutput`.
 (type InstOutputBuilder extern (enum))
 
+;; Type to hold multiple Regs
+(type MultiReg
+      (enum
+       (Empty)
+       (One (a Reg))
+       (Two (a Reg) (b Reg))
+       (Three (a Reg) (b Reg) (c Reg))
+       (Four (a Reg) (b Reg) (c Reg) (d Reg))
+      ))
+
 ;;;; Registers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+(model Reg (type (bv)))
 (type Reg (primitive Reg))
 (type WritableReg (primitive WritableReg))
 (type OptionWritableReg (primitive OptionWritableReg))
@@ -27,12 +38,22 @@
 (type PReg (primitive PReg))
 
 ;; Construct a `ValueRegs` of one register.
+(spec (value_reg arg)
+    (provide (= result arg)))
 (decl value_reg (Reg) ValueRegs)
 (extern constructor value_reg value_reg)
+
+;; Construct a `WritableValueRegs` of one register.
+(decl writable_value_reg (WritableReg) WritableValueRegs)
+(extern constructor writable_value_reg writable_value_reg)
 
 ;; Construct a `ValueRegs` of two registers.
 (decl value_regs (Reg Reg) ValueRegs)
 (extern constructor value_regs value_regs)
+
+;; Construct a `WritableValueRegs` of two registers.
+(decl writable_value_regs (WritableReg WritableReg) WritableValueRegs)
+(extern constructor writable_value_regs writable_value_regs)
 
 ;; Construct an empty `ValueRegs` containing only invalid register sentinels.
 (decl value_regs_invalid () ValueRegs)
@@ -43,6 +64,8 @@
 (extern constructor output_none output_none)
 
 ;; Construct a single-element `InstOutput`.
+(spec (output arg)
+      (provide (= arg (conv_to (widthof arg) result))))
 (decl output (ValueRegs) InstOutput)
 (extern constructor output output)
 
@@ -51,8 +74,16 @@
 (extern constructor output_pair output_pair)
 
 ;; Construct a single-element `InstOutput` from a single register.
+(spec (output_reg arg)
+      (provide (= result (conv_to (widthof result) arg))))
+(instantiate output_reg
+    ((args (bv 64)) (ret (bv 8)) (canon (bv 8)))
+    ((args (bv 64)) (ret (bv 16)) (canon (bv 16)))
+    ((args (bv 64)) (ret (bv 32)) (canon (bv 32)))
+    ((args (bv 64)) (ret (bv 64)) (canon (bv 64)))
+)
 (decl output_reg (Reg) InstOutput)
-(rule (output_reg reg) (output (value_reg reg)))
+(rule output_reg (output_reg reg) (output (value_reg reg)))
 
 ;; Construct a single-element `InstOutput` from a value.
 (decl output_value (Value) InstOutput)
@@ -85,11 +116,11 @@
 ;; Get or match the invalid register.
 (decl invalid_reg () Reg)
 (extern constructor invalid_reg invalid_reg)
-(extractor (invalid_reg) (is_valid_reg $false))
+(extractor (invalid_reg) (is_valid_reg false))
 
 ;; Match any register but the invalid register.
 (decl valid_reg (Reg) Reg)
-(extractor (valid_reg reg) (and (is_valid_reg $true) reg))
+(extractor (valid_reg reg) (and (is_valid_reg true) reg))
 
 ;; Mark this value as used, to ensure that it gets lowered.
 (decl mark_value_used (Value) Unit)
@@ -101,12 +132,15 @@
 ;; multiple registers for its representation (like `i128` on x64 for example).
 ;;
 ;; As a side effect, this marks the value as used.
+(spec (put_in_reg arg)
+      (provide (= result (conv_to 64 arg))))
 (decl put_in_reg (Value) Reg)
 (extern constructor put_in_reg put_in_reg)
 
 ;; Put the given value into one or more registers.
 ;;
 ;; As a side effect, this marks the value as used.
+(spec (put_in_regs arg) (provide (= (conv_to 64 arg) result)))
 (decl put_in_regs (Value) ValueRegs)
 (extern constructor put_in_regs put_in_regs)
 
@@ -116,11 +150,13 @@
 (extern constructor ensure_in_vreg ensure_in_vreg)
 
 ;; Get the `n`th register inside a `ValueRegs`.
+(spec (value_regs_get arg i)
+    (provide (= arg result) (= (widthof i) 1)))
 (decl value_regs_get (ValueRegs usize) Reg)
 (extern constructor value_regs_get value_regs_get)
 
 ;; Get the number of registers in a `ValueRegs`.
-(decl value_regs_len (ValueRegs) usize)
+(decl pure value_regs_len (ValueRegs) usize)
 (extern constructor value_regs_len value_regs_len)
 
 ;; Get a range for the number of regs in a `ValueRegs`.
@@ -134,7 +170,7 @@
 ;; the shift amount to the bit width of the value being shifted, and so the high
 ;; half of the `i128` won't ever be used.
 ;;
-;; As a side efect, this marks that value as used.
+;; As a side effect, this marks that value as used.
 (decl lo_reg (Value) Reg)
 (rule (lo_reg val)
       (let ((regs ValueRegs (put_in_regs val)))
@@ -143,6 +179,27 @@
 ;; Convert a `PReg` into a `Reg`.
 (decl preg_to_reg (PReg) Reg)
 (extern constructor preg_to_reg preg_to_reg)
+
+;; Convert a MultiReg with three registers into an InstOutput containing
+;; one ValueRegs containing the first two regs and one containing the third reg
+(decl multi_reg_to_pair_and_single (MultiReg) InstOutput)
+(rule (multi_reg_to_pair_and_single (MultiReg.Three a b c))
+      (output_pair (value_regs a b) c))
+
+;; Convert a MultiReg with two registers into an InstOutput containing one ValueRegs with both regs
+(decl multi_reg_to_pair (MultiReg) InstOutput)
+(rule (multi_reg_to_pair (MultiReg.Two a b))
+      (value_regs a b))
+
+;; Convert a MultiReg with one register into an InstOutput containing one ValueRegs with the register
+(decl multi_reg_to_single (MultiReg) InstOutput)
+(rule (multi_reg_to_single (MultiReg.One a))
+      (value_reg a))
+
+;; Add a range fact to a register, when compiling with
+;; proof-carrying-code enabled.
+(decl add_range_fact (Reg u16 u64 u64) Reg)
+(extern constructor add_range_fact add_range_fact)
 
 ;;;; Common Mach Types ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -154,6 +211,25 @@
 (type RelocDistance (primitive RelocDistance))
 (type VecArgPair extern (enum))
 (type VecRetPair extern (enum))
+(type CallArgList extern (enum))
+(type MachLabelSlice extern (enum))
+(type BoxVecMachLabel extern (enum))
+
+;; Extract a the target from a MachLabelSlice with exactly one target.
+(decl single_target (MachLabel) MachLabelSlice)
+(extern extractor single_target single_target)
+
+;; Extract a the targets from a MachLabelSlice with exactly two targets.
+(decl two_targets (MachLabel MachLabel) MachLabelSlice)
+(extern extractor two_targets two_targets)
+
+;; Extract the default target and jump table from a MachLabelSlice.
+(decl jump_table_targets (MachLabel BoxVecMachLabel) MachLabelSlice)
+(extern extractor jump_table_targets jump_table_targets)
+
+;; The size of the jump table.
+(decl jump_table_size (BoxVecMachLabel) u32)
+(extern constructor jump_table_size jump_table_size)
 
 ;;;; Helper Clif Extractors ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -190,12 +266,17 @@
            (value_list_slice (value_slice_unwrap head1 (value_slice_unwrap head2 tail))))
 
 ;; Turn a `Writable<Reg>` into a `Reg` via `Writable::to_reg`.
-(decl writable_reg_to_reg (WritableReg) Reg)
+(decl pure writable_reg_to_reg (WritableReg) Reg)
 (extern constructor writable_reg_to_reg writable_reg_to_reg)
 
 ;; Extract the result values for the given instruction.
 (decl inst_results (ValueSlice) Inst)
 (extern extractor infallible inst_results inst_results)
+
+;; Returns whether the given value is unused in this function and is a dead
+;; result.
+(decl pure value_is_unused (Value) bool)
+(extern constructor value_is_unused value_is_unused)
 
 ;; Extract the first result value of the given instruction.
 (decl first_result (Value) Inst)
@@ -212,19 +293,49 @@
 
 ;; Extract the type of the instruction's first result and pass along the
 ;; instruction as well.
+(spec (has_type ty arg)
+      (provide (= result arg))
+      (require (= ty (widthof arg))))
 (decl has_type (Type Inst) Inst)
 (extractor (has_type ty inst)
            (and (result_type ty)
                 inst))
 
 ;; Match the instruction that defines the given value, if any.
+(spec (def_inst arg) (provide (= result arg)))
 (decl def_inst (Inst) Value)
 (extern extractor def_inst def_inst)
 
+(decl u8_from_iconst (u8) Value)
+(extractor (u8_from_iconst x)
+           (def_inst (iconst (uimm8 x))))
+
+(decl u32_from_iconst (u32) Value)
+(extractor (u32_from_iconst x)
+           (u64_from_iconst (u64_as_u32 x)))
+
 ;; Extract a constant `u64` from a value defined by an `iconst`.
+(spec (u64_from_iconst arg) (provide (= arg (zero_ext 64 result))))
 (decl u64_from_iconst (u64) Value)
 (extractor (u64_from_iconst x)
            (def_inst (iconst (u64_from_imm64 x))))
+
+(decl i8_from_iconst (i8) Value)
+(extractor (i8_from_iconst x)
+           (i32_from_iconst (i32_as_i8 x)))
+
+;; Extract a constant `i32` from a value defined by an `iconst`.
+;; The value is sign extended to 32 bits.
+(spec (i32_from_iconst arg)
+      (provide (= arg (extract 31 0 (sign_ext 64 result))))
+      (require (= result (sign_ext (widthof result) arg))))
+(decl i32_from_iconst (i32) Value)
+(extern extractor i32_from_iconst i32_from_iconst)
+
+;; Extract a constant `i64` from a value defined by an `iconst`.
+;; The value is sign extended to 64 bits.
+(decl i64_from_iconst (i64) Value)
+(extern extractor i64_from_iconst i64_from_iconst)
 
 ;; Match any zero value for iconst, fconst32, fconst64, vconst and splat.
 (decl pure partial zero_value (Value) Value)
@@ -238,6 +349,14 @@
 ;; present.
 (decl maybe_uextend (Value) Value)
 (extern extractor maybe_uextend maybe_uextend)
+
+;; Get an unsigned 8-bit immediate in a u8 from an Imm64, if possible.
+(spec (uimm8 arg)
+    (provide (= result (zero_ext 64 arg)))
+    (require (bvslt result #x0000000000000100)
+             (= (widthof arg) 8)))
+(decl uimm8 (u8) Imm64)
+(extern extractor uimm8 uimm8)
 
 ;; Instruction creation helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -287,6 +406,8 @@
                                  (inst2 MInst)
                                  (inst3 MInst))))
 
+(model SideEffectNoResult (type Unit))
+
 ;; Emit given side-effectful instruction.
 (decl emit_side_effect (SideEffectNoResult) Unit)
 (rule (emit_side_effect (SideEffectNoResult.Inst inst))
@@ -302,6 +423,8 @@
 ;; Create an empty `InstOutput`, but do emit the given side-effectful
 ;; instruction.
 (decl side_effect (SideEffectNoResult) InstOutput)
+(spec (side_effect v)
+    (provide (= result v)))
 (rule (side_effect inst)
       (let ((_ Unit (emit_side_effect inst)))
         (output_none)))
@@ -335,9 +458,14 @@
                      (ProducesFlagsReturnsResultWithConsumer (inst MInst) (result Reg))))
 
 ;; Chain another producer to a `ProducesFlags`.
-(decl produces_flags_append (ProducesFlags MInst) ProducesFlags)
-(rule (produces_flags_append (ProducesFlags.ProducesFlagsSideEffect inst1) inst2)
+(decl produces_flags_concat (ProducesFlags ProducesFlags) ProducesFlags)
+(rule (produces_flags_concat (ProducesFlags.ProducesFlagsSideEffect inst1) (ProducesFlags.ProducesFlagsSideEffect inst2))
       (ProducesFlags.ProducesFlagsTwiceSideEffect inst1 inst2))
+
+;; Newtype wrapper around `MInst` for instructions that consume and produce flags
+(type ConsumesAndProducesFlags (enum
+                      (SideEffect (inst MInst))
+                      (ReturnsReg (inst MInst) (result Reg))))
 
 ;; Newtype wrapper around `MInst` for instructions that consume flags.
 ;;
@@ -528,10 +656,251 @@
         (ConsumesFlags.ConsumesFlagsSideEffect c))
       (SideEffectNoResult.Inst3 p1 p2 c))
 
-;;;; Helpers for accessing compilation flags ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Combine flag-producing and -consuming instruction that allows more than two results to be returned
+(decl with_flags_chained (ProducesFlags ConsumesAndProducesFlags ConsumesFlags) MultiReg)
 
-(decl avoid_div_traps () Type)
-(extern extractor avoid_div_traps avoid_div_traps)
+;; ProducesFlags.SideEffect + ConsumesAndProducesFlags.SideEffect with all possible ConsumeFlags options
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsSideEffect prod_inst)
+                          (ConsumesAndProducesFlags.SideEffect middle_inst)
+                          (ConsumesFlags.ConsumesFlagsSideEffect consume_inst))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst)))
+        (MultiReg.Empty)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsSideEffect prod_inst)
+                          (ConsumesAndProducesFlags.SideEffect middle_inst)
+                          (ConsumesFlags.ConsumesFlagsSideEffect2 consume_inst1 consume_inst2))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst1))
+            (_ Unit (emit consume_inst2)))
+        (MultiReg.Empty)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsSideEffect prod_inst)
+                          (ConsumesAndProducesFlags.SideEffect middle_inst)
+                          (ConsumesFlags.ConsumesFlagsReturnsReg consume_inst reg))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst)))
+        (MultiReg.One reg)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsSideEffect prod_inst)
+                          (ConsumesAndProducesFlags.SideEffect middle_inst)
+                          (ConsumesFlags.ConsumesFlagsTwiceReturnsValueRegs consume_inst1 consume_inst2 consume_result))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst1))
+            (_ Unit (emit consume_inst2)))
+        (MultiReg.Two (value_regs_get consume_result 0) (value_regs_get consume_result 1))))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsSideEffect prod_inst)
+                          (ConsumesAndProducesFlags.SideEffect middle_inst)
+                          (ConsumesFlags.ConsumesFlagsFourTimesReturnsValueRegs consume_inst1 consume_inst2 consume_inst3 consume_inst4 consume_result))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst1))
+            (_ Unit (emit consume_inst2))
+            (_ Unit (emit consume_inst3))
+            (_ Unit (emit consume_inst4)))
+        (MultiReg.Two (value_regs_get consume_result 0) (value_regs_get consume_result 1))))
+
+
+;; ProducesFlags.ReturnsReg + ConsumesAndProducesFlags.SideEffect with all possible ConsumeFlags options
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsReg prod_inst prod_result)
+                          (ConsumesAndProducesFlags.SideEffect middle_inst)
+                          (ConsumesFlags.ConsumesFlagsSideEffect consume_inst))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst)))
+        (MultiReg.One prod_result)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsReg prod_inst prod_result)
+                          (ConsumesAndProducesFlags.SideEffect middle_inst)
+                          (ConsumesFlags.ConsumesFlagsSideEffect2 consume_inst1 consume_inst2))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst1))
+            (_ Unit (emit consume_inst2)))
+        (MultiReg.One prod_result)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsReg prod_inst prod_result)
+                          (ConsumesAndProducesFlags.SideEffect middle_inst)
+                          (ConsumesFlags.ConsumesFlagsReturnsReg consume_inst consume_result))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst)))
+        (MultiReg.Two prod_result consume_result)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsReg prod_inst prod_result)
+                          (ConsumesAndProducesFlags.SideEffect middle_inst)
+                          (ConsumesFlags.ConsumesFlagsTwiceReturnsValueRegs consume_inst1 consume_inst2 consume_result))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst1))
+            (_ Unit (emit consume_inst2)))
+        (MultiReg.Three prod_result (value_regs_get consume_result 0) (value_regs_get consume_result 1))))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsReg prod_inst prod_result)
+                          (ConsumesAndProducesFlags.SideEffect middle_inst)
+                          (ConsumesFlags.ConsumesFlagsFourTimesReturnsValueRegs consume_inst1 consume_inst2 consume_inst3 consume_inst4 consume_result))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst1))
+            (_ Unit (emit consume_inst2))
+            (_ Unit (emit consume_inst3))
+            (_ Unit (emit consume_inst4)))
+        (MultiReg.Three prod_result (value_regs_get consume_result 0) (value_regs_get consume_result 1))))
+
+
+;; ProducesFlags.SideEffect + ConsumesAndProducesFlags.ReturnsReg with all possible ConsumeFlags options
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsSideEffect prod_inst)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsSideEffect consume_inst))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst)))
+        (MultiReg.One middle_result)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsSideEffect prod_inst)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsSideEffect2 consume_inst1 consume_inst2))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst1))
+            (_ Unit (emit consume_inst2)))
+        (MultiReg.One middle_result)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsSideEffect prod_inst)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsReturnsReg consume_inst consume_result))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst)))
+        (MultiReg.Two middle_result consume_result)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsSideEffect prod_inst)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsTwiceReturnsValueRegs consume_inst1 consume_inst2 consume_result))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst1))
+            (_ Unit (emit consume_inst2)))
+        (MultiReg.Three middle_result (value_regs_get consume_result 0) (value_regs_get consume_result 1))))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsSideEffect prod_inst)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsFourTimesReturnsValueRegs consume_inst1 consume_inst2 consume_inst3 consume_inst4 consume_result))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst1))
+            (_ Unit (emit consume_inst2))
+            (_ Unit (emit consume_inst3))
+            (_ Unit (emit consume_inst4)))
+        (MultiReg.Three middle_result (value_regs_get consume_result 0) (value_regs_get consume_result 1))))
+
+
+;; ProducesFlags.ReturnsReg + ConsumesAndProducesFlags.ReturnsReg with all possible ConsumeFlags options
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsReg prod_inst prod_result)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsSideEffect consume_inst))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst)))
+        (MultiReg.Two prod_result middle_result)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsReg prod_inst prod_result)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsSideEffect2 consume_inst1 consume_inst2))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst1))
+            (_ Unit (emit consume_inst2)))
+        (MultiReg.Two prod_result middle_result)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsReg prod_inst prod_result)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsReturnsReg consume_inst consume_result))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst)))
+        (MultiReg.Three prod_result middle_result consume_result)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsReg prod_inst prod_result)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsTwiceReturnsValueRegs consume_inst1 consume_inst2 consume_result))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst1))
+            (_ Unit (emit consume_inst2)))
+        (MultiReg.Four prod_result middle_result (value_regs_get consume_result 0) (value_regs_get consume_result 1))))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsReg prod_inst prod_result)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsFourTimesReturnsValueRegs consume_inst1 consume_inst2 consume_inst3 consume_inst4 consume_result))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst1))
+            (_ Unit (emit consume_inst2))
+            (_ Unit (emit consume_inst3))
+            (_ Unit (emit consume_inst4)))
+        (MultiReg.Four prod_result middle_result (value_regs_get consume_result 0) (value_regs_get consume_result 1))))
+
+;; ProducesFlags.ReturnsResultWithConsumer + ConsumesAndProducesFlags.ReturnsReg with all possible ConsumeFlags options
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsResultWithConsumer prod_inst prod_result)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsSideEffect consume_inst))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst)))
+        (MultiReg.Two prod_result middle_result)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsResultWithConsumer prod_inst prod_result)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsSideEffect2 consume_inst1 consume_inst2))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst1))
+            (_ Unit (emit consume_inst2)))
+        (MultiReg.Two prod_result middle_result)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsResultWithConsumer prod_inst prod_result)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsReturnsReg consume_inst consume_result))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst)))
+        (MultiReg.Three prod_result middle_result consume_result)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsResultWithConsumer prod_inst prod_result)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsReturnsResultWithProducer consume_inst consume_result))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst)))
+        (MultiReg.Three prod_result middle_result consume_result)))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsResultWithConsumer prod_inst prod_result)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsTwiceReturnsValueRegs consume_inst1 consume_inst2 consume_result))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst1))
+            (_ Unit (emit consume_inst2)))
+        (MultiReg.Four prod_result middle_result (value_regs_get consume_result 0) (value_regs_get consume_result 1))))
+
+(rule (with_flags_chained (ProducesFlags.ProducesFlagsReturnsResultWithConsumer prod_inst prod_result)
+                          (ConsumesAndProducesFlags.ReturnsReg middle_inst middle_result)
+                          (ConsumesFlags.ConsumesFlagsFourTimesReturnsValueRegs consume_inst1 consume_inst2 consume_inst3 consume_inst4 consume_result))
+      (let ((_ Unit (emit prod_inst))
+            (_ Unit (emit middle_inst))
+            (_ Unit (emit consume_inst1))
+            (_ Unit (emit consume_inst2))
+            (_ Unit (emit consume_inst3))
+            (_ Unit (emit consume_inst4)))
+        (MultiReg.Four prod_result middle_result (value_regs_get consume_result 0) (value_regs_get consume_result 1))))
+
+;;;; Helpers for accessing compilation flags ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; This definition should be kept up to date with the values defined in
 ;; cranelift/codegen/meta/src/shared/settings.rs
@@ -551,6 +920,13 @@
 
 (decl pure partial preserve_frame_pointers () Unit)
 (extern constructor preserve_frame_pointers preserve_frame_pointers)
+
+;; This definition should be kept up to date with the values defined in
+;; cranelift/codegen/meta/src/shared/settings.rs
+(type StackSwitchModel extern (enum (None) (Basic) (UpdateWindowsTib)))
+
+(decl pure partial stack_switch_model () StackSwitchModel)
+(extern constructor stack_switch_model stack_switch_model)
 
 ;;;; Helpers for accessing instruction data ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -582,6 +958,11 @@
 (decl u128_from_immediate (u128) Immediate)
 (extern extractor u128_from_immediate u128_from_immediate)
 
+;; Extracts an `Immediate` as a `VCodeConstant`.
+
+(decl vconst_from_immediate (VCodeConstant) Immediate)
+(extern extractor vconst_from_immediate vconst_from_immediate)
+
 ;; Accessor for `Constant` as u128.
 
 (decl u128_from_constant (u128) Constant)
@@ -591,6 +972,18 @@
 
 (decl u64_from_constant (u64) Constant)
 (extern extractor u64_from_constant u64_from_constant)
+
+;; Extracts lane indices, represented as u8's, if the immediate for a
+;; `shuffle` instruction represents shuffling N-bit values. The u8 values
+;; returned will be in the range of 0 to (256/N)-1, inclusive, and index the
+;; N-bit chunks of two concatenated 128-bit vectors starting from the
+;; least-significant bits.
+(decl shuffle64_from_imm (u8 u8) Immediate)
+(extern extractor shuffle64_from_imm shuffle64_from_imm)
+(decl shuffle32_from_imm (u8 u8 u8 u8) Immediate)
+(extern extractor shuffle32_from_imm shuffle32_from_imm)
+(decl shuffle16_from_imm (u8 u8 u8 u8 u8 u8 u8 u8) Immediate)
+(extern extractor shuffle16_from_imm shuffle16_from_imm)
 
 ;;;; Helpers for generating returns ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -627,6 +1020,11 @@
 (type RealReg (primitive RealReg))
 
 ;; Instruction on whether and how to extend an argument value.
+(model ArgumentExtension
+  (enum
+    (None)
+    (Uext)
+    (Sext)))
 (type ArgumentExtension extern
   (enum
     (None)
@@ -658,13 +1056,9 @@
 (decl abi_no_ret_arg () Sig)
 (extern extractor abi_no_ret_arg abi_no_ret_arg)
 
-;; Size of the argument area.
-(decl abi_sized_stack_arg_space (Sig) i64)
-(extern constructor abi_sized_stack_arg_space abi_sized_stack_arg_space)
-
-;; Size of the return-value area.
-(decl abi_sized_stack_ret_space (Sig) i64)
-(extern constructor abi_sized_stack_ret_space abi_sized_stack_ret_space)
+;; Incoming return area pointer (must be present).
+(decl abi_unwrap_ret_area_ptr () Reg)
+(extern constructor abi_unwrap_ret_area_ptr abi_unwrap_ret_area_ptr)
 
 ;; StackSlot addr
 (decl abi_stackslot_addr (WritableReg StackSlot Offset32) MInst)
@@ -678,11 +1072,6 @@
 ;; return value only requires a single slot to be passed.
 (decl abi_arg_only_slot (ABIArgSlot) ABIArg)
 (extern extractor abi_arg_only_slot abi_arg_only_slot)
-
-;; Extractor to detect the special case where a struct argument
-;; is explicitly passed by reference using a hidden pointer.
-(decl abi_arg_struct_pointer (ABIArgSlot i64 u64) ABIArg)
-(extern extractor abi_arg_struct_pointer abi_arg_struct_pointer)
 
 ;; Extractor to detect the special case where a non-struct argument
 ;; is implicitly passed by reference using a hidden pointer.
@@ -702,18 +1091,33 @@
 (extern constructor gen_move gen_move)
 
 ;; Generate a return instruction
-(decl lower_return (Range ValueSlice) InstOutput)
-(rule (lower_return _ vals)
+(decl lower_return (ValueSlice) InstOutput)
+(rule (lower_return vals)
       (let ((_ Unit (gen_return vals)))
         (output_none)))
 
 (decl gen_return (ValueSlice) Unit)
 (extern constructor gen_return gen_return)
 
+(decl gen_return_call (SigRef ExternalName RelocDistance ValueSlice) InstOutput)
+(extern constructor gen_return_call gen_return_call)
+
+(decl gen_return_call_indirect (SigRef Value ValueSlice) InstOutput)
+(extern constructor gen_return_call_indirect gen_return_call_indirect)
+
+;; Helper for extracting an immediate that's not 0 and not -1 from an imm64.
+ (spec (safe_divisor_from_imm64 t x)
+       (provide (= (sign_ext 64 x) result))
+       (require (not (= #x0000000000000000 result))
+                (not (= #x1111111111111111 result))))
+(decl pure partial safe_divisor_from_imm64 (Type Imm64) u64)
+(extern constructor safe_divisor_from_imm64 safe_divisor_from_imm64)
+
 ;;;; Automatic conversions ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (convert Inst Value def_inst)
 (convert Reg ValueRegs value_reg)
+(convert WritableReg WritableValueRegs writable_value_reg)
 (convert Value Reg put_in_reg)
 (convert Value ValueRegs put_in_regs)
 (convert WritableReg Reg writable_reg_to_reg)

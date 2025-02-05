@@ -1,22 +1,19 @@
-//! Encodes instructions in the standard x86 encoding mode. This is called IA-32E mode in the Intel
-//! manuals but corresponds to the addition of the REX-prefix format (hence the name of this module)
-//! that allowed encoding instructions in both compatibility mode (32-bit instructions running on a
+//! Encodes instructions in the standard x86 encoding mode. This is called
+//! IA-32E mode in the Intel manuals but corresponds to the addition of the
+//! REX-prefix format (hence the name of this module) that allowed encoding
+//! instructions in both compatibility mode (32-bit instructions running on a
 //! 64-bit OS) and in 64-bit mode (using the full 64-bit address space).
 //!
-//! For all of the routines that take both a memory-or-reg operand (sometimes called "E" in the
-//! Intel documentation, see the Intel Developer's manual, vol. 2, section A.2) and a reg-only
-//! operand ("G" in Intelese), the order is always G first, then E. The term "enc" in the following
-//! means "hardware register encoding number".
+//! For all of the routines that take both a memory-or-reg operand (sometimes
+//! called "E" in the Intel documentation, see the Intel Developer's manual,
+//! vol. 2, section A.2) and a reg-only operand ("G" in Intel-ese), the order is
+//! always G first, then E. The term "enc" in the following means "hardware
+//! register encoding number".
 
-use crate::machinst::{Reg, RegClass};
-use crate::{
-    ir::TrapCode,
-    isa::x64::inst::{
-        args::{Amode, OperandSize},
-        regs, Inst, LabelUse,
-    },
-    machinst::MachBuffer,
-};
+use super::ByteSink;
+use crate::isa::x64::inst::args::{Amode, OperandSize};
+use crate::isa::x64::inst::{regs, Inst, LabelUse};
+use crate::machinst::{MachBuffer, Reg, RegClass};
 
 pub(crate) fn low8_will_sign_extend_to_64(x: u32) -> bool {
     let xs = (x as i32) as i64;
@@ -49,7 +46,7 @@ pub(crate) fn encode_sib(shift: u8, enc_index: u8, enc_base: u8) -> u8 {
 #[inline(always)]
 pub(crate) fn int_reg_enc(reg: impl Into<Reg>) -> u8 {
     let reg = reg.into();
-    debug_assert!(reg.is_real());
+    debug_assert!(reg.is_real(), "reg = {reg:?}");
     debug_assert_eq!(reg.class(), RegClass::Int);
     reg.to_real_reg().unwrap().hw_enc()
 }
@@ -67,28 +64,43 @@ pub(crate) fn reg_enc(reg: impl Into<Reg>) -> u8 {
 /// - bit 1 set to 1 indicates the REX prefix must always be emitted.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-pub(crate) struct RexFlags(u8);
+pub struct RexFlags(u8);
 
 impl RexFlags {
     /// By default, set the W field, and don't always emit.
     #[inline(always)]
-    pub(crate) fn set_w() -> Self {
+    pub fn set_w() -> Self {
         Self(0)
     }
+
     /// Creates a new RexPrefix for which the REX.W bit will be cleared.
     #[inline(always)]
-    pub(crate) fn clear_w() -> Self {
+    pub fn clear_w() -> Self {
         Self(1)
     }
 
+    /// True if 64-bit operands are used.
     #[inline(always)]
-    pub(crate) fn always_emit(&mut self) -> &mut Self {
+    pub fn must_clear_w(&self) -> bool {
+        (self.0 & 1) != 0
+    }
+
+    /// Require that the REX prefix is emitted.
+    #[inline(always)]
+    pub fn always_emit(&mut self) -> &mut Self {
         self.0 = self.0 | 2;
         self
     }
 
+    /// True if the REX prefix must always be emitted.
     #[inline(always)]
-    pub(crate) fn always_emit_if_8bit_needed(&mut self, reg: Reg) -> &mut Self {
+    pub fn must_always_emit(&self) -> bool {
+        (self.0 & 2) != 0
+    }
+
+    /// Emit the rex prefix if the referenced register would require it for 8-bit operations.
+    #[inline(always)]
+    pub fn always_emit_if_8bit_needed(&mut self, reg: Reg) -> &mut Self {
         let enc_reg = int_reg_enc(reg);
         if enc_reg >= 4 && enc_reg <= 7 {
             self.always_emit();
@@ -96,17 +108,9 @@ impl RexFlags {
         self
     }
 
+    /// Emit a unary instruction.
     #[inline(always)]
-    pub(crate) fn must_clear_w(&self) -> bool {
-        (self.0 & 1) != 0
-    }
-    #[inline(always)]
-    pub(crate) fn must_always_emit(&self) -> bool {
-        (self.0 & 2) != 0
-    }
-
-    #[inline(always)]
-    pub(crate) fn emit_one_op(&self, sink: &mut MachBuffer<Inst>, enc_e: u8) {
+    pub fn emit_one_op<BS: ByteSink + ?Sized>(&self, sink: &mut BS, enc_e: u8) {
         // Register Operand coded in Opcode Byte
         // REX.R and REX.X unused
         // REX.B == 1 accesses r8-r15
@@ -120,8 +124,9 @@ impl RexFlags {
         }
     }
 
+    /// Emit a binary instruction.
     #[inline(always)]
-    pub(crate) fn emit_two_op(&self, sink: &mut MachBuffer<Inst>, enc_g: u8, enc_e: u8) {
+    pub fn emit_two_op<BS: ByteSink + ?Sized>(&self, sink: &mut BS, enc_g: u8, enc_e: u8) {
         let w = if self.must_clear_w() { 0 } else { 1 };
         let r = (enc_g >> 3) & 1;
         let x = 0;
@@ -132,10 +137,11 @@ impl RexFlags {
         }
     }
 
+    /// Emit a ternary instruction.
     #[inline(always)]
-    pub fn emit_three_op(
+    pub fn emit_three_op<BS: ByteSink + ?Sized>(
         &self,
-        sink: &mut MachBuffer<Inst>,
+        sink: &mut BS,
         enc_g: u8,
         enc_index: u8,
         enc_base: u8,
@@ -224,7 +230,7 @@ pub enum LegacyPrefixes {
 impl LegacyPrefixes {
     /// Emit the legacy prefix as bytes (e.g. in REX instructions).
     #[inline(always)]
-    pub(crate) fn emit(&self, sink: &mut MachBuffer<Inst>) {
+    pub(crate) fn emit<BS: ByteSink + ?Sized>(&self, sink: &mut BS) {
         match self {
             Self::_66 => sink.put1(0x66),
             Self::_F0 => sink.put1(0xF0),
@@ -305,9 +311,8 @@ pub(crate) fn emit_std_enc_mem(
     // 64-bit integer registers, because they are part of an address
     // expression.  But `enc_g` can be derived from a register of any class.
 
-    let can_trap = mem_e.can_trap();
-    if can_trap {
-        sink.add_trap(TrapCode::HeapOutOfBounds);
+    if let Some(trap_code) = mem_e.get_flags().trap_code() {
+        sink.add_trap(trap_code);
     }
 
     prefixes.emit(sink);
@@ -344,7 +349,7 @@ pub(crate) fn emit_std_enc_mem(
     }
 
     // And finally encode the mod/rm bytes and all further information.
-    emit_modrm_sib_disp(sink, enc_g, mem_e, bytes_at_end)
+    emit_modrm_sib_disp(sink, enc_g, mem_e, bytes_at_end, None)
 }
 
 pub(crate) fn emit_modrm_sib_disp(
@@ -352,50 +357,35 @@ pub(crate) fn emit_modrm_sib_disp(
     enc_g: u8,
     mem_e: &Amode,
     bytes_at_end: u8,
+    evex_scaling: Option<i8>,
 ) {
     match *mem_e {
         Amode::ImmReg { simm32, base, .. } => {
             let enc_e = int_reg_enc(base);
+            let mut imm = Imm::new(simm32, evex_scaling);
 
-            // Now the mod/rm and associated immediates.  This is
-            // significantly complicated due to the multiple special cases.
-            if simm32 == 0
-                && enc_e != regs::ENC_RSP
-                && enc_e != regs::ENC_RBP
-                && enc_e != regs::ENC_R12
-                && enc_e != regs::ENC_R13
-            {
-                // FIXME JRS 2020Feb11: those four tests can surely be
-                // replaced by a single mask-and-compare check.  We should do
-                // that because this routine is likely to be hot.
-                sink.put1(encode_modrm(0, enc_g & 7, enc_e & 7));
-            } else if simm32 == 0 && (enc_e == regs::ENC_RSP || enc_e == regs::ENC_R12) {
-                sink.put1(encode_modrm(0, enc_g & 7, 4));
-                sink.put1(0x24);
-            } else if low8_will_sign_extend_to_32(simm32)
-                && enc_e != regs::ENC_RSP
-                && enc_e != regs::ENC_R12
-            {
-                sink.put1(encode_modrm(1, enc_g & 7, enc_e & 7));
-                sink.put1((simm32 & 0xFF) as u8);
-            } else if enc_e != regs::ENC_RSP && enc_e != regs::ENC_R12 {
-                sink.put1(encode_modrm(2, enc_g & 7, enc_e & 7));
-                sink.put4(simm32);
-            } else if (enc_e == regs::ENC_RSP || enc_e == regs::ENC_R12)
-                && low8_will_sign_extend_to_32(simm32)
-            {
-                // REX.B distinguishes RSP from R12
-                sink.put1(encode_modrm(1, enc_g & 7, 4));
-                sink.put1(0x24);
-                sink.put1((simm32 & 0xFF) as u8);
-            } else if enc_e == regs::ENC_R12 || enc_e == regs::ENC_RSP {
-                //.. wait for test case for RSP case
-                // REX.B distinguishes RSP from R12
-                sink.put1(encode_modrm(2, enc_g & 7, 4));
-                sink.put1(0x24);
-                sink.put4(simm32);
+            // Most base registers allow for a single ModRM byte plus an
+            // optional immediate. If rsp is the base register, however, then a
+            // SIB byte must be used.
+            let enc_e_low3 = enc_e & 7;
+            if enc_e_low3 != regs::ENC_RSP {
+                // If the base register is rbp and there's no offset then force
+                // a 1-byte zero offset since otherwise the encoding would be
+                // invalid.
+                if enc_e_low3 == regs::ENC_RBP {
+                    imm.force_immediate();
+                }
+                sink.put1(encode_modrm(imm.m0d(), enc_g & 7, enc_e & 7));
+                imm.emit(sink);
             } else {
-                unreachable!("ImmReg");
+                // Displacement from RSP is encoded with a SIB byte where
+                // the index and base are both encoded as RSP's encoding of
+                // 0b100. This special encoding means that the index register
+                // isn't used and the base is 0b100 with or without a
+                // REX-encoded 4th bit (e.g. rsp or r12)
+                sink.put1(encode_modrm(imm.m0d(), enc_g & 7, 0b100));
+                sink.put1(0b00_100_100);
+                imm.emit(sink);
             }
         }
 
@@ -409,23 +399,31 @@ pub(crate) fn emit_modrm_sib_disp(
             let enc_base = int_reg_enc(*reg_base);
             let enc_index = int_reg_enc(*reg_index);
 
-            // modrm, SIB, immediates.
-            if low8_will_sign_extend_to_32(simm32) && enc_index != regs::ENC_RSP {
-                sink.put1(encode_modrm(1, enc_g & 7, 4));
-                sink.put1(encode_sib(shift, enc_index & 7, enc_base & 7));
-                sink.put1(simm32 as u8);
-            } else if enc_index != regs::ENC_RSP {
-                sink.put1(encode_modrm(2, enc_g & 7, 4));
-                sink.put1(encode_sib(shift, enc_index & 7, enc_base & 7));
-                sink.put4(simm32);
-            } else {
-                panic!("ImmRegRegShift");
+            // Encoding of ModRM/SIB bytes don't allow the index register to
+            // ever be rsp. Note, though, that the encoding of r12, whose three
+            // lower bits match the encoding of rsp, is explicitly allowed with
+            // REX bytes so only rsp is disallowed.
+            assert!(enc_index != regs::ENC_RSP);
+
+            // If the offset is zero then there is no immediate. Note, though,
+            // that if the base register's lower three bits are `101` then an
+            // offset must be present. This is a special case in the encoding of
+            // the SIB byte and requires an explicit displacement with rbp/r13.
+            let mut imm = Imm::new(simm32, evex_scaling);
+            if enc_base & 7 == regs::ENC_RBP {
+                imm.force_immediate();
             }
+
+            // With the above determined encode the ModRM byte, then the SIB
+            // byte, then any immediate as necessary.
+            sink.put1(encode_modrm(imm.m0d(), enc_g & 7, 0b100));
+            sink.put1(encode_sib(shift, enc_index & 7, enc_base & 7));
+            imm.emit(sink);
         }
 
         Amode::RipRelative { ref target } => {
             // RIP-relative is mod=00, rm=101.
-            sink.put1(encode_modrm(0, enc_g & 7, 0b101));
+            sink.put1(encode_modrm(0b00, enc_g & 7, 0b101));
 
             let offset = sink.cur_offset();
             sink.use_label_at_offset(offset, *target, LabelUse::JmpRel32);
@@ -436,7 +434,76 @@ pub(crate) fn emit_modrm_sib_disp(
             // to the end of the u32 field. So, to compensate for
             // this, we emit a negative extra offset in the u32 field
             // initially, and the relocation will add to it.
-            sink.put4(-(bytes_at_end as i32) as u32);
+            sink.put4(-(i32::from(bytes_at_end)) as u32);
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+enum Imm {
+    None,
+    Imm8(i8),
+    Imm32(i32),
+}
+
+impl Imm {
+    /// Classifies the 32-bit immediate `val` as how this can be encoded
+    /// with ModRM/SIB bytes.
+    ///
+    /// For `evex_scaling` according to Section 2.7.5 of Intel's manual:
+    ///
+    /// > EVEX-encoded instructions always use a compressed displacement scheme
+    /// > by multiplying disp8 in conjunction with a scaling factor N that is
+    /// > determined based on the vector length, the value of EVEX.b bit
+    /// > (embedded broadcast) and the input element size of the instruction
+    ///
+    /// The `evex_scaling` factor provided here is `Some(N)` for EVEX
+    /// instructions.  This is taken into account where the `Imm` value
+    /// contained is the raw byte offset.
+    fn new(val: i32, evex_scaling: Option<i8>) -> Imm {
+        if val == 0 {
+            return Imm::None;
+        }
+        match evex_scaling {
+            Some(scaling) => {
+                if val % i32::from(scaling) == 0 {
+                    let scaled = val / i32::from(scaling);
+                    if low8_will_sign_extend_to_32(scaled as u32) {
+                        return Imm::Imm8(scaled as i8);
+                    }
+                }
+                Imm::Imm32(val)
+            }
+            None => match i8::try_from(val) {
+                Ok(val) => Imm::Imm8(val),
+                Err(_) => Imm::Imm32(val),
+            },
+        }
+    }
+
+    /// Forces `Imm::None` to become `Imm::Imm8(0)`, used for special cases
+    /// where some base registers require an immediate.
+    fn force_immediate(&mut self) {
+        if let Imm::None = self {
+            *self = Imm::Imm8(0);
+        }
+    }
+
+    /// Returns the two "mod" bits present at the upper bits of the mod/rm
+    /// byte.
+    fn m0d(&self) -> u8 {
+        match self {
+            Imm::None => 0b00,
+            Imm::Imm8(_) => 0b01,
+            Imm::Imm32(_) => 0b10,
+        }
+    }
+
+    fn emit<BS: ByteSink + ?Sized>(&self, sink: &mut BS) {
+        match self {
+            Imm::None => {}
+            Imm::Imm8(n) => sink.put1(*n as u8),
+            Imm::Imm32(n) => sink.put4(*n as u32),
         }
     }
 }
@@ -445,8 +512,8 @@ pub(crate) fn emit_modrm_sib_disp(
 ///
 /// This is conceptually the same as emit_modrm_sib_enc_ge, except it is for the case where the E
 /// operand is a register rather than memory.  Hence it is much simpler.
-pub(crate) fn emit_std_enc_enc(
-    sink: &mut MachBuffer<Inst>,
+pub(crate) fn emit_std_enc_enc<BS: ByteSink + ?Sized>(
+    sink: &mut BS,
     prefixes: LegacyPrefixes,
     opcodes: u32,
     mut num_opcodes: usize,
@@ -473,7 +540,7 @@ pub(crate) fn emit_std_enc_enc(
 
     // Now the mod/rm byte.  The instruction we're generating doesn't access
     // memory, so there is no SIB byte or immediate -- we're done.
-    sink.put1(encode_modrm(3, enc_g & 7, enc_e & 7));
+    sink.put1(encode_modrm(0b11, enc_g & 7, enc_e & 7));
 }
 
 // These are merely wrappers for the above two functions that facilitate passing
@@ -502,8 +569,8 @@ pub(crate) fn emit_std_reg_mem(
     );
 }
 
-pub(crate) fn emit_std_reg_reg(
-    sink: &mut MachBuffer<Inst>,
+pub(crate) fn emit_std_reg_reg<BS: ByteSink + ?Sized>(
+    sink: &mut BS,
     prefixes: LegacyPrefixes,
     opcodes: u32,
     num_opcodes: usize,
@@ -517,7 +584,7 @@ pub(crate) fn emit_std_reg_reg(
 }
 
 /// Write a suitable number of bits from an imm64 to the sink.
-pub(crate) fn emit_simm(sink: &mut MachBuffer<Inst>, size: u8, simm32: u32) {
+pub(crate) fn emit_simm<BS: ByteSink + ?Sized>(sink: &mut BS, size: u8, simm32: u32) {
     match size {
         8 | 4 => sink.put4(simm32),
         2 => sink.put2(simm32 as u16),

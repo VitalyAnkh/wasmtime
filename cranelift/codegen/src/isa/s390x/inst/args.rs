@@ -3,10 +3,6 @@
 use crate::ir::condcodes::{FloatCC, IntCC};
 use crate::ir::MemFlags;
 use crate::isa::s390x::inst::*;
-use crate::machinst::MachLabel;
-use crate::machinst::{PrettyPrint, Reg};
-
-use std::string::String;
 
 //=============================================================================
 // Instruction sub-components (memory addresses): definitions
@@ -53,19 +49,20 @@ pub enum MemArg {
     /// Offset from the stack pointer at function entry.
     InitialSPOffset { off: i64 },
 
-    /// Offset from the "nominal stack pointer", which is where the real SP is
-    /// just after stack and spill slots are allocated in the function prologue.
+    /// Offset from the (nominal) stack pointer during this function.
+    NominalSPOffset { off: i64 },
+
+    /// Offset into the slot area of the stack, which lies just above the
+    /// outgoing argument area that's setup by the function prologue.
     /// At emission time, this is converted to `SPOffset` with a fixup added to
     /// the offset constant. The fixup is a running value that is tracked as
     /// emission iterates through instructions in linear order, and can be
     /// adjusted up and down with [Inst::VirtualSPOffsetAdj].
     ///
     /// The standard ABI is in charge of handling this (by emitting the
-    /// adjustment meta-instructions). It maintains the invariant that "nominal
-    /// SP" is where the actual SP is after the function prologue and before
-    /// clobber pushes. See the diagram in the documentation for
-    /// [crate::isa::s390x::abi](the ABI module) for more details.
-    NominalSPOffset { off: i64 },
+    /// adjustment meta-instructions). See the diagram in the documentation
+    /// for [crate::isa::aarch64::abi](the ABI module) for more details.
+    SlotOffset { off: i64 },
 }
 
 impl MemArg {
@@ -94,6 +91,25 @@ impl MemArg {
         MemArg::RegOffset { reg, off, flags }
     }
 
+    /// Add an offset to a virtual addressing mode.
+    pub fn offset(base: &MemArg, offset: i64) -> MemArg {
+        match base {
+            &MemArg::RegOffset { reg, off, flags } => MemArg::RegOffset {
+                reg,
+                off: off + offset,
+                flags,
+            },
+            &MemArg::InitialSPOffset { off } => MemArg::InitialSPOffset { off: off + offset },
+            &MemArg::NominalSPOffset { off } => MemArg::NominalSPOffset { off: off + offset },
+            &MemArg::SlotOffset { off } => MemArg::SlotOffset { off: off + offset },
+            // This routine is only defined for virtual addressing modes.
+            &MemArg::BXD12 { .. }
+            | &MemArg::BXD20 { .. }
+            | &MemArg::Label { .. }
+            | &MemArg::Symbol { .. } => unreachable!(),
+        }
+    }
+
     pub(crate) fn get_flags(&self) -> MemFlags {
         match self {
             MemArg::BXD12 { flags, .. } => *flags,
@@ -103,104 +119,7 @@ impl MemArg {
             MemArg::Symbol { flags, .. } => *flags,
             MemArg::InitialSPOffset { .. } => MemFlags::trusted(),
             MemArg::NominalSPOffset { .. } => MemFlags::trusted(),
-        }
-    }
-
-    pub(crate) fn can_trap(&self) -> bool {
-        !self.get_flags().notrap()
-    }
-
-    /// Edit registers with allocations.
-    pub fn with_allocs(&self, allocs: &mut AllocationConsumer<'_>) -> Self {
-        match self {
-            &MemArg::BXD12 {
-                base,
-                index,
-                disp,
-                flags,
-            } => MemArg::BXD12 {
-                base: allocs.next(base),
-                index: allocs.next(index),
-                disp,
-                flags,
-            },
-            &MemArg::BXD20 {
-                base,
-                index,
-                disp,
-                flags,
-            } => MemArg::BXD20 {
-                base: allocs.next(base),
-                index: allocs.next(index),
-                disp,
-                flags,
-            },
-            &MemArg::RegOffset { reg, off, flags } => MemArg::RegOffset {
-                reg: allocs.next(reg),
-                off,
-                flags,
-            },
-            x => x.clone(),
-        }
-    }
-}
-
-/// A memory argument for an instruction with two memory operands.
-/// We cannot use two instances of MemArg, because we do not have
-/// two free temp registers that would be needed to reload two
-/// addresses in the general case.  Also, two copies of MemArg would
-/// increase the size of Inst beyond its current limit.  Use this
-/// simplified form instead that never needs any reloads, and suffices
-/// for all current users.
-#[derive(Clone, Debug)]
-pub struct MemArgPair {
-    pub base: Reg,
-    pub disp: UImm12,
-    pub flags: MemFlags,
-}
-
-impl MemArgPair {
-    /// Convert a MemArg to a MemArgPair if possible.
-    pub fn maybe_from_memarg(mem: &MemArg) -> Option<MemArgPair> {
-        match mem {
-            &MemArg::BXD12 {
-                base,
-                index,
-                disp,
-                flags,
-            } => {
-                if index != zero_reg() {
-                    None
-                } else {
-                    Some(MemArgPair { base, disp, flags })
-                }
-            }
-            &MemArg::RegOffset { reg, off, flags } => {
-                if off < 0 {
-                    None
-                } else {
-                    let disp = UImm12::maybe_from_u64(off as u64)?;
-                    Some(MemArgPair {
-                        base: reg,
-                        disp,
-                        flags,
-                    })
-                }
-            }
-            _ => None,
-        }
-    }
-
-    pub(crate) fn can_trap(&self) -> bool {
-        !self.flags.notrap()
-    }
-
-    /// Edit registers with allocations.
-    pub fn with_allocs(&self, allocs: &mut AllocationConsumer<'_>) -> Self {
-        MemArgPair {
-            base: allocs.next(self.base),
-            disp: self.disp,
-            flags: self.flags,
+            MemArg::SlotOffset { .. } => MemFlags::trusted(),
         }
     }
 }
@@ -271,13 +190,11 @@ impl Cond {
 }
 
 impl PrettyPrint for MemArg {
-    fn pretty_print(&self, _: u8, allocs: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         match self {
             &MemArg::BXD12 {
                 base, index, disp, ..
             } => {
-                let base = allocs.next(base);
-                let index = allocs.next(index);
                 if base != zero_reg() {
                     if index != zero_reg() {
                         format!(
@@ -300,8 +217,6 @@ impl PrettyPrint for MemArg {
             &MemArg::BXD20 {
                 base, index, disp, ..
             } => {
-                let base = allocs.next(base);
-                let index = allocs.next(index);
                 if base != zero_reg() {
                     if index != zero_reg() {
                         format!(
@@ -328,6 +243,7 @@ impl PrettyPrint for MemArg {
             // Eliminated by `mem_finalize()`.
             &MemArg::InitialSPOffset { .. }
             | &MemArg::NominalSPOffset { .. }
+            | &MemArg::SlotOffset { .. }
             | &MemArg::RegOffset { .. } => {
                 panic!("Unexpected pseudo mem-arg mode (stack-offset or generic reg-offset)!")
             }
@@ -336,7 +252,7 @@ impl PrettyPrint for MemArg {
 }
 
 impl PrettyPrint for Cond {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         let s = match self.mask {
             1 => "o",
             2 => "h",

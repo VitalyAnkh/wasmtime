@@ -1,21 +1,17 @@
 //! S390x ISA definitions: registers.
 
 use alloc::string::String;
-use regalloc2::MachineEnv;
 use regalloc2::PReg;
-use regalloc2::VReg;
 
 use crate::isa::s390x::inst::{RegPair, WritableRegPair};
 use crate::machinst::*;
-use crate::settings;
 
 //=============================================================================
 // Registers, the Universe thereof, and printing
 
 /// Get a reference to a GPR (integer register).
 pub fn gpr(num: u8) -> Reg {
-    let preg = gpr_preg(num);
-    Reg::from(VReg::new(preg.index(), RegClass::Int))
+    Reg::from(gpr_preg(num))
 }
 
 pub(crate) const fn gpr_preg(num: u8) -> PReg {
@@ -30,8 +26,7 @@ pub fn writable_gpr(num: u8) -> Writable<Reg> {
 
 /// Get a reference to a VR (vector register).
 pub fn vr(num: u8) -> Reg {
-    let preg = vr_preg(num);
-    Reg::from(VReg::new(preg.index(), RegClass::Float))
+    Reg::from(vr_preg(num))
 }
 
 pub(crate) const fn vr_preg(num: u8) -> PReg {
@@ -83,85 +78,15 @@ pub fn zero_reg() -> Reg {
     gpr(0)
 }
 
-/// Create the register universe for AArch64.
-pub fn create_machine_env(_flags: &settings::Flags) -> MachineEnv {
-    fn preg(r: Reg) -> PReg {
-        r.to_real_reg().unwrap().into()
-    }
-
-    MachineEnv {
-        preferred_regs_by_class: [
-            vec![
-                // no r0; can't use for addressing?
-                // no r1; it is our spilltmp.
-                preg(gpr(2)),
-                preg(gpr(3)),
-                preg(gpr(4)),
-                preg(gpr(5)),
-            ],
-            vec![
-                preg(vr(0)),
-                preg(vr(1)),
-                preg(vr(2)),
-                preg(vr(3)),
-                preg(vr(4)),
-                preg(vr(5)),
-                preg(vr(6)),
-                preg(vr(7)),
-                preg(vr(16)),
-                preg(vr(17)),
-                preg(vr(18)),
-                preg(vr(19)),
-                preg(vr(20)),
-                preg(vr(21)),
-                preg(vr(22)),
-                preg(vr(23)),
-                preg(vr(24)),
-                preg(vr(25)),
-                preg(vr(26)),
-                preg(vr(27)),
-                preg(vr(28)),
-                preg(vr(29)),
-                preg(vr(30)),
-                preg(vr(31)),
-            ],
-        ],
-        non_preferred_regs_by_class: [
-            vec![
-                preg(gpr(6)),
-                preg(gpr(7)),
-                preg(gpr(8)),
-                preg(gpr(9)),
-                preg(gpr(10)),
-                preg(gpr(11)),
-                preg(gpr(12)),
-                preg(gpr(13)),
-                preg(gpr(14)),
-                // no r15; it is the stack pointer.
-            ],
-            vec![
-                preg(vr(8)),
-                preg(vr(9)),
-                preg(vr(10)),
-                preg(vr(11)),
-                preg(vr(12)),
-                preg(vr(13)),
-                preg(vr(14)),
-                preg(vr(15)),
-            ],
-        ],
-        fixed_stack_slots: vec![],
-    }
-}
-
 pub fn show_reg(reg: Reg) -> String {
     if let Some(rreg) = reg.to_real_reg() {
         match rreg.class() {
             RegClass::Int => format!("%r{}", rreg.hw_enc()),
             RegClass::Float => format!("%v{}", rreg.hw_enc()),
+            RegClass::Vector => unreachable!(),
         }
     } else {
-        format!("%{:?}", reg)
+        format!("%{reg:?}")
     }
 }
 
@@ -174,14 +99,13 @@ pub fn maybe_show_fpr(reg: Reg) -> Option<String> {
     None
 }
 
-pub fn pretty_print_reg(reg: Reg, allocs: &mut AllocationConsumer<'_>) -> String {
-    let reg = allocs.next(reg);
+pub fn pretty_print_reg(reg: Reg) -> String {
     show_reg(reg)
 }
 
-pub fn pretty_print_regpair(pair: RegPair, allocs: &mut AllocationConsumer<'_>) -> String {
-    let hi = allocs.next(pair.hi);
-    let lo = allocs.next(pair.lo);
+pub fn pretty_print_regpair(pair: RegPair) -> String {
+    let hi = pair.hi;
+    let lo = pair.lo;
     if let Some(hi_reg) = hi.to_real_reg() {
         if let Some(lo_reg) = lo.to_real_reg() {
             assert!(
@@ -197,13 +121,9 @@ pub fn pretty_print_regpair(pair: RegPair, allocs: &mut AllocationConsumer<'_>) 
     format!("{}/{}", show_reg(hi), show_reg(lo))
 }
 
-pub fn pretty_print_reg_mod(
-    rd: Writable<Reg>,
-    ri: Reg,
-    allocs: &mut AllocationConsumer<'_>,
-) -> String {
-    let output = allocs.next_writable(rd).to_reg();
-    let input = allocs.next(ri);
+pub fn pretty_print_reg_mod(rd: Writable<Reg>, ri: Reg) -> String {
+    let output = rd.to_reg();
+    let input = ri;
     if output == input {
         show_reg(output)
     } else {
@@ -211,15 +131,11 @@ pub fn pretty_print_reg_mod(
     }
 }
 
-pub fn pretty_print_regpair_mod(
-    rd: WritableRegPair,
-    ri: RegPair,
-    allocs: &mut AllocationConsumer<'_>,
-) -> String {
-    let rd_hi = allocs.next(rd.hi.to_reg());
-    let rd_lo = allocs.next(rd.lo.to_reg());
-    let ri_hi = allocs.next(ri.hi);
-    let ri_lo = allocs.next(ri.lo);
+pub fn pretty_print_regpair_mod(rd: WritableRegPair, ri: RegPair) -> String {
+    let rd_hi = rd.hi.to_reg();
+    let rd_lo = rd.lo.to_reg();
+    let ri_hi = ri.hi;
+    let ri_lo = ri.lo;
     if rd_hi == ri_hi {
         show_reg(rd_hi)
     } else {
@@ -233,14 +149,9 @@ pub fn pretty_print_regpair_mod(
     }
 }
 
-pub fn pretty_print_regpair_mod_lo(
-    rd: WritableRegPair,
-    ri: Reg,
-    allocs: &mut AllocationConsumer<'_>,
-) -> String {
-    let rd_hi = allocs.next(rd.hi.to_reg());
-    let rd_lo = allocs.next(rd.lo.to_reg());
-    let ri = allocs.next(ri);
+pub fn pretty_print_regpair_mod_lo(rd: WritableRegPair, ri: Reg) -> String {
+    let rd_hi = rd.hi.to_reg();
+    let rd_lo = rd.lo.to_reg();
     if rd_lo == ri {
         show_reg(rd_hi)
     } else {
@@ -253,7 +164,6 @@ pub fn pretty_print_regpair_mod_lo(
     }
 }
 
-pub fn pretty_print_fpr(reg: Reg, allocs: &mut AllocationConsumer<'_>) -> (String, Option<String>) {
-    let reg = allocs.next(reg);
+pub fn pretty_print_fpr(reg: Reg) -> (String, Option<String>) {
     (show_reg(reg), maybe_show_fpr(reg))
 }

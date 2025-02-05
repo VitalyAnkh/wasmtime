@@ -4,7 +4,7 @@
 //!
 //! Usage Example:
 //!     Record
-//!         sudo perf record -k 1 -e instructions:u target/debug/wasmtime -g --jitdump test.wasm
+//!         sudo perf record -k 1 -e instructions:u target/debug/wasmtime -g --profile=jitdump test.wasm
 //!     Combine
 //!         sudo perf inject -v -j -i perf.data -o perf.jit.data
 //!     Report
@@ -84,7 +84,7 @@ pub struct DebugEntry {
 }
 
 /// Describes debug information for a jitted function. An array of debug entries are
-/// appended to this record during writting. Note, this record must preceed the code
+/// appended to this record during writing. Note, this record must precede the code
 /// load record that describes the same jitted function.
 #[derive(Debug, Default, Clone, Copy)]
 #[repr(C)]
@@ -139,7 +139,7 @@ pub struct JitDumpFile {
 }
 
 impl JitDumpFile {
-    /// Intialize a JitDumpAgent and write out the header
+    /// Initialize a JitDumpAgent and write out the header
     pub fn new(filename: impl AsRef<Path>, e_machine: u32) -> io::Result<Self> {
         let jitdump_file = OpenOptions::new()
             .read(true)
@@ -252,8 +252,7 @@ impl JitDumpFile {
     pub fn dump_code_load_record(
         &mut self,
         method_name: &str,
-        addr: *const u8,
-        len: usize,
+        code: &[u8],
         timestamp: u64,
         pid: u32,
         tid: u32,
@@ -263,7 +262,7 @@ impl JitDumpFile {
 
         let rh = RecordHeader {
             id: RecordId::JitCodeLoad as u32,
-            record_size: size_limit as u32 + name_len as u32 + len as u32,
+            record_size: size_limit as u32 + name_len as u32 + code.len() as u32,
             timestamp,
         };
 
@@ -271,16 +270,13 @@ impl JitDumpFile {
             header: rh,
             pid,
             tid,
-            virtual_address: addr as u64,
-            address: addr as u64,
-            size: len as u64,
+            virtual_address: code.as_ptr() as u64,
+            address: code.as_ptr() as u64,
+            size: code.len() as u64,
             index: self.next_code_index(),
         };
 
-        unsafe {
-            let code_buffer: &[u8] = std::slice::from_raw_parts(addr, len);
-            self.write_code_load_record(method_name, clr, code_buffer)
-        }
+        self.write_code_load_record(method_name, clr, code)
     }
 }
 

@@ -1,11 +1,20 @@
-use std::ffi::c_void;
-use std::io::Result;
+use core::ffi::c_void;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+extern crate std;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use std::io::Result;
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub use anyhow::Result;
 
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "android")
 ))]
 mod details {
+    extern crate std;
+
     use super::*;
     use libc::{syscall, EINVAL, EPERM};
     use std::io::Error;
@@ -87,29 +96,34 @@ mod details {
     any(target_os = "linux", target_os = "android")
 )))]
 mod details {
-    pub(crate) fn pipeline_flush_mt() -> std::io::Result<()> {
+    // NB: this uses `anyhow::Result` instead of `std::io::Result` to compile on
+    // `no_std`.
+    pub(crate) fn pipeline_flush_mt() -> super::Result<()> {
         Ok(())
     }
 }
+
 #[cfg(all(target_arch = "riscv64", target_os = "linux"))]
 fn riscv_flush_icache(start: u64, end: u64) -> Result<()> {
     cfg_if::cfg_if! {
         if #[cfg(feature = "one-core")] {
-            use std::arch::asm;
+            use core::arch::asm;
+            let _ = (start, end);
             unsafe {
                 asm!("fence.i");
             };
             Ok(())
         } else {
+            extern crate std;
+
+            #[expect(non_upper_case_globals, reason = "matching C style")]
             match unsafe {
                 libc::syscall(
                     {
-                        // The syscall isn't defined in `libc`, so we definfe the syscall number here.
+                        // The syscall isn't defined in `libc`, so we define the syscall number here.
                         // https://github.com/torvalds/linux/search?q=__NR_arch_specific_syscall
-                        #[allow(non_upper_case_globals)]
                         const  __NR_arch_specific_syscall :i64 = 244;
                         // https://github.com/torvalds/linux/blob/5bfc75d92efd494db37f5c4c173d3639d4772966/tools/arch/riscv/include/uapi/asm/unistd.h#L40
-                        #[allow(non_upper_case_globals)]
                         const sys_riscv_flush_icache :i64 =  __NR_arch_specific_syscall + 15;
                         sys_riscv_flush_icache
                     },
@@ -117,9 +131,7 @@ fn riscv_flush_icache(start: u64, end: u64) -> Result<()> {
                     start, // start
                     end, // end
                     {
-                        #[allow(non_snake_case)]
                         const SYS_RISCV_FLUSH_ICACHE_LOCAL :i64 = 1;
-                        #[allow(non_snake_case)]
                         const SYS_RISCV_FLUSH_ICACHE_ALL :i64 = SYS_RISCV_FLUSH_ICACHE_LOCAL;
                         SYS_RISCV_FLUSH_ICACHE_ALL
                     }, // flags

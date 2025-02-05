@@ -1,24 +1,51 @@
-use crate::RunResult;
+use crate::{RunResult, RuntimeFiberStack};
+use alloc::boxed::Box;
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::io;
+use std::ops::Range;
 use std::ptr;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Threading::*;
+
+pub type Error = io::Error;
 
 #[derive(Debug)]
 pub struct FiberStack(usize);
 
 impl FiberStack {
-    pub fn new(size: usize) -> io::Result<Self> {
+    pub fn new(size: usize, zeroed: bool) -> io::Result<Self> {
+        // We don't support fiber stack zeroing on windows.
+        let _ = zeroed;
+
         Ok(Self(size))
     }
 
-    pub unsafe fn from_top_ptr(_top: *mut u8) -> io::Result<Self> {
+    pub unsafe fn from_raw_parts(
+        _base: *mut u8,
+        _guard_size: usize,
+        _len: usize,
+    ) -> io::Result<Self> {
+        Err(io::Error::from_raw_os_error(ERROR_NOT_SUPPORTED as i32))
+    }
+
+    pub fn is_from_raw_parts(&self) -> bool {
+        false
+    }
+
+    pub fn from_custom(_custom: Box<dyn RuntimeFiberStack>) -> io::Result<Self> {
         Err(io::Error::from_raw_os_error(ERROR_NOT_SUPPORTED as i32))
     }
 
     pub fn top(&self) -> Option<*mut u8> {
+        None
+    }
+
+    pub fn range(&self) -> Option<Range<usize>> {
+        None
+    }
+
+    pub fn guard_range(&self) -> Option<Range<*mut u8>> {
         None
     }
 }
@@ -40,13 +67,14 @@ struct StartState {
 
 const FIBER_FLAG_FLOAT_SWITCH: u32 = 1;
 
-extern "C" {
+unsafe extern "C" {
+    #[wasmtime_versioned_export_macros::versioned_link]
     fn wasmtime_fiber_get_current() -> *mut c_void;
 }
 
 unsafe extern "system" fn fiber_start<F, A, B, C>(data: *mut c_void)
 where
-    F: FnOnce(A, &super::Suspend<A, B, C>) -> C,
+    F: FnOnce(A, &mut super::Suspend<A, B, C>) -> C,
 {
     // Set the stack guarantee to be consistent with what Rust expects for threads
     // This value is taken from:
@@ -66,7 +94,7 @@ where
 impl Fiber {
     pub fn new<F, A, B, C>(stack: &FiberStack, func: F) -> io::Result<Self>
     where
-        F: FnOnce(A, &super::Suspend<A, B, C>) -> C,
+        F: FnOnce(A, &mut super::Suspend<A, B, C>) -> C,
     {
         unsafe {
             let state = Box::new(StartState {

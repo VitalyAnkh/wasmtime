@@ -1,7 +1,7 @@
 //! Wasmtime's Fused Adapter Compiler of Trampolines (FACT)
 //!
 //! This module contains a compiler which emits trampolines to implement fused
-//! adatpers for the component model. A fused adapter is when a core wasm
+//! adapters for the component model. A fused adapter is when a core wasm
 //! function is lifted from one component instance and then lowered into another
 //! component instance. This communication between components is well-defined by
 //! the spec and ends up creating what's called a "fused adapter".
@@ -14,17 +14,19 @@
 //!
 //! Note that identification of precisely what goes into an adapter module is
 //! not handled in this file, instead that's all done in `translate/adapt.rs`.
-//! Otherwise this module is only reponsible for taking a set of adapters and
+//! Otherwise this module is only responsible for taking a set of adapters and
 //! their imports and then generating a core wasm module to implement all of
 //! that.
 
 use crate::component::dfg::CoreDef;
 use crate::component::{
     Adapter, AdapterOptions as AdapterOptionsDfg, ComponentTypesBuilder, FlatType, InterfaceType,
-    StringEncoding, TypeFuncIndex,
+    StringEncoding, Transcode, TypeFuncIndex,
 };
 use crate::fact::transcode::Transcoder;
+use crate::prelude::*;
 use crate::{EntityRef, FuncIndex, GlobalIndex, MemoryIndex, PrimaryMap};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use wasm_encoder::*;
 
@@ -33,8 +35,6 @@ mod signature;
 mod trampoline;
 mod transcode;
 mod traps;
-
-pub use self::transcode::{FixedEncoding, Transcode};
 
 /// Representation of an adapter module.
 pub struct Module<'a> {
@@ -58,6 +58,12 @@ pub struct Module<'a> {
     imported: HashMap<CoreDef, usize>,
     /// Intern'd transcoders and what index they were assigned.
     imported_transcoders: HashMap<Transcoder, FuncIndex>,
+
+    /// Cached versions of imported trampolines for working with resources.
+    imported_resource_transfer_own: Option<FuncIndex>,
+    imported_resource_transfer_borrow: Option<FuncIndex>,
+    imported_resource_enter_call: Option<FuncIndex>,
+    imported_resource_exit_call: Option<FuncIndex>,
 
     // Current status of index spaces from the imports generated so far.
     imported_funcs: PrimaryMap<FuncIndex, Option<CoreDef>>,
@@ -116,6 +122,8 @@ struct Options {
     /// An optionally-specified function to be used to allocate space for
     /// types such as strings as they go into a module.
     realloc: Option<FuncIndex>,
+    callback: Option<FuncIndex>,
+    async_: bool,
 }
 
 enum Context {
@@ -177,6 +185,10 @@ impl<'a> Module<'a> {
             funcs: PrimaryMap::new(),
             helper_funcs: HashMap::new(),
             helper_worklist: Vec::new(),
+            imported_resource_transfer_own: None,
+            imported_resource_transfer_borrow: None,
+            imported_resource_enter_call: None,
+            imported_resource_exit_call: None,
         }
     }
 
@@ -238,25 +250,30 @@ impl<'a> Module<'a> {
             memory64,
             realloc,
             post_return: _, // handled above
+            callback,
+            async_,
         } = options;
+
         let flags = self.import_global(
             "flags",
             &format!("instance{}", instance.as_u32()),
             GlobalType {
                 val_type: ValType::I32,
                 mutable: true,
+                shared: false,
             },
             CoreDef::InstanceFlags(*instance),
         );
         let memory = memory.as_ref().map(|memory| {
             self.import_memory(
                 "memory",
-                "",
+                &format!("m{}", self.imported_memories.len()),
                 MemoryType {
                     minimum: 0,
                     maximum: None,
                     shared: false,
                     memory64: *memory64,
+                    page_size_log2: None,
                 },
                 memory.clone().into(),
             )
@@ -268,7 +285,29 @@ impl<'a> Module<'a> {
                 ValType::I32
             };
             let ty = self.core_types.function(&[ptr, ptr, ptr, ptr], &[ptr]);
-            self.import_func("realloc", "", ty, func.clone())
+            self.import_func(
+                "realloc",
+                &format!("f{}", self.imported_funcs.len()),
+                ty,
+                func.clone(),
+            )
+        });
+        let callback = callback.as_ref().map(|func| {
+            let ptr = if *memory64 {
+                ValType::I64
+            } else {
+                ValType::I32
+            };
+            let ty = self.core_types.function(
+                &[ptr, ValType::I32, ValType::I32, ValType::I32],
+                &[ValType::I32],
+            );
+            self.import_func(
+                "callback",
+                &format!("f{}", self.imported_funcs.len()),
+                ty,
+                func.clone(),
+            )
         });
 
         AdapterOptions {
@@ -280,6 +319,8 @@ impl<'a> Module<'a> {
                 memory64: *memory64,
                 memory,
                 realloc,
+                callback,
+                async_: *async_,
             },
         }
     }
@@ -356,6 +397,72 @@ impl<'a> Module<'a> {
 
                 self.imported_funcs.push(None)
             })
+    }
+
+    fn import_simple(
+        &mut self,
+        module: &str,
+        name: &str,
+        params: &[ValType],
+        results: &[ValType],
+        import: Import,
+        get: impl Fn(&mut Self) -> &mut Option<FuncIndex>,
+    ) -> FuncIndex {
+        if let Some(idx) = get(self) {
+            return *idx;
+        }
+        let ty = self.core_types.function(params, results);
+        let ty = EntityType::Function(ty);
+        self.core_imports.import(module, name, ty);
+
+        self.imports.push(import);
+        let idx = self.imported_funcs.push(None);
+        *get(self) = Some(idx);
+        idx
+    }
+
+    fn import_resource_transfer_own(&mut self) -> FuncIndex {
+        self.import_simple(
+            "resource",
+            "transfer-own",
+            &[ValType::I32, ValType::I32, ValType::I32],
+            &[ValType::I32],
+            Import::ResourceTransferOwn,
+            |me| &mut me.imported_resource_transfer_own,
+        )
+    }
+
+    fn import_resource_transfer_borrow(&mut self) -> FuncIndex {
+        self.import_simple(
+            "resource",
+            "transfer-borrow",
+            &[ValType::I32, ValType::I32, ValType::I32],
+            &[ValType::I32],
+            Import::ResourceTransferBorrow,
+            |me| &mut me.imported_resource_transfer_borrow,
+        )
+    }
+
+    fn import_resource_enter_call(&mut self) -> FuncIndex {
+        self.import_simple(
+            "resource",
+            "enter-call",
+            &[],
+            &[],
+            Import::ResourceEnterCall,
+            |me| &mut me.imported_resource_enter_call,
+        )
+    }
+
+    fn import_resource_exit_call(&mut self) -> FuncIndex {
+        self.import_simple(
+            "resource",
+            "exit-call",
+            &[],
+            &[],
+            Import::ResourceExitCall,
+            |me| &mut me.imported_resource_exit_call,
+        )
     }
 
     fn translate_helper(&mut self, helper: Helper) -> FunctionId {
@@ -437,8 +544,8 @@ impl<'a> Module<'a> {
         result.section(&code);
         if self.debug {
             result.section(&CustomSection {
-                name: "wasmtime-trampoline-traps",
-                data: &traps,
+                name: "wasmtime-trampoline-traps".into(),
+                data: Cow::Borrowed(&traps),
             });
         }
         result.finish()
@@ -469,6 +576,36 @@ pub enum Import {
         /// Whether or not `to` is a 64-bit memory
         to64: bool,
     },
+    /// Transfers an owned resource from one table to another.
+    ResourceTransferOwn,
+    /// Transfers a borrowed resource from one table to another.
+    ResourceTransferBorrow,
+    /// Sets up entry metadata for a borrow resources when a call starts.
+    ResourceEnterCall,
+    /// Tears down a previous entry and handles checking borrow-related
+    /// metadata.
+    ResourceExitCall,
+    /// An intrinsic used by FACT-generated modules to begin a call to an
+    /// async-lowered import function.
+    AsyncEnterCall,
+    /// An intrinsic used by FACT-generated modules to complete a call to an
+    /// async-lowered import function.
+    AsyncExitCall {
+        /// The callee's callback function, if any.
+        callback: Option<CoreDef>,
+
+        /// The callee's post-return function, if any.
+        post_return: Option<CoreDef>,
+    },
+    /// An intrinisic used by FACT-generated modules to (partially or entirely) transfer
+    /// ownership of a `future`.
+    FutureTransfer,
+    /// An intrinisic used by FACT-generated modules to (partially or entirely) transfer
+    /// ownership of a `stream`.
+    StreamTransfer,
+    /// An intrinisic used by FACT-generated modules to (partially or entirely) transfer
+    /// ownership of an `error-context`.
+    ErrorContextTransfer,
 }
 
 impl Options {
@@ -513,7 +650,7 @@ cranelift_entity::entity_impl!(FunctionId);
 
 /// A generated function to be added to an adapter module.
 ///
-/// At least one function is created per-adapter and dependeing on the type
+/// At least one function is created per-adapter and depending on the type
 /// hierarchy multiple functions may be generated per-adapter.
 struct Function {
     /// Whether or not the `body` has been finished.
@@ -537,7 +674,7 @@ struct Function {
     /// The contents of the function.
     ///
     /// See `Body` for more information, and the `Vec` here represents the
-    /// concatentation of all the `Body` fragments.
+    /// concatenation of all the `Body` fragments.
     body: Vec<Body>,
 }
 

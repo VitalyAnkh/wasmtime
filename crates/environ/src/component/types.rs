@@ -1,27 +1,13 @@
 use crate::component::{MAX_FLAT_PARAMS, MAX_FLAT_RESULTS};
-use crate::{
-    EntityType, Global, GlobalInit, ModuleTypes, ModuleTypesBuilder, PrimaryMap, SignatureIndex,
-};
-use anyhow::{bail, Result};
-use cranelift_entity::EntityRef;
-use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::hash::Hash;
-use std::ops::Index;
-use wasmparser::{
-    ComponentAlias, ComponentOuterAliasKind, ComponentTypeDeclaration, InstanceTypeDeclaration,
-};
+use crate::prelude::*;
+use crate::{EntityType, ModuleInternedTypeIndex, ModuleTypes, PrimaryMap};
+use core::hash::{Hash, Hasher};
+use core::ops::Index;
+use serde_derive::{Deserialize, Serialize};
+use wasmparser::component_types::ComponentAnyTypeId;
 use wasmtime_component_util::{DiscriminantSize, FlagsSize};
 
-/// Maximum nesting depth of a type allowed in Wasmtime.
-///
-/// This constant isn't chosen via any scientific means and its main purpose is
-/// to enable most of Wasmtime to handle types via recursion without worrying
-/// about stack overflow.
-///
-/// Some more information about this can be found in #4814
-const MAX_TYPE_DEPTH: u32 = 100;
+pub use crate::StaticModuleIndex;
 
 macro_rules! indices {
     ($(
@@ -33,6 +19,7 @@ macro_rules! indices {
             Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug,
             Serialize, Deserialize,
         )]
+        #[repr(transparent)]
         pub struct $name(u32);
         cranelift_entity::entity_impl!($name);
     )*);
@@ -94,8 +81,6 @@ indices! {
     pub struct TypeFlagsIndex(u32);
     /// Index pointing to an enum type in the component model.
     pub struct TypeEnumIndex(u32);
-    /// Index pointing to a union type in the component model.
-    pub struct TypeUnionIndex(u32);
     /// Index pointing to an option type in the component model (aka a
     /// `Option<T, E>`)
     pub struct TypeOptionIndex(u32);
@@ -104,6 +89,73 @@ indices! {
     pub struct TypeResultIndex(u32);
     /// Index pointing to a list type in the component model.
     pub struct TypeListIndex(u32);
+    /// Index pointing to a future type in the component model.
+    pub struct TypeFutureIndex(u32);
+    /// Index pointing to a future table within a component.
+    ///
+    /// This is analogous to `TypeResourceTableIndex` in that it tracks
+    /// ownership of futures within each (sub)component instance.
+    pub struct TypeFutureTableIndex(u32);
+    /// Index pointing to a stream type in the component model.
+    pub struct TypeStreamIndex(u32);
+    /// Index pointing to a stream table within a component.
+    ///
+    /// This is analogous to `TypeResourceTableIndex` in that it tracks
+    /// ownership of stream within each (sub)component instance.
+    pub struct TypeStreamTableIndex(u32);
+
+    /// Index pointing to a error context table within a component.
+    ///
+    /// This is analogous to `TypeResourceTableIndex` in that it tracks
+    /// ownership of error contexts within each (sub)component instance.
+    pub struct TypeComponentLocalErrorContextTableIndex(u32);
+
+    /// Index pointing to a (component) globally tracked error context table entry
+    ///
+    /// Unlike [`TypeComponentLocalErrorContextTableIndex`], this index refers to
+    /// the global state table for error contexts at the level of the entire component,
+    /// not just a subcomponent.
+    pub struct TypeComponentGlobalErrorContextTableIndex(u32);
+
+    /// Index pointing to an interned `task.return` type within a component.
+    pub struct TypeTaskReturnIndex(u32);
+
+    /// Index pointing to a resource table within a component.
+    ///
+    /// This is a Wasmtime-specific type index which isn't part of the component
+    /// model per-se (or at least not the binary format). This index represents
+    /// a pointer to a table of runtime information tracking state for resources
+    /// within a component. Tables are generated per-resource-per-component
+    /// meaning that if the exact same resource is imported into 4 subcomponents
+    /// then that's 5 tables: one for the defining component and one for each
+    /// subcomponent.
+    ///
+    /// All resource-related intrinsics operate on table-local indices which
+    /// indicate which table the intrinsic is modifying. Each resource table has
+    /// an origin resource type (defined by `ResourceIndex`) along with a
+    /// component instance that it's recorded for.
+    pub struct TypeResourceTableIndex(u32);
+
+    /// Index pointing to a resource within a component.
+    ///
+    /// This index space covers all unique resource type definitions. For
+    /// example all unique imports come first and then all locally-defined
+    /// resources come next. Note that this does not count the number of runtime
+    /// tables required to track resources (that's `TypeResourceTableIndex`
+    /// instead). Instead this is a count of the number of unique
+    /// `(type (resource (rep ..)))` declarations within a component, plus
+    /// imports.
+    ///
+    /// This is then used for correlating various information such as
+    /// destructors, origin information, etc.
+    pub struct ResourceIndex(u32);
+
+    /// Index pointing to a local resource defined within a component.
+    ///
+    /// This is similar to `FooIndex` and `DefinedFooIndex` for core wasm and
+    /// the idea here is that this is guaranteed to be a wasm-defined resource
+    /// which is connected to a component instance for example.
+    pub struct DefinedResourceIndex(u32);
 
     // ========================================================================
     // Index types used to identify modules and components during compilation.
@@ -115,11 +167,6 @@ indices! {
 
     /// Same as `ModuleUpvarIndex` but for components.
     pub struct ComponentUpvarIndex(u32);
-
-    /// Index into the global list of modules found within an entire component.
-    /// Module translations are saved on the side to get fully compiled after
-    /// the original component has finished being translated.
-    pub struct StaticModuleIndex(u32);
 
     /// Same as `StaticModuleIndex` but for components.
     pub struct StaticComponentIndex(u32);
@@ -157,9 +204,6 @@ indices! {
     /// component model.
     pub struct LoweredIndex(u32);
 
-    /// Same as `LoweredIndex` but for the `CoreDef::AlwaysTrap` variant.
-    pub struct RuntimeAlwaysTrapIndex(u32);
-
     /// Index representing a linear memory extracted from a wasm instance
     /// which is stored in a `VMComponentContext`. This is used to deduplicate
     /// references to the same linear memory where it's only stored once in a
@@ -172,35 +216,38 @@ indices! {
     /// Same as `RuntimeMemoryIndex` except for the `realloc` function.
     pub struct RuntimeReallocIndex(u32);
 
+    /// Same as `RuntimeMemoryIndex` except for the `callback` function.
+    pub struct RuntimeCallbackIndex(u32);
+
     /// Same as `RuntimeMemoryIndex` except for the `post-return` function.
     pub struct RuntimePostReturnIndex(u32);
 
-    /// Index that represents an exported module from a component since that's
-    /// currently the only use for saving the entire module state at runtime.
-    pub struct RuntimeModuleIndex(u32);
-
-    /// Index into the list of transcoders identified during compilation.
-    ///
-    /// This is used to index the `VMCallerCheckedFuncRef` slots reserved for
-    /// string encoders which reference linear memories defined within a
+    /// Index for all trampolines that are compiled in Cranelift for a
     /// component.
-    pub struct RuntimeTranscoderIndex(u32);
+    ///
+    /// This is used to point to various bits of metadata within a compiled
+    /// component and is stored in the final compilation artifact. This does not
+    /// have a direct correspondence to any wasm definition.
+    pub struct TrampolineIndex(u32);
+
+    /// An index into `Component::export_items` at the end of compilation.
+    pub struct ExportIndex(u32);
 }
 
 // Reexport for convenience some core-wasm indices which are also used in the
 // component model, typically for when aliasing exports of core wasm modules.
-pub use crate::{FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TypeIndex};
+pub use crate::{FuncIndex, GlobalIndex, MemoryIndex, TableIndex};
 
 /// Equivalent of `EntityIndex` but for the component model instead of core
 /// wasm.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy)]
+#[allow(missing_docs, reason = "self-describing variants")]
 pub enum ComponentItem {
     Func(ComponentFuncIndex),
     Module(ModuleIndex),
     Component(ComponentIndex),
     ComponentInstance(ComponentInstanceIndex),
-    Type(TypeDef),
+    Type(ComponentAnyTypeId),
 }
 
 /// Runtime information about the type information contained within a component.
@@ -210,27 +257,33 @@ pub enum ComponentItem {
 /// will have a pointer to this value as well.
 #[derive(Default, Serialize, Deserialize)]
 pub struct ComponentTypes {
-    modules: PrimaryMap<TypeModuleIndex, TypeModule>,
-    components: PrimaryMap<TypeComponentIndex, TypeComponent>,
-    component_instances: PrimaryMap<TypeComponentInstanceIndex, TypeComponentInstance>,
-    functions: PrimaryMap<TypeFuncIndex, TypeFunc>,
-    lists: PrimaryMap<TypeListIndex, TypeList>,
-    records: PrimaryMap<TypeRecordIndex, TypeRecord>,
-    variants: PrimaryMap<TypeVariantIndex, TypeVariant>,
-    tuples: PrimaryMap<TypeTupleIndex, TypeTuple>,
-    enums: PrimaryMap<TypeEnumIndex, TypeEnum>,
-    flags: PrimaryMap<TypeFlagsIndex, TypeFlags>,
-    unions: PrimaryMap<TypeUnionIndex, TypeUnion>,
-    options: PrimaryMap<TypeOptionIndex, TypeOption>,
-    results: PrimaryMap<TypeResultIndex, TypeResult>,
-
-    module_types: ModuleTypes,
+    pub(super) modules: PrimaryMap<TypeModuleIndex, TypeModule>,
+    pub(super) components: PrimaryMap<TypeComponentIndex, TypeComponent>,
+    pub(super) component_instances: PrimaryMap<TypeComponentInstanceIndex, TypeComponentInstance>,
+    pub(super) functions: PrimaryMap<TypeFuncIndex, TypeFunc>,
+    pub(super) lists: PrimaryMap<TypeListIndex, TypeList>,
+    pub(super) records: PrimaryMap<TypeRecordIndex, TypeRecord>,
+    pub(super) variants: PrimaryMap<TypeVariantIndex, TypeVariant>,
+    pub(super) tuples: PrimaryMap<TypeTupleIndex, TypeTuple>,
+    pub(super) enums: PrimaryMap<TypeEnumIndex, TypeEnum>,
+    pub(super) flags: PrimaryMap<TypeFlagsIndex, TypeFlags>,
+    pub(super) options: PrimaryMap<TypeOptionIndex, TypeOption>,
+    pub(super) results: PrimaryMap<TypeResultIndex, TypeResult>,
+    pub(super) resource_tables: PrimaryMap<TypeResourceTableIndex, TypeResourceTable>,
+    pub(super) module_types: Option<ModuleTypes>,
+    pub(super) futures: PrimaryMap<TypeFutureIndex, TypeFuture>,
+    pub(super) future_tables: PrimaryMap<TypeFutureTableIndex, TypeFutureTable>,
+    pub(super) streams: PrimaryMap<TypeStreamIndex, TypeStream>,
+    pub(super) stream_tables: PrimaryMap<TypeStreamTableIndex, TypeStreamTable>,
+    pub(super) error_context_tables:
+        PrimaryMap<TypeComponentLocalErrorContextTableIndex, TypeErrorContextTable>,
+    pub(super) task_returns: PrimaryMap<TypeTaskReturnIndex, TypeTaskReturn>,
 }
 
 impl ComponentTypes {
     /// Returns the core wasm module types known within this component.
     pub fn module_types(&self) -> &ModuleTypes {
-        &self.module_types
+        self.module_types.as_ref().unwrap()
     }
 
     /// Returns the canonical ABI information about the specified type.
@@ -245,7 +298,12 @@ impl ComponentTypes {
             InterfaceType::U32
             | InterfaceType::S32
             | InterfaceType::Float32
-            | InterfaceType::Char => &CanonicalAbiInfo::SCALAR4,
+            | InterfaceType::Char
+            | InterfaceType::Own(_)
+            | InterfaceType::Borrow(_)
+            | InterfaceType::Future(_)
+            | InterfaceType::Stream(_)
+            | InterfaceType::ErrorContext(_) => &CanonicalAbiInfo::SCALAR4,
 
             InterfaceType::U64 | InterfaceType::S64 | InterfaceType::Float64 => {
                 &CanonicalAbiInfo::SCALAR8
@@ -258,19 +316,33 @@ impl ComponentTypes {
             InterfaceType::Tuple(i) => &self[*i].abi,
             InterfaceType::Flags(i) => &self[*i].abi,
             InterfaceType::Enum(i) => &self[*i].abi,
-            InterfaceType::Union(i) => &self[*i].abi,
             InterfaceType::Option(i) => &self[*i].abi,
             InterfaceType::Result(i) => &self[*i].abi,
         }
+    }
+
+    /// Adds a new `table` to the list of resource tables for this component.
+    pub fn push_resource_table(&mut self, table: TypeResourceTable) -> TypeResourceTableIndex {
+        self.resource_tables.push(table)
     }
 }
 
 macro_rules! impl_index {
     ($(impl Index<$ty:ident> for ComponentTypes { $output:ident => $field:ident })*) => ($(
-        impl std::ops::Index<$ty> for ComponentTypes {
+        impl core::ops::Index<$ty> for ComponentTypes {
             type Output = $output;
+            #[inline]
             fn index(&self, idx: $ty) -> &$output {
                 &self.$field[idx]
+            }
+        }
+
+        #[cfg(feature = "compile")]
+        impl core::ops::Index<$ty> for super::ComponentTypesBuilder {
+            type Output = $output;
+            #[inline]
+            fn index(&self, idx: $ty) -> &$output {
+                &self.component_types()[idx]
             }
         }
     )*)
@@ -286,10 +358,15 @@ impl_index! {
     impl Index<TypeTupleIndex> for ComponentTypes { TypeTuple => tuples }
     impl Index<TypeEnumIndex> for ComponentTypes { TypeEnum => enums }
     impl Index<TypeFlagsIndex> for ComponentTypes { TypeFlags => flags }
-    impl Index<TypeUnionIndex> for ComponentTypes { TypeUnion => unions }
     impl Index<TypeOptionIndex> for ComponentTypes { TypeOption => options }
     impl Index<TypeResultIndex> for ComponentTypes { TypeResult => results }
     impl Index<TypeListIndex> for ComponentTypes { TypeList => lists }
+    impl Index<TypeResourceTableIndex> for ComponentTypes { TypeResourceTable => resource_tables }
+    impl Index<TypeFutureIndex> for ComponentTypes { TypeFuture => futures }
+    impl Index<TypeStreamIndex> for ComponentTypes { TypeStream => streams }
+    impl Index<TypeFutureTableIndex> for ComponentTypes { TypeFutureTable => future_tables }
+    impl Index<TypeStreamTableIndex> for ComponentTypes { TypeStreamTable => stream_tables }
+    impl Index<TypeComponentLocalErrorContextTableIndex> for ComponentTypes { TypeErrorContextTable => error_context_tables }
 }
 
 // Additionally forward anything that can index `ModuleTypes` to `ModuleTypes`
@@ -300,668 +377,8 @@ where
 {
     type Output = <ModuleTypes as Index<T>>::Output;
     fn index(&self, idx: T) -> &Self::Output {
-        self.module_types.index(idx)
+        self.module_types.as_ref().unwrap().index(idx)
     }
-}
-
-/// Structured used to build a [`ComponentTypes`] during translation.
-///
-/// This contains tables to intern any component types found as well as
-/// managing building up core wasm [`ModuleTypes`] as well.
-#[derive(Default)]
-pub struct ComponentTypesBuilder {
-    type_scopes: Vec<TypeScope>,
-    functions: HashMap<TypeFunc, TypeFuncIndex>,
-    lists: HashMap<TypeList, TypeListIndex>,
-    records: HashMap<TypeRecord, TypeRecordIndex>,
-    variants: HashMap<TypeVariant, TypeVariantIndex>,
-    tuples: HashMap<TypeTuple, TypeTupleIndex>,
-    enums: HashMap<TypeEnum, TypeEnumIndex>,
-    flags: HashMap<TypeFlags, TypeFlagsIndex>,
-    unions: HashMap<TypeUnion, TypeUnionIndex>,
-    options: HashMap<TypeOption, TypeOptionIndex>,
-    results: HashMap<TypeResult, TypeResultIndex>,
-
-    component_types: ComponentTypes,
-    module_types: ModuleTypesBuilder,
-
-    // Cache of what the "flat" representation of all types are which is only
-    // used at compile-time and not used at runtime, hence the location here
-    // as opposed to `ComponentTypes`.
-    type_info: TypeInformationCache,
-}
-
-#[derive(Default)]
-struct TypeScope {
-    core: PrimaryMap<TypeIndex, TypeDef>,
-    component: PrimaryMap<ComponentTypeIndex, TypeDef>,
-    instances: PrimaryMap<ComponentInstanceIndex, TypeComponentInstanceIndex>,
-}
-
-macro_rules! intern_and_fill_flat_types {
-    ($me:ident, $name:ident, $val:ident) => {{
-        if let Some(idx) = $me.$name.get(&$val) {
-            return *idx;
-        }
-        let idx = $me.component_types.$name.push($val.clone());
-        let mut info = TypeInformation::new();
-        info.$name($me, &$val);
-        let idx2 = $me.type_info.$name.push(info);
-        assert_eq!(idx, idx2);
-        $me.$name.insert($val, idx);
-        return idx;
-    }};
-}
-
-impl ComponentTypesBuilder {
-    /// Finishes this list of component types and returns the finished
-    /// structure.
-    pub fn finish(mut self) -> ComponentTypes {
-        self.component_types.module_types = self.module_types.finish();
-        self.component_types
-    }
-
-    /// Returns the `ComponentTypes`-in-progress.
-    pub fn component_types(&self) -> &ComponentTypes {
-        &self.component_types
-    }
-
-    /// Returns the underlying builder used to build up core wasm module types.
-    ///
-    /// Note that this is shared across all modules found within a component to
-    /// improve the wins from deduplicating function signatures.
-    pub fn module_types_builder(&mut self) -> &mut ModuleTypesBuilder {
-        &mut self.module_types
-    }
-
-    /// Pushes a new scope when entering a new index space for types in the
-    /// component model.
-    ///
-    /// This happens when a component is recursed into or a module/instance
-    /// type is recursed into.
-    pub fn push_type_scope(&mut self) {
-        self.type_scopes.push(Default::default());
-    }
-
-    /// Adds a new `TypeDef` definition within the current component types
-    /// scope.
-    ///
-    /// Returns the `ComponentTypeIndex` associated with the type being pushed.
-    ///
-    /// # Panics
-    ///
-    /// Requires that `push_type_scope` was called previously.
-    pub fn push_component_typedef(&mut self, ty: TypeDef) -> ComponentTypeIndex {
-        debug_assert!(!matches!(ty, TypeDef::Module(_) | TypeDef::CoreFunc(_)));
-        self.type_scopes.last_mut().unwrap().component.push(ty)
-    }
-
-    /// Adds a new `TypeDef` definition within the current core types
-    /// scope.
-    ///
-    /// Returns the `TypeIndex` associated with the type being pushed. Note that
-    /// this should only be used with core-wasm-related `TypeDef` instances such
-    /// as `TypeDef::Module` and `TypeDef::CoreFunc`.
-    ///
-    /// # Panics
-    ///
-    /// Requires that `push_type_scope` was called previously.
-    pub fn push_core_typedef(&mut self, ty: TypeDef) -> TypeIndex {
-        debug_assert!(matches!(ty, TypeDef::Module(_) | TypeDef::CoreFunc(_)));
-        self.type_scopes.last_mut().unwrap().core.push(ty)
-    }
-
-    /// Looks up an "outer" type in this builder to handle outer aliases.
-    ///
-    /// The `count` parameter and `ty` are taken from the binary format itself,
-    /// and the `TypeDef` returned is what the outer type refers to.
-    ///
-    /// # Panics
-    ///
-    /// Assumes that `count` and `ty` are valid.
-    pub fn component_outer_type(&self, count: u32, ty: ComponentTypeIndex) -> TypeDef {
-        // Reverse the index and 0 means the "current scope"
-        let idx = self.type_scopes.len() - (count as usize) - 1;
-        self.type_scopes[idx].component[ty]
-    }
-
-    /// Same as `component_outer_type` but for core wasm types instead.
-    pub fn core_outer_type(&self, count: u32, ty: TypeIndex) -> TypeDef {
-        // Reverse the index and 0 means the "current scope"
-        let idx = self.type_scopes.len() - (count as usize) - 1;
-        self.type_scopes[idx].core[ty]
-    }
-
-    /// Pops a scope pushed by `push_type_scope`.
-    pub fn pop_type_scope(&mut self) {
-        self.type_scopes.pop().unwrap();
-    }
-
-    /// Translates a wasmparser `TypeComponent` into a Wasmtime `TypeDef`,
-    /// interning types along the way.
-    pub fn intern_component_type(&mut self, ty: &wasmparser::ComponentType<'_>) -> Result<TypeDef> {
-        Ok(match ty {
-            wasmparser::ComponentType::Defined(ty) => TypeDef::Interface(self.defined_type(ty)?),
-            wasmparser::ComponentType::Func(ty) => TypeDef::ComponentFunc(self.func_type(ty)),
-            wasmparser::ComponentType::Component(ty) => {
-                TypeDef::Component(self.component_type(ty)?)
-            }
-            wasmparser::ComponentType::Instance(ty) => {
-                TypeDef::ComponentInstance(self.component_instance_type(ty)?)
-            }
-        })
-    }
-
-    /// Translates a wasmparser `CoreType` into a Wasmtime `TypeDef`,
-    /// interning types along the way.
-    pub fn intern_core_type(&mut self, ty: &wasmparser::CoreType<'_>) -> Result<TypeDef> {
-        Ok(match ty {
-            wasmparser::CoreType::Func(ty) => {
-                TypeDef::CoreFunc(self.module_types.wasm_func_type(ty.clone().try_into()?))
-            }
-            wasmparser::CoreType::Module(ty) => TypeDef::Module(self.module_type(ty)?),
-        })
-    }
-
-    /// Translates a wasmparser `ComponentTypeRef` into a Wasmtime `TypeDef`.
-    pub fn component_type_ref(&self, ty: &wasmparser::ComponentTypeRef) -> TypeDef {
-        match ty {
-            wasmparser::ComponentTypeRef::Module(ty) => {
-                self.core_outer_type(0, TypeIndex::from_u32(*ty))
-            }
-            wasmparser::ComponentTypeRef::Func(ty)
-            | wasmparser::ComponentTypeRef::Type(wasmparser::TypeBounds::Eq, ty)
-            | wasmparser::ComponentTypeRef::Instance(ty)
-            | wasmparser::ComponentTypeRef::Component(ty) => {
-                self.component_outer_type(0, ComponentTypeIndex::from_u32(*ty))
-            }
-            wasmparser::ComponentTypeRef::Value(..) => {
-                unimplemented!("references to value types");
-            }
-        }
-    }
-
-    fn module_type(
-        &mut self,
-        ty: &[wasmparser::ModuleTypeDeclaration<'_>],
-    ) -> Result<TypeModuleIndex> {
-        let mut result = TypeModule::default();
-        self.push_type_scope();
-
-        for item in ty {
-            match item {
-                wasmparser::ModuleTypeDeclaration::Type(wasmparser::Type::Func(f)) => {
-                    let ty =
-                        TypeDef::CoreFunc(self.module_types.wasm_func_type(f.clone().try_into()?));
-                    self.push_core_typedef(ty);
-                }
-                wasmparser::ModuleTypeDeclaration::Export { name, ty } => {
-                    let prev = result
-                        .exports
-                        .insert(name.to_string(), self.entity_type(ty)?);
-                    assert!(prev.is_none());
-                }
-                wasmparser::ModuleTypeDeclaration::Import(import) => {
-                    let prev = result.imports.insert(
-                        (import.module.to_string(), import.name.to_string()),
-                        self.entity_type(&import.ty)?,
-                    );
-                    assert!(prev.is_none());
-                }
-                wasmparser::ModuleTypeDeclaration::OuterAlias {
-                    kind: wasmparser::OuterAliasKind::Type,
-                    count,
-                    index,
-                } => {
-                    let ty = self.core_outer_type(*count, TypeIndex::from_u32(*index));
-                    self.push_core_typedef(ty);
-                }
-            }
-        }
-
-        self.pop_type_scope();
-
-        Ok(self.component_types.modules.push(result))
-    }
-
-    fn entity_type(&self, ty: &wasmparser::TypeRef) -> Result<EntityType> {
-        Ok(match ty {
-            wasmparser::TypeRef::Func(idx) => {
-                let idx = TypeIndex::from_u32(*idx);
-                match self.core_outer_type(0, idx) {
-                    TypeDef::CoreFunc(idx) => EntityType::Function(idx),
-                    _ => unreachable!(), // not possible with valid components
-                }
-            }
-            wasmparser::TypeRef::Table(ty) => EntityType::Table(ty.clone().try_into()?),
-            wasmparser::TypeRef::Memory(ty) => EntityType::Memory(ty.clone().into()),
-            wasmparser::TypeRef::Global(ty) => {
-                EntityType::Global(Global::new(ty.clone(), GlobalInit::Import)?)
-            }
-            wasmparser::TypeRef::Tag(_) => bail!("exceptions proposal not implemented"),
-        })
-    }
-
-    fn component_type(
-        &mut self,
-        ty: &[ComponentTypeDeclaration<'_>],
-    ) -> Result<TypeComponentIndex> {
-        let mut result = TypeComponent::default();
-        self.push_type_scope();
-
-        for item in ty {
-            match item {
-                ComponentTypeDeclaration::Type(ty) => self.type_declaration_type(ty)?,
-                ComponentTypeDeclaration::CoreType(ty) => self.type_declaration_core_type(ty)?,
-                ComponentTypeDeclaration::Alias(alias) => self.type_declaration_alias(alias)?,
-                ComponentTypeDeclaration::Export { name, url, ty } => {
-                    let ty = self.type_declaration_define(ty);
-                    result
-                        .exports
-                        .insert(name.to_string(), (url.to_string(), ty));
-                }
-                ComponentTypeDeclaration::Import(import) => {
-                    let ty = self.type_declaration_define(&import.ty);
-                    result
-                        .imports
-                        .insert(import.name.to_string(), (import.url.to_string(), ty));
-                }
-            }
-        }
-
-        self.pop_type_scope();
-
-        Ok(self.component_types.components.push(result))
-    }
-
-    fn component_instance_type(
-        &mut self,
-        ty: &[InstanceTypeDeclaration<'_>],
-    ) -> Result<TypeComponentInstanceIndex> {
-        let mut result = TypeComponentInstance::default();
-        self.push_type_scope();
-
-        for item in ty {
-            match item {
-                InstanceTypeDeclaration::Type(ty) => self.type_declaration_type(ty)?,
-                InstanceTypeDeclaration::CoreType(ty) => self.type_declaration_core_type(ty)?,
-                InstanceTypeDeclaration::Alias(alias) => self.type_declaration_alias(alias)?,
-                InstanceTypeDeclaration::Export { name, url, ty } => {
-                    let ty = self.type_declaration_define(ty);
-                    result
-                        .exports
-                        .insert(name.to_string(), (url.to_string(), ty));
-                }
-            }
-        }
-
-        self.pop_type_scope();
-
-        Ok(self.component_types.component_instances.push(result))
-    }
-
-    fn type_declaration_type(&mut self, ty: &wasmparser::ComponentType<'_>) -> Result<()> {
-        let ty = self.intern_component_type(ty)?;
-        self.push_component_typedef(ty);
-        Ok(())
-    }
-
-    fn type_declaration_core_type(&mut self, ty: &wasmparser::CoreType<'_>) -> Result<()> {
-        let ty = self.intern_core_type(ty)?;
-        self.push_core_typedef(ty);
-        Ok(())
-    }
-
-    fn type_declaration_alias(&mut self, alias: &wasmparser::ComponentAlias<'_>) -> Result<()> {
-        match alias {
-            ComponentAlias::Outer {
-                kind: ComponentOuterAliasKind::CoreType,
-                count,
-                index,
-            } => {
-                let ty = self.core_outer_type(*count, TypeIndex::from_u32(*index));
-                self.push_core_typedef(ty);
-            }
-            ComponentAlias::Outer {
-                kind: ComponentOuterAliasKind::Type,
-                count,
-                index,
-            } => {
-                let ty = self.component_outer_type(*count, ComponentTypeIndex::from_u32(*index));
-                self.push_component_typedef(ty);
-            }
-            ComponentAlias::InstanceExport {
-                kind: _,
-                instance_index,
-                name,
-            } => {
-                let ty = self.type_scopes.last().unwrap().instances
-                    [ComponentInstanceIndex::from_u32(*instance_index)];
-                let (_, ty) = self.component_types[ty].exports[*name];
-                self.push_component_typedef(ty);
-            }
-            a => unreachable!("invalid alias {a:?}"),
-        }
-        Ok(())
-    }
-
-    fn type_declaration_define(&mut self, ty: &wasmparser::ComponentTypeRef) -> TypeDef {
-        let ty = self.component_type_ref(ty);
-        let scope = self.type_scopes.last_mut().unwrap();
-        match ty {
-            // If an import or an export within a component or instance type
-            // references an interface type itself then that creates a new type
-            // which is effectively an alias, so push the type information here.
-            TypeDef::Interface(_) => {
-                self.push_component_typedef(ty);
-            }
-
-            // When an import or an export references a component instance then
-            // that creates a "pseudo-instance" which type information is
-            // maintained about. This is later used during the `InstanceExport`
-            // alias within a type declaration.
-            TypeDef::ComponentInstance(ty) => {
-                scope.instances.push(ty);
-            }
-
-            // All other valid types are ignored since we don't need to maintain
-            // metadata about them here as index spaces are modified that we're
-            // not interested in.
-            _ => {}
-        }
-
-        ty
-    }
-
-    fn func_type(&mut self, ty: &wasmparser::ComponentFuncType<'_>) -> TypeFuncIndex {
-        let ty = TypeFunc {
-            params: ty
-                .params
-                .iter()
-                .map(|(_name, ty)| self.valtype(ty))
-                .collect(),
-            results: ty
-                .results
-                .iter()
-                .map(|(_name, ty)| self.valtype(ty))
-                .collect(),
-        };
-        self.add_func_type(ty)
-    }
-
-    fn defined_type(&mut self, ty: &wasmparser::ComponentDefinedType<'_>) -> Result<InterfaceType> {
-        let result = match ty {
-            wasmparser::ComponentDefinedType::Primitive(ty) => ty.into(),
-            wasmparser::ComponentDefinedType::Record(e) => {
-                InterfaceType::Record(self.record_type(e))
-            }
-            wasmparser::ComponentDefinedType::Variant(e) => {
-                InterfaceType::Variant(self.variant_type(e))
-            }
-            wasmparser::ComponentDefinedType::List(e) => InterfaceType::List(self.list_type(e)),
-            wasmparser::ComponentDefinedType::Tuple(e) => InterfaceType::Tuple(self.tuple_type(e)),
-            wasmparser::ComponentDefinedType::Flags(e) => InterfaceType::Flags(self.flags_type(e)),
-            wasmparser::ComponentDefinedType::Enum(e) => InterfaceType::Enum(self.enum_type(e)),
-            wasmparser::ComponentDefinedType::Union(e) => InterfaceType::Union(self.union_type(e)),
-            wasmparser::ComponentDefinedType::Option(e) => {
-                InterfaceType::Option(self.option_type(e))
-            }
-            wasmparser::ComponentDefinedType::Result { ok, err } => {
-                InterfaceType::Result(self.result_type(ok, err))
-            }
-        };
-        let info = self.type_information(&result);
-        if info.depth > MAX_TYPE_DEPTH {
-            bail!("type nesting is too deep");
-        }
-        Ok(result)
-    }
-
-    fn valtype(&mut self, ty: &wasmparser::ComponentValType) -> InterfaceType {
-        match ty {
-            wasmparser::ComponentValType::Primitive(p) => p.into(),
-            wasmparser::ComponentValType::Type(idx) => {
-                let idx = ComponentTypeIndex::from_u32(*idx);
-                match self.component_outer_type(0, idx) {
-                    TypeDef::Interface(ty) => ty,
-                    // this should not be possible if the module validated
-                    _ => unreachable!(),
-                }
-            }
-        }
-    }
-
-    fn record_type(&mut self, record: &[(&str, wasmparser::ComponentValType)]) -> TypeRecordIndex {
-        let fields = record
-            .iter()
-            .map(|(name, ty)| RecordField {
-                name: name.to_string(),
-                ty: self.valtype(ty),
-            })
-            .collect::<Box<[_]>>();
-        let abi = CanonicalAbiInfo::record(
-            fields
-                .iter()
-                .map(|field| self.component_types.canonical_abi(&field.ty)),
-        );
-        self.add_record_type(TypeRecord { fields, abi })
-    }
-
-    fn variant_type(&mut self, cases: &[wasmparser::VariantCase<'_>]) -> TypeVariantIndex {
-        let cases = cases
-            .iter()
-            .map(|case| {
-                // FIXME: need to implement `refines`, not sure what that
-                // is at this time.
-                assert!(case.refines.is_none());
-                VariantCase {
-                    name: case.name.to_string(),
-                    ty: case.ty.as_ref().map(|ty| self.valtype(ty)),
-                }
-            })
-            .collect::<Box<[_]>>();
-        let (info, abi) = VariantInfo::new(cases.iter().map(|c| {
-            c.ty.as_ref()
-                .map(|ty| self.component_types.canonical_abi(ty))
-        }));
-        self.add_variant_type(TypeVariant { cases, abi, info })
-    }
-
-    fn tuple_type(&mut self, types: &[wasmparser::ComponentValType]) -> TypeTupleIndex {
-        let types = types
-            .iter()
-            .map(|ty| self.valtype(ty))
-            .collect::<Box<[_]>>();
-        let abi = CanonicalAbiInfo::record(
-            types
-                .iter()
-                .map(|ty| self.component_types.canonical_abi(ty)),
-        );
-        self.add_tuple_type(TypeTuple { types, abi })
-    }
-
-    fn flags_type(&mut self, flags: &[&str]) -> TypeFlagsIndex {
-        let flags = TypeFlags {
-            names: flags.iter().map(|s| s.to_string()).collect(),
-            abi: CanonicalAbiInfo::flags(flags.len()),
-        };
-        self.add_flags_type(flags)
-    }
-
-    fn enum_type(&mut self, variants: &[&str]) -> TypeEnumIndex {
-        let names = variants.iter().map(|s| s.to_string()).collect::<Box<[_]>>();
-        let (info, abi) = VariantInfo::new(names.iter().map(|_| None));
-        self.add_enum_type(TypeEnum { names, abi, info })
-    }
-
-    fn union_type(&mut self, types: &[wasmparser::ComponentValType]) -> TypeUnionIndex {
-        let types = types
-            .iter()
-            .map(|ty| self.valtype(ty))
-            .collect::<Box<[_]>>();
-        let (info, abi) = VariantInfo::new(
-            types
-                .iter()
-                .map(|t| Some(self.component_types.canonical_abi(t))),
-        );
-        self.add_union_type(TypeUnion { types, abi, info })
-    }
-
-    fn option_type(&mut self, ty: &wasmparser::ComponentValType) -> TypeOptionIndex {
-        let ty = self.valtype(ty);
-        let (info, abi) = VariantInfo::new([None, Some(self.component_types.canonical_abi(&ty))]);
-        self.add_option_type(TypeOption { ty, abi, info })
-    }
-
-    fn result_type(
-        &mut self,
-        ok: &Option<wasmparser::ComponentValType>,
-        err: &Option<wasmparser::ComponentValType>,
-    ) -> TypeResultIndex {
-        let ok = ok.as_ref().map(|ty| self.valtype(ty));
-        let err = err.as_ref().map(|ty| self.valtype(ty));
-        let (info, abi) = VariantInfo::new([
-            ok.as_ref().map(|t| self.component_types.canonical_abi(t)),
-            err.as_ref().map(|t| self.component_types.canonical_abi(t)),
-        ]);
-        self.add_result_type(TypeResult { ok, err, abi, info })
-    }
-
-    fn list_type(&mut self, ty: &wasmparser::ComponentValType) -> TypeListIndex {
-        let element = self.valtype(ty);
-        self.add_list_type(TypeList { element })
-    }
-
-    /// Interns a new function type within this type information.
-    pub fn add_func_type(&mut self, ty: TypeFunc) -> TypeFuncIndex {
-        intern(&mut self.functions, &mut self.component_types.functions, ty)
-    }
-
-    /// Interns a new record type within this type information.
-    pub fn add_record_type(&mut self, ty: TypeRecord) -> TypeRecordIndex {
-        intern_and_fill_flat_types!(self, records, ty)
-    }
-
-    /// Interns a new flags type within this type information.
-    pub fn add_flags_type(&mut self, ty: TypeFlags) -> TypeFlagsIndex {
-        intern_and_fill_flat_types!(self, flags, ty)
-    }
-
-    /// Interns a new tuple type within this type information.
-    pub fn add_tuple_type(&mut self, ty: TypeTuple) -> TypeTupleIndex {
-        intern_and_fill_flat_types!(self, tuples, ty)
-    }
-
-    /// Interns a new variant type within this type information.
-    pub fn add_variant_type(&mut self, ty: TypeVariant) -> TypeVariantIndex {
-        intern_and_fill_flat_types!(self, variants, ty)
-    }
-
-    /// Interns a new union type within this type information.
-    pub fn add_union_type(&mut self, ty: TypeUnion) -> TypeUnionIndex {
-        intern_and_fill_flat_types!(self, unions, ty)
-    }
-
-    /// Interns a new enum type within this type information.
-    pub fn add_enum_type(&mut self, ty: TypeEnum) -> TypeEnumIndex {
-        intern_and_fill_flat_types!(self, enums, ty)
-    }
-
-    /// Interns a new option type within this type information.
-    pub fn add_option_type(&mut self, ty: TypeOption) -> TypeOptionIndex {
-        intern_and_fill_flat_types!(self, options, ty)
-    }
-
-    /// Interns a new result type within this type information.
-    pub fn add_result_type(&mut self, ty: TypeResult) -> TypeResultIndex {
-        intern_and_fill_flat_types!(self, results, ty)
-    }
-
-    /// Interns a new type within this type information.
-    pub fn add_list_type(&mut self, ty: TypeList) -> TypeListIndex {
-        intern_and_fill_flat_types!(self, lists, ty)
-    }
-
-    /// Returns the canonical ABI information about the specified type.
-    pub fn canonical_abi(&self, ty: &InterfaceType) -> &CanonicalAbiInfo {
-        self.component_types.canonical_abi(ty)
-    }
-
-    /// Returns the "flat types" for the given interface type used in the
-    /// canonical ABI.
-    ///
-    /// Returns `None` if the type is too large to be represented via flat types
-    /// in the canonical abi.
-    pub fn flat_types(&self, ty: &InterfaceType) -> Option<FlatTypes<'_>> {
-        self.type_information(ty).flat.as_flat_types()
-    }
-
-    fn type_information(&self, ty: &InterfaceType) -> &TypeInformation {
-        match ty {
-            InterfaceType::U8
-            | InterfaceType::S8
-            | InterfaceType::Bool
-            | InterfaceType::U16
-            | InterfaceType::S16
-            | InterfaceType::U32
-            | InterfaceType::S32
-            | InterfaceType::Char => {
-                static INFO: TypeInformation = TypeInformation::primitive(FlatType::I32);
-                &INFO
-            }
-            InterfaceType::U64 | InterfaceType::S64 => {
-                static INFO: TypeInformation = TypeInformation::primitive(FlatType::I64);
-                &INFO
-            }
-            InterfaceType::Float32 => {
-                static INFO: TypeInformation = TypeInformation::primitive(FlatType::F32);
-                &INFO
-            }
-            InterfaceType::Float64 => {
-                static INFO: TypeInformation = TypeInformation::primitive(FlatType::F64);
-                &INFO
-            }
-            InterfaceType::String => {
-                static INFO: TypeInformation = TypeInformation::string();
-                &INFO
-            }
-
-            InterfaceType::List(i) => &self.type_info.lists[*i],
-            InterfaceType::Record(i) => &self.type_info.records[*i],
-            InterfaceType::Variant(i) => &self.type_info.variants[*i],
-            InterfaceType::Tuple(i) => &self.type_info.tuples[*i],
-            InterfaceType::Flags(i) => &self.type_info.flags[*i],
-            InterfaceType::Enum(i) => &self.type_info.enums[*i],
-            InterfaceType::Union(i) => &self.type_info.unions[*i],
-            InterfaceType::Option(i) => &self.type_info.options[*i],
-            InterfaceType::Result(i) => &self.type_info.results[*i],
-        }
-    }
-}
-
-// Forward the indexing impl to the internal `TypeTables`
-impl<T> Index<T> for ComponentTypesBuilder
-where
-    ComponentTypes: Index<T>,
-{
-    type Output = <ComponentTypes as Index<T>>::Output;
-
-    fn index(&self, sig: T) -> &Self::Output {
-        &self.component_types[sig]
-    }
-}
-
-fn intern<T, U>(map: &mut HashMap<T, U>, list: &mut PrimaryMap<U, T>, item: T) -> U
-where
-    T: Hash + Clone + Eq,
-    U: Copy + EntityRef,
-{
-    if let Some(idx) = map.get(&item) {
-        return *idx;
-    }
-    let idx = list.push(item.clone());
-    map.insert(item, idx);
-    return idx;
 }
 
 /// Types of imports and exports in the component model.
@@ -977,12 +394,32 @@ pub enum TypeDef {
     ComponentInstance(TypeComponentInstanceIndex),
     /// A component function, not to be confused with a core wasm function.
     ComponentFunc(TypeFuncIndex),
-    /// An interface type.
+    /// An type in an interface.
     Interface(InterfaceType),
     /// A core wasm module and its type.
     Module(TypeModuleIndex),
     /// A core wasm function using only core wasm types.
-    CoreFunc(SignatureIndex),
+    CoreFunc(ModuleInternedTypeIndex),
+    /// A resource type which operates on the specified resource table.
+    ///
+    /// Note that different resource tables may point to the same underlying
+    /// actual resource type, but that's a private detail.
+    Resource(TypeResourceTableIndex),
+}
+
+impl TypeDef {
+    /// A human readable description of what kind of type definition this is.
+    pub fn desc(&self) -> &str {
+        match self {
+            TypeDef::Component(_) => "component",
+            TypeDef::ComponentInstance(_) => "instance",
+            TypeDef::ComponentFunc(_) => "function",
+            TypeDef::Interface(_) => "type",
+            TypeDef::Module(_) => "core module",
+            TypeDef::CoreFunc(_) => "core function",
+            TypeDef::Resource(_) => "resource",
+        }
+    }
 }
 
 // NB: Note that maps below are stored as an `IndexMap` now but the order
@@ -1016,9 +453,9 @@ pub struct TypeModule {
 #[derive(Serialize, Deserialize, Default)]
 pub struct TypeComponent {
     /// The named values that this component imports.
-    pub imports: IndexMap<String, (String, TypeDef)>,
+    pub imports: IndexMap<String, TypeDef>,
     /// The named values that this component exports.
-    pub exports: IndexMap<String, (String, TypeDef)>,
+    pub exports: IndexMap<String, TypeDef>,
 }
 
 /// The type of a component instance in the component model, or an instantiated
@@ -1028,17 +465,32 @@ pub struct TypeComponent {
 #[derive(Serialize, Deserialize, Default)]
 pub struct TypeComponentInstance {
     /// The list of exports that this component has along with their types.
-    pub exports: IndexMap<String, (String, TypeDef)>,
+    pub exports: IndexMap<String, TypeDef>,
 }
 
 /// A component function type in the component model.
 #[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
 pub struct TypeFunc {
-    /// The list of optionally named parameters for this function, and their
-    /// types.
-    pub params: Box<[InterfaceType]>,
-    /// The return values of this function.
-    pub results: Box<[InterfaceType]>,
+    /// Names of parameters.
+    pub param_names: Vec<String>,
+    /// Parameters to the function represented as a tuple.
+    pub params: TypeTupleIndex,
+    /// Results of the function represented as a tuple.
+    pub results: TypeTupleIndex,
+    /// Expected core func type for memory32 `task.return` calls for this function.
+    pub task_return_type32: TypeTaskReturnIndex,
+    /// Expected core func type for memory64 `task.return` calls for this function.
+    pub task_return_type64: TypeTaskReturnIndex,
+}
+
+/// A core type representing the expected `task.return` signature for a
+/// component function.
+#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
+pub struct TypeTaskReturn {
+    /// Core type parameters for the signature.
+    ///
+    /// Note that `task.return` never returns results.
+    pub params: Vec<FlatType>,
 }
 
 /// All possible interface types that values can have.
@@ -1048,7 +500,7 @@ pub struct TypeFunc {
 /// forms where for non-primitive types a `ComponentTypes` structure is used to
 /// lookup further information based on the index found here.
 #[derive(Serialize, Deserialize, Copy, Clone, Hash, Eq, PartialEq, Debug)]
-#[allow(missing_docs)]
+#[allow(missing_docs, reason = "self-describing variants")]
 pub enum InterfaceType {
     Bool,
     S8,
@@ -1069,9 +521,13 @@ pub enum InterfaceType {
     Tuple(TypeTupleIndex),
     Flags(TypeFlagsIndex),
     Enum(TypeEnumIndex),
-    Union(TypeUnionIndex),
     Option(TypeOptionIndex),
     Result(TypeResultIndex),
+    Own(TypeResourceTableIndex),
+    Borrow(TypeResourceTableIndex),
+    Future(TypeFutureTableIndex),
+    Stream(TypeStreamTableIndex),
+    ErrorContext(TypeComponentLocalErrorContextTableIndex),
 }
 
 impl From<&wasmparser::PrimitiveValType> for InterfaceType {
@@ -1086,8 +542,8 @@ impl From<&wasmparser::PrimitiveValType> for InterfaceType {
             wasmparser::PrimitiveValType::U32 => InterfaceType::U32,
             wasmparser::PrimitiveValType::S64 => InterfaceType::S64,
             wasmparser::PrimitiveValType::U64 => InterfaceType::U64,
-            wasmparser::PrimitiveValType::Float32 => InterfaceType::Float32,
-            wasmparser::PrimitiveValType::Float64 => InterfaceType::Float64,
+            wasmparser::PrimitiveValType::F32 => InterfaceType::Float32,
+            wasmparser::PrimitiveValType::F64 => InterfaceType::Float64,
             wasmparser::PrimitiveValType::Char => InterfaceType::Char,
             wasmparser::PrimitiveValType::String => InterfaceType::String,
         }
@@ -1344,6 +800,24 @@ impl CanonicalAbiInfo {
         }
     }
 
+    /// Calculates ABI information for an enum with `cases` cases.
+    pub const fn enum_(cases: usize) -> CanonicalAbiInfo {
+        // NB: this is basically a duplicate definition of
+        // `CanonicalAbiInfo::variant`, these should be kept in sync.
+
+        let discrim_size = match DiscriminantSize::from_count(cases) {
+            Some(size) => size.byte_size(),
+            None => unreachable!(),
+        };
+        CanonicalAbiInfo {
+            size32: discrim_size,
+            align32: discrim_size,
+            size64: discrim_size,
+            align64: discrim_size,
+            flat_count: Some(1),
+        }
+    }
+
     /// Returns the flat count of this ABI information so long as the count
     /// doesn't exceed the `max` specified.
     pub fn flat_count(&self, max: usize) -> Option<usize> {
@@ -1454,24 +928,26 @@ pub struct RecordField {
 /// Variants are close to Rust `enum` declarations where a value is one of many
 /// cases and each case has a unique name and an optional payload associated
 /// with it.
-#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Eq, PartialEq, Debug)]
 pub struct TypeVariant {
     /// The list of cases that this variant can take.
-    pub cases: Box<[VariantCase]>,
+    pub cases: IndexMap<String, Option<InterfaceType>>,
     /// Byte information about this type in the canonical ABI.
     pub abi: CanonicalAbiInfo,
     /// Byte information about this variant type.
     pub info: VariantInfo,
 }
 
-/// One case of a `variant` type which contains the name of the variant as well
-/// as the payload.
-#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
-pub struct VariantCase {
-    /// Name of the variant, unique amongst all cases in a variant.
-    pub name: String,
-    /// Optional type associated with this payload.
-    pub ty: Option<InterfaceType>,
+impl Hash for TypeVariant {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        let TypeVariant { cases, abi, info } = self;
+        cases.len().hash(h);
+        for pair in cases {
+            pair.hash(h);
+        }
+        abi.hash(h);
+        info.hash(h);
+    }
 }
 
 /// Shape of a "tuple" type in interface types.
@@ -1490,12 +966,23 @@ pub struct TypeTuple {
 ///
 /// This can be thought of as a record-of-bools, although the representation is
 /// more efficient as bitflags.
-#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Eq, PartialEq, Debug)]
 pub struct TypeFlags {
     /// The names of all flags, all of which are unique.
-    pub names: Box<[String]>,
+    pub names: IndexSet<String>,
     /// Byte information about this type in the canonical ABI.
     pub abi: CanonicalAbiInfo,
+}
+
+impl Hash for TypeFlags {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        let TypeFlags { names, abi } = self;
+        names.len().hash(h);
+        for name in names {
+            name.hash(h);
+        }
+        abi.hash(h);
+    }
 }
 
 /// Shape of an "enum" type in interface types, not to be confused with a Rust
@@ -1503,29 +990,26 @@ pub struct TypeFlags {
 ///
 /// In interface types enums are simply a bag of names, and can be seen as a
 /// variant where all payloads are `Unit`.
-#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Eq, PartialEq, Debug)]
 pub struct TypeEnum {
     /// The names of this enum, all of which are unique.
-    pub names: Box<[String]>,
+    pub names: IndexSet<String>,
     /// Byte information about this type in the canonical ABI.
     pub abi: CanonicalAbiInfo,
     /// Byte information about this variant type.
     pub info: VariantInfo,
 }
 
-/// Shape of a "union" type in interface types.
-///
-/// Note that this can be viewed as a specialization of the `variant` interface
-/// type where each type here has a name that's numbered. This is still a
-/// tagged union.
-#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
-pub struct TypeUnion {
-    /// The list of types this is a union over.
-    pub types: Box<[InterfaceType]>,
-    /// Byte information about this type in the canonical ABI.
-    pub abi: CanonicalAbiInfo,
-    /// Byte information about this variant type.
-    pub info: VariantInfo,
+impl Hash for TypeEnum {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        let TypeEnum { names, abi, info } = self;
+        names.len().hash(h);
+        for name in names {
+            name.hash(h);
+        }
+        abi.hash(h);
+        info.hash(h);
+    }
 }
 
 /// Shape of an "option" interface type.
@@ -1552,6 +1036,58 @@ pub struct TypeResult {
     pub info: VariantInfo,
 }
 
+/// Shape of a "future" interface type.
+#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
+pub struct TypeFuture {
+    /// The `T` in `future<T>`
+    pub payload: Option<InterfaceType>,
+}
+
+/// Metadata about a future table added to a component.
+#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
+pub struct TypeFutureTable {
+    /// The specific future type this table is used for.
+    pub ty: TypeFutureIndex,
+    /// The specific component instance this table is used for.
+    pub instance: RuntimeComponentInstanceIndex,
+}
+
+/// Shape of a "stream" interface type.
+#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
+pub struct TypeStream {
+    /// The `T` in `stream<T>`
+    pub payload: Option<InterfaceType>,
+}
+
+/// Metadata about a stream table added to a component.
+#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
+pub struct TypeStreamTable {
+    /// The specific stream type this table is used for.
+    pub ty: TypeStreamIndex,
+    /// The specific component instance this table is used for.
+    pub instance: RuntimeComponentInstanceIndex,
+}
+
+/// Metadata about a error context table added to a component.
+#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
+pub struct TypeErrorContextTable {
+    /// The specific component instance this table is used for.
+    pub instance: RuntimeComponentInstanceIndex,
+}
+
+/// Metadata about a resource table added to a component.
+#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
+pub struct TypeResourceTable {
+    /// The original resource that this table contains.
+    ///
+    /// This is used when destroying resources within this table since this
+    /// original definition will know how to execute destructors.
+    pub ty: ResourceIndex,
+
+    /// The component instance that contains this resource table.
+    pub instance: RuntimeComponentInstanceIndex,
+}
+
 /// Shape of a "list" interface type.
 #[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
 pub struct TypeList {
@@ -1559,7 +1095,8 @@ pub struct TypeList {
     pub element: InterfaceType,
 }
 
-const MAX_FLAT_TYPES: usize = if MAX_FLAT_PARAMS > MAX_FLAT_RESULTS {
+/// Maximum number of flat types, for either params or results.
+pub const MAX_FLAT_TYPES: usize = if MAX_FLAT_PARAMS > MAX_FLAT_RESULTS {
     MAX_FLAT_PARAMS
 } else {
     MAX_FLAT_RESULTS
@@ -1602,7 +1139,6 @@ pub struct FlatTypes<'a> {
     pub memory64: &'a [FlatType],
 }
 
-#[allow(missing_docs)]
 impl FlatTypes<'_> {
     /// Returns the number of flat types used to represent this type.
     ///
@@ -1614,291 +1150,13 @@ impl FlatTypes<'_> {
 }
 
 // Note that this is intentionally duplicated here to keep the size to 1 byte
-// irregardless to changes in the core wasm type system since this will only
-// ever use integers/floats for the forseeable future.
-#[derive(PartialEq, Eq, Copy, Clone)]
-#[allow(missing_docs)]
+// regardless to changes in the core wasm type system since this will only
+// ever use integers/floats for the foreseeable future.
+#[derive(Serialize, Deserialize, Hash, Debug, PartialEq, Eq, Copy, Clone)]
+#[allow(missing_docs, reason = "self-describing variants")]
 pub enum FlatType {
     I32,
     I64,
     F32,
     F64,
-}
-
-struct FlatTypesStorage {
-    // This could be represented as `Vec<FlatType>` but on 64-bit architectures
-    // that's 24 bytes. Otherwise `FlatType` is 1 byte large and
-    // `MAX_FLAT_TYPES` is 16, so it should ideally be more space-efficient to
-    // use a flat array instead of a heap-based vector.
-    memory32: [FlatType; MAX_FLAT_TYPES],
-    memory64: [FlatType; MAX_FLAT_TYPES],
-
-    // Tracks the number of flat types pushed into this storage. If this is
-    // `MAX_FLAT_TYPES + 1` then this storage represents an un-reprsentable
-    // type in flat types.
-    len: u8,
-}
-
-impl FlatTypesStorage {
-    const fn new() -> FlatTypesStorage {
-        FlatTypesStorage {
-            memory32: [FlatType::I32; MAX_FLAT_TYPES],
-            memory64: [FlatType::I32; MAX_FLAT_TYPES],
-            len: 0,
-        }
-    }
-
-    fn as_flat_types(&self) -> Option<FlatTypes<'_>> {
-        let len = usize::from(self.len);
-        if len > MAX_FLAT_TYPES {
-            assert_eq!(len, MAX_FLAT_TYPES + 1);
-            None
-        } else {
-            Some(FlatTypes {
-                memory32: &self.memory32[..len],
-                memory64: &self.memory64[..len],
-            })
-        }
-    }
-
-    /// Pushes a new flat type into this list using `t32` for 32-bit memories
-    /// and `t64` for 64-bit memories.
-    ///
-    /// Returns whether the type was actually pushed or whether this list of
-    /// flat types just exceeded the maximum meaning that it is now
-    /// unrepresentable with a flat list of types.
-    fn push(&mut self, t32: FlatType, t64: FlatType) -> bool {
-        let len = usize::from(self.len);
-        if len < MAX_FLAT_TYPES {
-            self.memory32[len] = t32;
-            self.memory64[len] = t64;
-            self.len += 1;
-            true
-        } else {
-            // If this was the first one to go over then flag the length as
-            // being incompatible with a flat representation.
-            if len == MAX_FLAT_TYPES {
-                self.len += 1;
-            }
-            false
-        }
-    }
-}
-
-impl FlatType {
-    fn join(&mut self, other: FlatType) {
-        if *self == other {
-            return;
-        }
-        *self = match (*self, other) {
-            (FlatType::I32, FlatType::F32) | (FlatType::F32, FlatType::I32) => FlatType::I32,
-            _ => FlatType::I64,
-        };
-    }
-}
-
-#[derive(Default)]
-struct TypeInformationCache {
-    records: PrimaryMap<TypeRecordIndex, TypeInformation>,
-    variants: PrimaryMap<TypeVariantIndex, TypeInformation>,
-    tuples: PrimaryMap<TypeTupleIndex, TypeInformation>,
-    enums: PrimaryMap<TypeEnumIndex, TypeInformation>,
-    flags: PrimaryMap<TypeFlagsIndex, TypeInformation>,
-    unions: PrimaryMap<TypeUnionIndex, TypeInformation>,
-    options: PrimaryMap<TypeOptionIndex, TypeInformation>,
-    results: PrimaryMap<TypeResultIndex, TypeInformation>,
-    lists: PrimaryMap<TypeListIndex, TypeInformation>,
-}
-
-struct TypeInformation {
-    depth: u32,
-    flat: FlatTypesStorage,
-}
-
-impl TypeInformation {
-    const fn new() -> TypeInformation {
-        TypeInformation {
-            depth: 0,
-            flat: FlatTypesStorage::new(),
-        }
-    }
-
-    const fn primitive(flat: FlatType) -> TypeInformation {
-        let mut info = TypeInformation::new();
-        info.depth = 1;
-        info.flat.memory32[0] = flat;
-        info.flat.memory64[0] = flat;
-        info.flat.len = 1;
-        info
-    }
-
-    const fn string() -> TypeInformation {
-        let mut info = TypeInformation::new();
-        info.depth = 1;
-        info.flat.memory32[0] = FlatType::I32;
-        info.flat.memory32[1] = FlatType::I32;
-        info.flat.memory64[0] = FlatType::I64;
-        info.flat.memory64[1] = FlatType::I64;
-        info.flat.len = 2;
-        info
-    }
-
-    /// Builds up all flat types internally using the specified representation
-    /// for all of the component fields of the record.
-    fn build_record<'a>(&mut self, types: impl Iterator<Item = &'a TypeInformation>) {
-        self.depth = 1;
-        for info in types {
-            self.depth = self.depth.max(1 + info.depth);
-            match info.flat.as_flat_types() {
-                Some(types) => {
-                    for (t32, t64) in types.memory32.iter().zip(types.memory64) {
-                        if !self.flat.push(*t32, *t64) {
-                            break;
-                        }
-                    }
-                }
-                None => {
-                    self.flat.len = u8::try_from(MAX_FLAT_TYPES + 1).unwrap();
-                }
-            }
-        }
-    }
-
-    /// Builds up the flat types used to represent a `variant` which notably
-    /// handles "join"ing types together so each case is representable as a
-    /// single flat list of types.
-    ///
-    /// The iterator item is:
-    ///
-    /// * `None` - no payload for this case
-    /// * `Some(None)` - this case has a payload but can't be represented with
-    ///   flat types
-    /// * `Some(Some(types))` - this case has a payload and is represented with
-    ///   the types specified in the flat representation.
-    fn build_variant<'a, I>(&mut self, cases: I)
-    where
-        I: IntoIterator<Item = Option<&'a TypeInformation>>,
-    {
-        let cases = cases.into_iter();
-        self.flat.push(FlatType::I32, FlatType::I32);
-        self.depth = 1;
-
-        for info in cases {
-            let info = match info {
-                Some(info) => info,
-                // If this case doesn't have a payload then it doesn't change
-                // the depth/flat representation
-                None => continue,
-            };
-            self.depth = self.depth.max(1 + info.depth);
-
-            // If this variant is already unrepresentable in a flat
-            // representation then this can be skipped.
-            if usize::from(self.flat.len) > MAX_FLAT_TYPES {
-                continue;
-            }
-
-            let types = match info.flat.as_flat_types() {
-                Some(types) => types,
-                // If this case isn't representable with a flat list of types
-                // then this variant also isn't representable.
-                None => {
-                    self.flat.len = u8::try_from(MAX_FLAT_TYPES + 1).unwrap();
-                    continue;
-                }
-            };
-            // If the case used all of the flat types then the discriminant
-            // added for this variant means that this variant is no longer
-            // representable.
-            if types.memory32.len() >= MAX_FLAT_TYPES {
-                self.flat.len = u8::try_from(MAX_FLAT_TYPES + 1).unwrap();
-                continue;
-            }
-            let dst = self
-                .flat
-                .memory32
-                .iter_mut()
-                .zip(&mut self.flat.memory64)
-                .skip(1);
-            for (i, ((t32, t64), (dst32, dst64))) in types
-                .memory32
-                .iter()
-                .zip(types.memory64)
-                .zip(dst)
-                .enumerate()
-            {
-                if i + 1 < usize::from(self.flat.len) {
-                    // If this index hs already been set by some previous case
-                    // then the types are joined together.
-                    dst32.join(*t32);
-                    dst64.join(*t64);
-                } else {
-                    // Otherwise if this is the first time that the
-                    // representation has gotten this large then the destination
-                    // is simply whatever the type is. The length is also
-                    // increased here to indicate this.
-                    self.flat.len += 1;
-                    *dst32 = *t32;
-                    *dst64 = *t64;
-                }
-            }
-        }
-    }
-
-    fn records(&mut self, types: &ComponentTypesBuilder, ty: &TypeRecord) {
-        self.build_record(ty.fields.iter().map(|f| types.type_information(&f.ty)));
-    }
-
-    fn tuples(&mut self, types: &ComponentTypesBuilder, ty: &TypeTuple) {
-        self.build_record(ty.types.iter().map(|t| types.type_information(t)));
-    }
-
-    fn enums(&mut self, _types: &ComponentTypesBuilder, _ty: &TypeEnum) {
-        self.depth = 1;
-        self.flat.push(FlatType::I32, FlatType::I32);
-    }
-
-    fn flags(&mut self, _types: &ComponentTypesBuilder, ty: &TypeFlags) {
-        self.depth = 1;
-        match FlagsSize::from_count(ty.names.len()) {
-            FlagsSize::Size0 => {}
-            FlagsSize::Size1 | FlagsSize::Size2 => {
-                self.flat.push(FlatType::I32, FlatType::I32);
-            }
-            FlagsSize::Size4Plus(n) => {
-                for _ in 0..n {
-                    self.flat.push(FlatType::I32, FlatType::I32);
-                }
-            }
-        }
-    }
-
-    fn variants(&mut self, types: &ComponentTypesBuilder, ty: &TypeVariant) {
-        self.build_variant(
-            ty.cases
-                .iter()
-                .map(|c| c.ty.as_ref().map(|ty| types.type_information(ty))),
-        )
-    }
-
-    fn unions(&mut self, types: &ComponentTypesBuilder, ty: &TypeUnion) {
-        self.build_variant(ty.types.iter().map(|t| Some(types.type_information(t))))
-    }
-
-    fn results(&mut self, types: &ComponentTypesBuilder, ty: &TypeResult) {
-        self.build_variant([
-            ty.ok.as_ref().map(|ty| types.type_information(ty)),
-            ty.err.as_ref().map(|ty| types.type_information(ty)),
-        ])
-    }
-
-    fn options(&mut self, types: &ComponentTypesBuilder, ty: &TypeOption) {
-        self.build_variant([None, Some(types.type_information(&ty.ty))]);
-    }
-
-    fn lists(&mut self, types: &ComponentTypesBuilder, ty: &TypeList) {
-        *self = TypeInformation::string();
-        let info = types.type_information(&ty.element);
-        self.depth += info.depth;
-    }
 }

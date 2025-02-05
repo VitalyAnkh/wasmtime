@@ -3,30 +3,10 @@
 //! The `cranelift_reader` library supports reading .clif files. This functionality is needed for
 //! testing Cranelift, but is not essential for a JIT compiler.
 
-#![deny(
-    missing_docs,
-    trivial_numeric_casts,
-    unused_extern_crates,
-    unstable_features
-)]
-#![warn(unused_import_braces)]
-#![cfg_attr(feature = "clippy", plugin(clippy(conf_file = "../../clippy.toml")))]
-#![cfg_attr(feature = "cargo-clippy", allow(clippy::new_without_default))]
-#![cfg_attr(
-    feature = "cargo-clippy",
-    warn(
-        clippy::float_arithmetic,
-        clippy::mut_mut,
-        clippy::nonminimal_bool,
-        clippy::map_unwrap_or,
-        clippy::clippy::print_stdout,
-        clippy::unicode_not_nfc,
-        clippy::use_self
-    )
-)]
+#![deny(missing_docs)]
 
 pub use crate::error::{Location, ParseError, ParseResult};
-pub use crate::isaspec::{parse_options, IsaSpec, ParseOptionError};
+pub use crate::isaspec::{parse_option, parse_options, IsaSpec, ParseOptionError};
 pub use crate::parser::{parse_functions, parse_run_command, parse_test, ParseOptions};
 pub use crate::run_command::{Comparison, Invocation, RunCommand};
 pub use crate::sourcemap::SourceMap;
@@ -49,7 +29,7 @@ use std::str::FromStr;
 use target_lexicon::Triple;
 
 /// Like `FlagsOrIsa`, but holds ownership.
-#[allow(missing_docs)]
+#[allow(missing_docs, reason = "self-describing variants")]
 pub enum OwnedFlagsOrIsa {
     Flags(settings::Flags),
     Isa(OwnedTargetIsa),
@@ -72,19 +52,17 @@ pub fn parse_sets_and_triple(flag_set: &[String], flag_triple: &str) -> Result<O
     // Collect unknown system-wide settings, so we can try to parse them as target specific
     // settings, if a target is defined.
     let mut unknown_settings = Vec::new();
-    match parse_options(
-        flag_set.iter().map(|x| x.as_str()),
-        &mut flag_builder,
-        Location { line_number: 0 },
-    ) {
-        Err(ParseOptionError::UnknownFlag { name, .. }) => {
-            unknown_settings.push(name);
+    for flag in flag_set {
+        match parse_option(flag, &mut flag_builder, Location { line_number: 0 }) {
+            Err(ParseOptionError::UnknownFlag { name, .. }) => {
+                unknown_settings.push(name);
+            }
+            Err(ParseOptionError::UnknownValue { name, value, .. }) => {
+                unknown_settings.push(format!("{name}={value}"));
+            }
+            Err(ParseOptionError::Generic(err)) => return Err(err.into()),
+            Ok(()) => {}
         }
-        Err(ParseOptionError::UnknownValue { name, value, .. }) => {
-            unknown_settings.push(format!("{}={}", name, value));
-        }
-        Err(ParseOptionError::Generic(err)) => return Err(err.into()),
-        Ok(()) => {}
     }
 
     let mut words = flag_triple.trim().split_whitespace();

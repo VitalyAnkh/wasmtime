@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use gimli::write::{Address, FrameDescriptionEntry};
 
 #[cfg(feature = "enable-serde")]
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 
 type Register = u16;
 
@@ -34,7 +34,7 @@ impl std::fmt::Display for RegisterMappingError {
                 "register mapping is currently only implemented for x86_64"
             ),
             RegisterMappingError::UnsupportedRegisterBank(bank) => {
-                write!(f, "unsupported register bank: {}", bank)
+                write!(f, "unsupported register bank: {bank}")
             }
         }
     }
@@ -135,8 +135,6 @@ impl Into<gimli::write::CallFrameInstruction> for CallFrameInstruction {
 pub(crate) trait RegisterMapper<Reg> {
     /// Maps Reg.
     fn map(&self, reg: Reg) -> Result<Register, RegisterMappingError>;
-    /// Gets stack pointer register.
-    fn sp(&self) -> Register;
     /// Gets the frame pointer register, if any.
     fn fp(&self) -> Option<Register> {
         None
@@ -159,6 +157,12 @@ pub(crate) trait RegisterMapper<Reg> {
 pub struct UnwindInfo {
     instructions: Vec<(u32, CallFrameInstruction)>,
     len: u32,
+}
+
+/// Offset from the caller's SP to CFA as we define it.
+pub(crate) fn caller_sp_to_cfa_offset() -> u32 {
+    // Currently we define them to always be equal.
+    0
 }
 
 pub(crate) fn create_unwind_info_from_insts<MR: RegisterMapper<Reg>>(
@@ -242,6 +246,19 @@ pub(crate) fn create_unwind_info_from_insts<MR: RegisterMapper<Reg>>(
                     .map_err(|e| CodegenError::RegisterMappingError(e))?;
                 let off = (clobber_offset as i32) - (clobber_offset_to_cfa as i32);
                 instructions.push((instruction_offset, CallFrameInstruction::Offset(reg, off)));
+            }
+            &UnwindInst::RegStackOffset {
+                clobber_offset,
+                reg,
+            } => {
+                let reg = mr
+                    .map(reg.into())
+                    .map_err(|e| CodegenError::RegisterMappingError(e))?;
+                let off = (clobber_offset as i32) - (clobber_offset_to_cfa as i32);
+                instructions.push((
+                    instruction_offset,
+                    CallFrameInstruction::ValOffset(reg, off),
+                ));
             }
             &UnwindInst::Aarch64SetPointerAuth { return_addresses } => {
                 instructions.push((

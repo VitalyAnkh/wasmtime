@@ -10,11 +10,11 @@
 //!
 //! The three main primitives are the following:
 //! - `compute_cache_key` is used to compute the cache key associated to a `Function`. This is
-//! basically the content of the function, modulo a few things the caching system is resilient to.
+//!   basically the content of the function, modulo a few things the caching system is resilient to.
 //! - `serialize_compiled` is used to serialize the result of a compilation, so it can be reused
-//! later on by...
+//!   later on by...
 //! - `try_finish_recompile`, which reads binary blobs serialized with `serialize_compiled`,
-//! re-creating the compilation artifact from those.
+//!   re-creating the compilation artifact from those.
 //!
 //! The `CacheStore` trait and `Context::compile_with_cache` method are provided as
 //! high-level, easy-to-use facilities to make use of that cache, and show an example of how to use
@@ -32,6 +32,7 @@ use crate::{isa::TargetIsa, timing};
 use crate::{trace, CompileError, Context};
 use alloc::borrow::{Cow, ToOwned as _};
 use alloc::string::ToString as _;
+use cranelift_control::ControlPlane;
 
 impl Context {
     /// Compile the function, as in `compile`, but tries to reuse compiled artifacts from former
@@ -40,11 +41,12 @@ impl Context {
         &mut self,
         isa: &dyn TargetIsa,
         cache_store: &mut dyn CacheKvStore,
+        ctrl_plane: &mut ControlPlane,
     ) -> CompileResult<(&CompiledCode, bool)> {
         let cache_key_hash = {
             let _tt = timing::try_incremental_cache();
 
-            let cache_key_hash = compute_cache_key(isa, &mut self.func);
+            let cache_key_hash = compute_cache_key(isa, &self.func);
 
             if let Some(blob) = cache_store.get(&cache_key_hash.0) {
                 match try_finish_recompile(&self.func, &blob) {
@@ -52,7 +54,7 @@ impl Context {
                         let info = compiled_code.code_info();
 
                         if isa.flags().enable_incremental_compilation_cache_checks() {
-                            let actual_result = self.compile(isa)?;
+                            let actual_result = self.compile(isa, ctrl_plane)?;
                             assert_eq!(*actual_result, compiled_code);
                             assert_eq!(actual_result.code_info(), info);
                             // no need to set `compiled_code` here, it's set by `compile()`.
@@ -71,10 +73,12 @@ impl Context {
             cache_key_hash
         };
 
-        let stencil = self.compile_stencil(isa).map_err(|err| CompileError {
-            inner: err,
-            func: &self.func,
-        })?;
+        let stencil = self
+            .compile_stencil(isa, ctrl_plane)
+            .map_err(|err| CompileError {
+                inner: err,
+                func: &self.func,
+            })?;
 
         let stencil = {
             let _tt = timing::store_incremental_cache();
@@ -114,10 +118,12 @@ impl std::fmt::Display for CacheKeyHash {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde_derive::Serialize, serde_derive::Deserialize)]
 struct CachedFunc {
-    stencil: CompiledCodeStencil,
+    // Note: The version marker must be first to ensure deserialization stops in case of a version
+    // mismatch before attempting to deserialize the actual compiled code.
     version_marker: VersionMarker,
+    stencil: CompiledCodeStencil,
 }
 
 /// Key for caching a single function's compilation.
@@ -133,7 +139,7 @@ struct CacheKey<'a> {
     parameters: CompileParameters,
 }
 
-#[derive(Clone, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Hash, serde_derive::Serialize, serde_derive::Deserialize)]
 struct CompileParameters {
     isa: String,
     triple: String,
@@ -160,11 +166,7 @@ impl<'a> CacheKey<'a> {
     /// Creates a new cache store key for a function.
     ///
     /// This is a bit expensive to compute, so it should be cached and reused as much as possible.
-    fn new(isa: &dyn TargetIsa, f: &'a mut Function) -> Self {
-        // Make sure the blocks and instructions are sequenced the same way as we might
-        // have serialized them earlier. This is the symmetric of what's done in
-        // `try_load`.
-        f.stencil.layout.full_renumber();
+    fn new(isa: &dyn TargetIsa, f: &'a Function) -> Self {
         CacheKey {
             stencil: &f.stencil,
             parameters: CompileParameters::from_isa(isa),
@@ -175,7 +177,7 @@ impl<'a> CacheKey<'a> {
 /// Compute a cache key, and hash it on your behalf.
 ///
 /// Since computing the `CacheKey` is a bit expensive, it should be done as least as possible.
-pub fn compute_cache_key(isa: &dyn TargetIsa, func: &mut Function) -> CacheKeyHash {
+pub fn compute_cache_key(isa: &dyn TargetIsa, func: &Function) -> CacheKeyHash {
     use core::hash::{Hash as _, Hasher};
     use sha2::Digest as _;
 
@@ -206,12 +208,12 @@ pub fn compute_cache_key(isa: &dyn TargetIsa, func: &mut Function) -> CacheKeyHa
 /// of the function call. The value is left untouched.
 pub fn serialize_compiled(
     result: CompiledCodeStencil,
-) -> (CompiledCodeStencil, Result<Vec<u8>, bincode::Error>) {
+) -> (CompiledCodeStencil, Result<Vec<u8>, postcard::Error>) {
     let cached = CachedFunc {
-        stencil: result,
         version_marker: VersionMarker,
+        stencil: result,
     };
-    let result = bincode::serialize(&cached);
+    let result = postcard::to_allocvec(&cached);
     (cached.stencil, result)
 }
 
@@ -221,7 +223,7 @@ pub enum RecompileError {
     /// The version embedded in the cache entry isn't the same as cranelift's current version.
     VersionMismatch,
     /// An error occurred while deserializing the cache entry.
-    Deserialize(bincode::Error),
+    Deserialize(postcard::Error),
 }
 
 impl fmt::Display for RecompileError {
@@ -229,7 +231,7 @@ impl fmt::Display for RecompileError {
         match self {
             RecompileError::VersionMismatch => write!(f, "cranelift version mismatch",),
             RecompileError::Deserialize(err) => {
-                write!(f, "bincode failed during deserialization: {err}")
+                write!(f, "postcard failed during deserialization: {err}")
             }
         }
     }
@@ -241,7 +243,7 @@ impl fmt::Display for RecompileError {
 /// Precondition: the bytes must have retrieved from a cache store entry which hash value
 /// is strictly the same as the `Function`'s computed hash retrieved from `compute_cache_key`.
 pub fn try_finish_recompile(func: &Function, bytes: &[u8]) -> Result<CompiledCode, RecompileError> {
-    match bincode::deserialize::<CachedFunc>(bytes) {
+    match postcard::from_bytes::<CachedFunc>(bytes) {
         Ok(result) => {
             if result.version_marker != func.stencil.version_marker {
                 Err(RecompileError::VersionMismatch)

@@ -9,7 +9,6 @@
 
 use crate::Variable;
 use alloc::vec::Vec;
-use core::convert::TryInto;
 use core::mem;
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::entity::{EntityList, EntitySet, ListPool, SecondaryMap};
@@ -20,7 +19,7 @@ use cranelift_codegen::packed_option::PackedOption;
 
 /// Structure containing the data relevant the construction of SSA for a given function.
 ///
-/// The parameter struct `Variable` corresponds to the way variables are represented in the
+/// The parameter struct [`Variable`] corresponds to the way variables are represented in the
 /// non-SSA language you're translating from.
 ///
 /// The SSA building relies on information about the variables used and defined.
@@ -63,9 +62,6 @@ pub struct SSABuilder {
 /// Side effects of a `use_var` or a `seal_block` method call.
 #[derive(Default)]
 pub struct SideEffects {
-    /// When we want to append jump arguments to a `br_table` instruction, the critical edge is
-    /// splitted and the newly created `Block`s are signaled here.
-    pub split_blocks_created: Vec<Block>,
     /// When a variable is used but has never been defined before (this happens in the case of
     /// unreachable code), a placeholder `iconst` or `fconst` value is added to the right `Block`.
     /// This field signals if it is the case and return the `Block` to which the initialization has
@@ -75,7 +71,7 @@ pub struct SideEffects {
 
 impl SideEffects {
     fn is_empty(&self) -> bool {
-        self.split_blocks_created.is_empty() && self.instructions_added_to_blocks.is_empty()
+        self.instructions_added_to_blocks.is_empty()
     }
 }
 
@@ -146,8 +142,6 @@ fn emit_zero(ty: Type, mut cur: FuncCursor) -> Value {
         cur.ins().f32const(Ieee32::with_bits(0))
     } else if ty == F64 {
         cur.ins().f64const(Ieee64::with_bits(0))
-    } else if ty.is_ref() {
-        cur.ins().null(ty)
     } else if ty.is_vector() {
         let scalar_ty = ty.lane_type();
         if scalar_ty.is_int() {
@@ -164,10 +158,10 @@ fn emit_zero(ty: Type, mut cur: FuncCursor) -> Value {
             let scalar = cur.ins().f64const(Ieee64::with_bits(0));
             cur.ins().splat(ty, scalar)
         } else {
-            panic!("unimplemented scalar type: {:?}", ty)
+            panic!("unimplemented scalar type: {ty:?}")
         }
     } else {
-        panic!("unimplemented type: {:?}", ty)
+        panic!("unimplemented type: {ty:?}")
     }
 }
 
@@ -384,8 +378,7 @@ impl SSABuilder {
     pub fn seal_block(&mut self, block: Block, func: &mut Function) -> SideEffects {
         debug_assert!(
             !self.is_sealed(block),
-            "Attempting to seal {} which is already sealed.",
-            block
+            "Attempting to seal {block} which is already sealed."
         );
         self.seal_one_block(block, func);
         mem::take(&mut self.side_effects)

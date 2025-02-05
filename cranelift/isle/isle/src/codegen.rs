@@ -1,10 +1,15 @@
 //! Generate Rust code from a series of Sequences.
 
-use crate::sema::{ExternalSig, ReturnKind, Sym, Term, TermEnv, TermId, Type, TypeEnv, TypeId};
+use crate::files::Files;
+use crate::sema::{
+    BuiltinType, ExternalSig, ReturnKind, Term, TermEnv, TermId, Type, TypeEnv, TypeId,
+};
 use crate::serialize::{Block, ControlFlow, EvalStep, MatchArm};
+use crate::stablemapset::StableSet;
 use crate::trie_again::{Binding, BindingId, Constraint, RuleSet};
-use crate::StableSet;
 use std::fmt::Write;
+use std::slice::Iter;
+use std::sync::Arc;
 
 /// Options for code generation.
 #[derive(Clone, Debug, Default)]
@@ -16,19 +21,26 @@ pub struct CodegenOptions {
 
 /// Emit Rust source code for the given type and term environments.
 pub fn codegen(
+    files: Arc<Files>,
     typeenv: &TypeEnv,
     termenv: &TermEnv,
     terms: &[(TermId, RuleSet)],
     options: &CodegenOptions,
 ) -> String {
-    Codegen::compile(typeenv, termenv, terms).generate_rust(options)
+    Codegen::compile(files, typeenv, termenv, terms).generate_rust(options)
 }
 
 #[derive(Clone, Debug)]
 struct Codegen<'a> {
+    files: Arc<Files>,
     typeenv: &'a TypeEnv,
     termenv: &'a TermEnv,
     terms: &'a [(TermId, RuleSet)],
+}
+
+enum Nested<'a> {
+    Cases(Iter<'a, EvalStep>),
+    Arms(BindingId, Iter<'a, MatchArm>),
 }
 
 struct BodyContext<'a, W> {
@@ -60,7 +72,10 @@ impl<'a, W: Write> BodyContext<'a, W> {
         writeln!(self.out, " {{")
     }
 
-    fn end_block(&mut self, scope: StableSet<BindingId>) -> std::fmt::Result {
+    fn end_block(&mut self, last_line: &str, scope: StableSet<BindingId>) -> std::fmt::Result {
+        if !last_line.is_empty() {
+            writeln!(self.out, "{}{}", &self.indent, last_line)?;
+        }
         self.is_bound = scope;
         self.end_block_without_newline()?;
         writeln!(self.out)
@@ -82,11 +97,13 @@ impl<'a, W: Write> BodyContext<'a, W> {
 
 impl<'a> Codegen<'a> {
     fn compile(
+        files: Arc<Files>,
         typeenv: &'a TypeEnv,
         termenv: &'a TermEnv,
         terms: &'a [(TermId, RuleSet)],
     ) -> Codegen<'a> {
         Codegen {
+            files,
             typeenv,
             termenv,
             terms,
@@ -112,8 +129,8 @@ impl<'a> Codegen<'a> {
             "// Generated automatically from the instruction-selection DSL code in:",
         )
         .unwrap();
-        for file in &self.typeenv.filenames {
-            writeln!(code, "// - {}", file).unwrap();
+        for file in &self.files.file_names {
+            writeln!(code, "// - {file}").unwrap();
         }
 
         if !options.exclude_global_allow_pragmas {
@@ -154,7 +171,7 @@ impl<'a> Codegen<'a> {
         if sig.ret_kind == ReturnKind::Iterator {
             writeln!(
                 code,
-                "{indent}type {name}_iter: ContextIter<Context = Self, Output = {output}>;",
+                "{indent}type {name}_returns: Default + IntoContextIter<Context = Self, Output = {output}>;",
                 indent = indent,
                 name = sig.func_name,
                 output = ret_tuple,
@@ -164,8 +181,8 @@ impl<'a> Codegen<'a> {
 
         let ret_ty = match sig.ret_kind {
             ReturnKind::Plain => ret_tuple,
-            ReturnKind::Option => format!("Option<{}>", ret_tuple),
-            ReturnKind::Iterator => format!("Self::{}_iter", sig.func_name),
+            ReturnKind::Option => format!("Option<{ret_tuple}>"),
+            ReturnKind::Iterator => format!("()"),
         };
 
         writeln!(
@@ -178,6 +195,11 @@ impl<'a> Codegen<'a> {
                 .iter()
                 .enumerate()
                 .map(|(i, &ty)| format!("arg{}: {}", i, self.type_name(ty, /* by_ref = */ true)))
+                .chain(if sig.ret_kind == ReturnKind::Iterator {
+                    Some(format!("returns: &mut Self::{}_returns", sig.func_name))
+                } else {
+                    None
+                })
                 .collect::<Vec<_>>()
                 .join(", "),
             ret_ty = ret_ty,
@@ -186,7 +208,7 @@ impl<'a> Codegen<'a> {
     }
 
     fn generate_ctx_trait(&self, code: &mut String) {
-        writeln!(code, "").unwrap();
+        writeln!(code).unwrap();
         writeln!(
             code,
             "/// Context during lowering: an implementation of this trait"
@@ -217,31 +239,92 @@ impl<'a> Codegen<'a> {
         writeln!(
             code,
             r#"
-           pub trait ContextIter {{
-               type Context;
-               type Output;
-               fn next(&mut self, ctx: &mut Self::Context) -> Option<Self::Output>;
-           }}
+pub trait ContextIter {{
+    type Context;
+    type Output;
+    fn next(&mut self, ctx: &mut Self::Context) -> Option<Self::Output>;
+    fn size_hint(&self) -> (usize, Option<usize>) {{ (0, None) }}
+}}
 
-           pub struct ContextIterWrapper<Item, I: Iterator < Item = Item>, C: Context> {{
-               iter: I,
-               _ctx: PhantomData<C>,
-           }}
-           impl<Item, I: Iterator<Item = Item>, C: Context> From<I> for ContextIterWrapper<Item, I, C> {{
-               fn from(iter: I) -> Self {{
-                   Self {{ iter, _ctx: PhantomData }}
-               }}
-           }}
-           impl<Item, I: Iterator<Item = Item>, C: Context> ContextIter for ContextIterWrapper<Item, I, C> {{
-               type Context = C;
-               type Output = Item;
-               fn next(&mut self, _ctx: &mut Self::Context) -> Option<Self::Output> {{
-                   self.iter.next()
-               }}
-           }}
+pub trait IntoContextIter {{
+    type Context;
+    type Output;
+    type IntoIter: ContextIter<Context = Self::Context, Output = Self::Output>;
+    fn into_context_iter(self) -> Self::IntoIter;
+}}
+
+pub trait Length {{
+    fn len(&self) -> usize;
+}}
+
+impl<T> Length for std::vec::Vec<T> {{
+    fn len(&self) -> usize {{
+        std::vec::Vec::len(self)
+    }}
+}}
+
+pub struct ContextIterWrapper<I, C> {{
+    iter: I,
+    _ctx: std::marker::PhantomData<C>,
+}}
+impl<I: Default, C> Default for ContextIterWrapper<I, C> {{
+    fn default() -> Self {{
+        ContextIterWrapper {{
+            iter: I::default(),
+            _ctx: std::marker::PhantomData
+        }}
+    }}
+}}
+impl<I, C> std::ops::Deref for ContextIterWrapper<I, C> {{
+    type Target = I;
+    fn deref(&self) -> &I {{
+        &self.iter
+    }}
+}}
+impl<I, C> std::ops::DerefMut for ContextIterWrapper<I, C> {{
+    fn deref_mut(&mut self) -> &mut I {{
+        &mut self.iter
+    }}
+}}
+impl<I: Iterator, C: Context> From<I> for ContextIterWrapper<I, C> {{
+    fn from(iter: I) -> Self {{
+        Self {{ iter, _ctx: std::marker::PhantomData }}
+    }}
+}}
+impl<I: Iterator, C: Context> ContextIter for ContextIterWrapper<I, C> {{
+    type Context = C;
+    type Output = I::Item;
+    fn next(&mut self, _ctx: &mut Self::Context) -> Option<Self::Output> {{
+        self.iter.next()
+    }}
+    fn size_hint(&self) -> (usize, Option<usize>) {{
+        self.iter.size_hint()
+    }}
+}}
+impl<I: IntoIterator, C: Context> IntoContextIter for ContextIterWrapper<I, C> {{
+    type Context = C;
+    type Output = I::Item;
+    type IntoIter = ContextIterWrapper<I::IntoIter, C>;
+    fn into_context_iter(self) -> Self::IntoIter {{
+        ContextIterWrapper {{
+            iter: self.iter.into_iter(),
+            _ctx: std::marker::PhantomData
+        }}
+    }}
+}}
+impl<T, E: Extend<T>, C> Extend<T> for ContextIterWrapper<E, C> {{
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {{
+        self.iter.extend(iter);
+    }}
+}}
+impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
+    fn len(&self) -> usize {{
+        self.iter.len()
+    }}
+}}
            "#,
         )
-            .unwrap();
+        .unwrap();
     }
 
     fn generate_internal_types(&self, code: &mut String) {
@@ -260,35 +343,31 @@ impl<'a> Codegen<'a> {
                         code,
                         "\n/// Internal type {}: defined at {}.",
                         name,
-                        pos.pretty_print_line(&self.typeenv.filenames[..])
+                        pos.pretty_print_line(&self.files)
                     )
                     .unwrap();
 
                     // Generate the `derive`s.
                     let debug_derive = if is_nodebug { "" } else { ", Debug" };
                     if variants.iter().all(|v| v.fields.is_empty()) {
-                        writeln!(
-                            code,
-                            "#[derive(Copy, Clone, PartialEq, Eq{})]",
-                            debug_derive
-                        )
-                        .unwrap();
+                        writeln!(code, "#[derive(Copy, Clone, PartialEq, Eq{debug_derive})]")
+                            .unwrap();
                     } else {
-                        writeln!(code, "#[derive(Clone{})]", debug_derive).unwrap();
+                        writeln!(code, "#[derive(Clone{debug_derive})]").unwrap();
                     }
 
-                    writeln!(code, "pub enum {} {{", name).unwrap();
+                    writeln!(code, "pub enum {name} {{").unwrap();
                     for variant in variants {
                         let name = &self.typeenv.syms[variant.name.index()];
                         if variant.fields.is_empty() {
-                            writeln!(code, "    {},", name).unwrap();
+                            writeln!(code, "    {name},").unwrap();
                         } else {
-                            writeln!(code, "    {} {{", name).unwrap();
+                            writeln!(code, "    {name} {{").unwrap();
                             for field in &variant.fields {
                                 let name = &self.typeenv.syms[field.name.index()];
                                 let ty_name =
-                                    self.typeenv.types[field.ty.index()].name(&self.typeenv);
-                                writeln!(code, "        {}: {},", name, ty_name).unwrap();
+                                    self.typeenv.types[field.ty.index()].name(self.typeenv);
+                                writeln!(code, "        {name}: {ty_name},").unwrap();
                             }
                             writeln!(code, "    }},").unwrap();
                         }
@@ -301,9 +380,10 @@ impl<'a> Codegen<'a> {
     }
 
     fn type_name(&self, typeid: TypeId, by_ref: bool) -> String {
-        match &self.typeenv.types[typeid.index()] {
-            &Type::Primitive(_, sym, _) => self.typeenv.syms[sym.index()].clone(),
-            &Type::Enum { name, .. } => {
+        match self.typeenv.types[typeid.index()] {
+            Type::Builtin(bt) => String::from(bt.name()),
+            Type::Primitive(_, sym, _) => self.typeenv.syms[sym.index()].clone(),
+            Type::Enum { name, .. } => {
                 let r = if by_ref { "&" } else { "" };
                 format!("{}{}", r, self.typeenv.syms[name.index()])
             }
@@ -333,14 +413,9 @@ impl<'a> Codegen<'a> {
 
             writeln!(ctx.out, "{}    ctx: &mut C,", &ctx.indent)?;
             for (i, &ty) in sig.param_tys.iter().enumerate() {
-                let (is_ref, sym) = self.ty(ty);
+                let (is_ref, ty) = self.ty(ty);
                 write!(ctx.out, "{}    arg{}: ", &ctx.indent, i)?;
-                write!(
-                    ctx.out,
-                    "{}{}",
-                    if is_ref { "&" } else { "" },
-                    &self.typeenv.syms[sym.index()]
-                )?;
+                write!(ctx.out, "{}{}", if is_ref { "&" } else { "" }, ty)?;
                 if let Some(binding) = ctx.ruleset.find_binding(&Binding::Argument {
                     index: i.try_into().unwrap(),
                 }) {
@@ -349,73 +424,61 @@ impl<'a> Codegen<'a> {
                 writeln!(ctx.out, ",")?;
             }
 
-            write!(ctx.out, "{}) -> ", &ctx.indent)?;
             let (_, ret) = self.ty(sig.ret_tys[0]);
-            let ret = &self.typeenv.syms[ret.index()];
-            match sig.ret_kind {
-                ReturnKind::Iterator => {
-                    write!(ctx.out, "impl ContextIter<Context = C, Output = {}>", ret)?
-                }
-                ReturnKind::Option => write!(ctx.out, "Option<{}>", ret)?,
-                ReturnKind::Plain => write!(ctx.out, "{}", ret)?,
-            };
 
-            let scope = ctx.enter_scope();
-            ctx.begin_block()?;
-
-            if sig.ret_kind == ReturnKind::Iterator {
+            if let ReturnKind::Iterator = sig.ret_kind {
                 writeln!(
                     ctx.out,
-                    "{}let mut returns = ConstructorVec::new();",
-                    &ctx.indent
+                    "{}    returns: &mut (impl Extend<{}> + Length),",
+                    &ctx.indent, ret
                 )?;
             }
 
-            self.emit_block(&mut ctx, &root, sig.ret_kind)?;
+            write!(ctx.out, "{}) -> ", &ctx.indent)?;
+            match sig.ret_kind {
+                ReturnKind::Iterator => write!(ctx.out, "()")?,
+                ReturnKind::Option => write!(ctx.out, "Option<{ret}>")?,
+                ReturnKind::Plain => write!(ctx.out, "{ret}")?,
+            };
 
-            match (sig.ret_kind, root.steps.last()) {
-                    (ReturnKind::Iterator, _) => {
-                        writeln!(
-                            ctx.out,
-                            "{}return ContextIterWrapper::from(returns.into_iter());",
-                            &ctx.indent
-                        )?;
-                    }
-                    (_, Some(EvalStep { check: ControlFlow::Return { .. }, .. })) => {
-                        // If there's an outermost fallback, no need for another `return` statement.
-                    }
-                    (ReturnKind::Option, _) => {
-                        writeln!(ctx.out, "{}None", &ctx.indent)?
-                    }
-                    (ReturnKind::Plain, _) => {
-                        writeln!(ctx.out,
-                                "unreachable!(\"no rule matched for term {{}} at {{}}; should it be partial?\", {:?}, {:?})",
-                                term_name,
-                                termdata
-                                    .decl_pos
-                                    .pretty_print_line(&self.typeenv.filenames[..])
-                        )?
-                    }
+            let last_expr = if let Some(EvalStep {
+                check: ControlFlow::Return { .. },
+                ..
+            }) = root.steps.last()
+            {
+                // If there's an outermost fallback, no need for another `return` statement.
+                String::new()
+            } else {
+                match sig.ret_kind {
+                    ReturnKind::Iterator => String::new(),
+                    ReturnKind::Option => "None".to_string(),
+                    ReturnKind::Plain => format!(
+                        "unreachable!(\"no rule matched for term {{}} at {{}}; should it be partial?\", {:?}, {:?})",
+                        term_name,
+                        termdata
+                            .decl_pos
+                            .pretty_print_line(&self.files)
+                    ),
                 }
+            };
 
-            ctx.end_block(scope)?;
+            let scope = ctx.enter_scope();
+            self.emit_block(&mut ctx, &root, sig.ret_kind, &last_expr, scope)?;
         }
         Ok(())
     }
 
-    fn ty(&self, typeid: TypeId) -> (bool, Sym) {
-        match &self.typeenv.types[typeid.index()] {
-            &Type::Primitive(_, sym, _) => (false, sym),
-            &Type::Enum { name, .. } => (true, name),
-        }
+    fn ty(&self, typeid: TypeId) -> (bool, String) {
+        let ty = &self.typeenv.types[typeid.index()];
+        let name = ty.name(self.typeenv);
+        let is_ref = match ty {
+            Type::Builtin(_) | Type::Primitive(..) => false,
+            Type::Enum { .. } => true,
+        };
+        (is_ref, String::from(name))
     }
 
-    fn emit_block<W: Write>(
-        &self,
-        ctx: &mut BodyContext<W>,
-        block: &Block,
-        ret_kind: ReturnKind,
-    ) -> std::fmt::Result {
+    fn validate_block(ret_kind: ReturnKind, block: &Block) -> Nested {
         if !matches!(ret_kind, ReturnKind::Iterator) {
             // Loops are only allowed if we're returning an iterator.
             assert!(!block
@@ -434,115 +497,204 @@ impl<'a> Codegen<'a> {
             }
         }
 
-        for case in block.steps.iter() {
-            for &expr in case.bind_order.iter() {
-                write!(ctx.out, "{}let v{} = ", &ctx.indent, expr.index())?;
-                self.emit_expr(ctx, expr)?;
-                writeln!(ctx.out, ";")?;
-                ctx.is_bound.insert(expr);
-            }
+        Nested::Cases(block.steps.iter())
+    }
 
-            match &case.check {
-                // Use a shorthand notation if there's only one match arm.
-                ControlFlow::Match { source, arms } if arms.len() == 1 => {
-                    let arm = &arms[0];
-                    let scope = ctx.enter_scope();
-                    match arm.constraint {
-                        Constraint::ConstInt { .. } | Constraint::ConstPrim { .. } => {
-                            write!(ctx.out, "{}if ", &ctx.indent)?;
-                            self.emit_expr(ctx, *source)?;
-                            write!(ctx.out, " == ")?;
-                            self.emit_constraint(ctx, *source, arm)?;
-                        }
-                        Constraint::Variant { .. } | Constraint::Some => {
-                            write!(ctx.out, "{}if let ", &ctx.indent)?;
-                            self.emit_constraint(ctx, *source, arm)?;
-                            write!(ctx.out, " = ")?;
-                            self.emit_source(ctx, *source, arm.constraint)?;
-                        }
-                    }
-                    ctx.begin_block()?;
-                    self.emit_block(ctx, &arm.body, ret_kind)?;
-                    ctx.end_block(scope)?;
-                }
+    fn emit_block<W: Write>(
+        &self,
+        ctx: &mut BodyContext<W>,
+        block: &Block,
+        ret_kind: ReturnKind,
+        last_expr: &str,
+        scope: StableSet<BindingId>,
+    ) -> std::fmt::Result {
+        let mut stack = Vec::new();
+        ctx.begin_block()?;
+        stack.push((Self::validate_block(ret_kind, block), last_expr, scope));
 
-                ControlFlow::Match { source, arms } => {
-                    let scope = ctx.enter_scope();
-                    write!(ctx.out, "{}match ", &ctx.indent)?;
-                    self.emit_source(ctx, *source, arms[0].constraint)?;
-                    ctx.begin_block()?;
-                    for arm in arms.iter() {
-                        let scope = ctx.enter_scope();
-                        write!(ctx.out, "{}", &ctx.indent)?;
-                        self.emit_constraint(ctx, *source, arm)?;
-                        write!(ctx.out, " =>")?;
-                        ctx.begin_block()?;
-                        self.emit_block(ctx, &arm.body, ret_kind)?;
-                        ctx.end_block(scope)?;
-                    }
-                    // Always add a catchall, because we don't do exhaustiveness checking on the
-                    // match arms.
-                    writeln!(ctx.out, "{}_ => {{}}", &ctx.indent)?;
-                    ctx.end_block(scope)?;
-                }
-
-                ControlFlow::Equal { a, b, body } => {
-                    let scope = ctx.enter_scope();
-                    write!(ctx.out, "{}if ", &ctx.indent)?;
-                    self.emit_expr(ctx, *a)?;
-                    write!(ctx.out, " == ")?;
-                    self.emit_expr(ctx, *b)?;
-                    ctx.begin_block()?;
-                    self.emit_block(ctx, body, ret_kind)?;
-                    ctx.end_block(scope)?;
-                }
-
-                ControlFlow::Loop { result, body } => {
-                    let source = match &ctx.ruleset.bindings[result.index()] {
-                        Binding::Iterator { source } => source,
-                        _ => unreachable!("Loop from a non-Iterator"),
+        while let Some((mut nested, last_line, scope)) = stack.pop() {
+            match &mut nested {
+                Nested::Cases(cases) => {
+                    let Some(case) = cases.next() else {
+                        ctx.end_block(last_line, scope)?;
+                        continue;
                     };
-                    let scope = ctx.enter_scope();
-                    write!(ctx.out, "{}let mut v{} = ", &ctx.indent, source.index())?;
-                    self.emit_expr(ctx, *source)?;
-                    writeln!(ctx.out, ";")?;
-                    write!(
-                        ctx.out,
-                        "{}while let Some(v{}) = v{}.next(ctx)",
-                        &ctx.indent,
-                        result.index(),
-                        source.index()
-                    )?;
-                    ctx.is_bound.insert(*result);
-                    ctx.begin_block()?;
-                    self.emit_block(ctx, body, ret_kind)?;
-                    ctx.end_block(scope)?;
+                    // Iterator isn't done, put it back on the stack.
+                    stack.push((nested, last_line, scope));
+
+                    for &expr in case.bind_order.iter() {
+                        let iter_return = match &ctx.ruleset.bindings[expr.index()] {
+                            Binding::Extractor { term, .. } => {
+                                let termdata = &self.termenv.terms[term.index()];
+                                let sig = termdata.extractor_sig(self.typeenv).unwrap();
+                                if sig.ret_kind == ReturnKind::Iterator {
+                                    if termdata.has_external_extractor() {
+                                        Some(format!("C::{}_returns", sig.func_name))
+                                    } else {
+                                        Some(format!("ContextIterWrapper::<ConstructorVec<_>, _>"))
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            Binding::Constructor { term, .. } => {
+                                let termdata = &self.termenv.terms[term.index()];
+                                let sig = termdata.constructor_sig(self.typeenv).unwrap();
+                                if sig.ret_kind == ReturnKind::Iterator {
+                                    if termdata.has_external_constructor() {
+                                        Some(format!("C::{}_returns", sig.func_name))
+                                    } else {
+                                        Some(format!("ContextIterWrapper::<ConstructorVec<_>, _>"))
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(ty) = iter_return {
+                            writeln!(
+                                ctx.out,
+                                "{}let mut v{} = {}::default();",
+                                &ctx.indent,
+                                expr.index(),
+                                ty
+                            )?;
+                            write!(ctx.out, "{}", &ctx.indent)?;
+                        } else {
+                            write!(ctx.out, "{}let v{} = ", &ctx.indent, expr.index())?;
+                        }
+                        self.emit_expr(ctx, expr)?;
+                        writeln!(ctx.out, ";")?;
+                        ctx.is_bound.insert(expr);
+                    }
+
+                    match &case.check {
+                        // Use a shorthand notation if there's only one match arm.
+                        ControlFlow::Match { source, arms } if arms.len() == 1 => {
+                            let arm = &arms[0];
+                            let scope = ctx.enter_scope();
+                            match arm.constraint {
+                                Constraint::ConstBool { .. }
+                                | Constraint::ConstInt { .. }
+                                | Constraint::ConstPrim { .. } => {
+                                    write!(ctx.out, "{}if ", &ctx.indent)?;
+                                    self.emit_expr(ctx, *source)?;
+                                    write!(ctx.out, " == ")?;
+                                    self.emit_constraint(ctx, *source, arm)?;
+                                }
+                                Constraint::Variant { .. } | Constraint::Some => {
+                                    write!(ctx.out, "{}if let ", &ctx.indent)?;
+                                    self.emit_constraint(ctx, *source, arm)?;
+                                    write!(ctx.out, " = ")?;
+                                    self.emit_source(ctx, *source, arm.constraint)?;
+                                }
+                            }
+                            ctx.begin_block()?;
+                            stack.push((Self::validate_block(ret_kind, &arm.body), "", scope));
+                        }
+
+                        ControlFlow::Match { source, arms } => {
+                            let scope = ctx.enter_scope();
+                            write!(ctx.out, "{}match ", &ctx.indent)?;
+                            self.emit_source(ctx, *source, arms[0].constraint)?;
+                            ctx.begin_block()?;
+
+                            // Always add a catchall arm, because we
+                            // don't do exhaustiveness checking on the
+                            // match arms.
+                            stack.push((Nested::Arms(*source, arms.iter()), "_ => {}", scope));
+                        }
+
+                        ControlFlow::Equal { a, b, body } => {
+                            let scope = ctx.enter_scope();
+                            write!(ctx.out, "{}if ", &ctx.indent)?;
+                            self.emit_expr(ctx, *a)?;
+                            write!(ctx.out, " == ")?;
+                            self.emit_expr(ctx, *b)?;
+                            ctx.begin_block()?;
+                            stack.push((Self::validate_block(ret_kind, body), "", scope));
+                        }
+
+                        ControlFlow::Loop { result, body } => {
+                            let source = match &ctx.ruleset.bindings[result.index()] {
+                                Binding::Iterator { source } => source,
+                                _ => unreachable!("Loop from a non-Iterator"),
+                            };
+                            let scope = ctx.enter_scope();
+
+                            writeln!(
+                                ctx.out,
+                                "{}let mut v{} = v{}.into_context_iter();",
+                                &ctx.indent,
+                                source.index(),
+                                source.index(),
+                            )?;
+
+                            write!(
+                                ctx.out,
+                                "{}while let Some(v{}) = v{}.next(ctx)",
+                                &ctx.indent,
+                                result.index(),
+                                source.index()
+                            )?;
+                            ctx.is_bound.insert(*result);
+                            ctx.begin_block()?;
+                            stack.push((Self::validate_block(ret_kind, body), "", scope));
+                        }
+
+                        &ControlFlow::Return { pos, result } => {
+                            writeln!(
+                                ctx.out,
+                                "{}// Rule at {}.",
+                                &ctx.indent,
+                                pos.pretty_print_line(&self.files)
+                            )?;
+                            write!(ctx.out, "{}", &ctx.indent)?;
+                            match ret_kind {
+                                ReturnKind::Plain | ReturnKind::Option => {
+                                    write!(ctx.out, "return ")?
+                                }
+                                ReturnKind::Iterator => write!(ctx.out, "returns.extend(Some(")?,
+                            }
+                            self.emit_expr(ctx, result)?;
+                            if ctx.is_ref.contains(&result) {
+                                write!(ctx.out, ".clone()")?;
+                            }
+                            match ret_kind {
+                                ReturnKind::Plain | ReturnKind::Option => writeln!(ctx.out, ";")?,
+                                ReturnKind::Iterator => {
+                                    writeln!(ctx.out, "));")?;
+                                    writeln!(
+                                        ctx.out,
+                                        "{}if returns.len() >= MAX_ISLE_RETURNS {{ return; }}",
+                                        ctx.indent
+                                    )?;
+                                }
+                            }
+                        }
+                    }
                 }
 
-                &ControlFlow::Return { pos, result } => {
-                    writeln!(
-                        ctx.out,
-                        "{}// Rule at {}.",
-                        &ctx.indent,
-                        pos.pretty_print_line(&self.typeenv.filenames)
-                    )?;
+                Nested::Arms(source, arms) => {
+                    let Some(arm) = arms.next() else {
+                        ctx.end_block(last_line, scope)?;
+                        continue;
+                    };
+                    let source = *source;
+                    // Iterator isn't done, put it back on the stack.
+                    stack.push((nested, last_line, scope));
+
+                    let scope = ctx.enter_scope();
                     write!(ctx.out, "{}", &ctx.indent)?;
-                    match ret_kind {
-                        ReturnKind::Plain => write!(ctx.out, "return ")?,
-                        ReturnKind::Option => write!(ctx.out, "return Some(")?,
-                        ReturnKind::Iterator => write!(ctx.out, "returns.push(")?,
-                    }
-                    self.emit_expr(ctx, result)?;
-                    if ctx.is_ref.contains(&result) {
-                        write!(ctx.out, ".clone()")?;
-                    }
-                    match ret_kind {
-                        ReturnKind::Plain => writeln!(ctx.out, ";")?,
-                        ReturnKind::Option | ReturnKind::Iterator => writeln!(ctx.out, ");")?,
-                    }
+                    self.emit_constraint(ctx, source, arm)?;
+                    write!(ctx.out, " =>")?;
+                    ctx.begin_block()?;
+                    stack.push((Self::validate_block(ret_kind, &arm.body), "", scope));
                 }
             }
         }
+
         Ok(())
     }
 
@@ -556,6 +708,7 @@ impl<'a> Codegen<'a> {
         let mut call =
             |term: TermId,
              parameters: &[BindingId],
+
              get_sig: fn(&Term, &TypeEnv) -> Option<ExternalSig>| {
                 let termdata = &self.termenv.terms[term.index()];
                 let sig = get_sig(termdata, self.typeenv).unwrap();
@@ -576,14 +729,18 @@ impl<'a> Codegen<'a> {
                         (true, false) => ("&", ""),
                         _ => ("", ""),
                     };
-                    write!(ctx.out, "{}", before)?;
+                    write!(ctx.out, "{before}")?;
                     self.emit_expr(ctx, parameter)?;
-                    write!(ctx.out, "{}", after)?;
+                    write!(ctx.out, "{after}")?;
+                }
+                if let ReturnKind::Iterator = sig.ret_kind {
+                    write!(ctx.out, ", &mut v{}", result.index())?;
                 }
                 write!(ctx.out, ")")
             };
 
         match binding {
+            &Binding::ConstBool { val, .. } => self.emit_bool(ctx, val),
             &Binding::ConstInt { val, ty } => self.emit_int(ctx, val, ty),
             Binding::ConstPrim { val } => write!(ctx.out, "{}", &self.typeenv.syms[val.index()]),
             Binding::Argument { index } => write!(ctx.out, "arg{}", index.index()),
@@ -620,7 +777,7 @@ impl<'a> Codegen<'a> {
                             &self.typeenv.syms[field.name.index()],
                         )?;
                         self.emit_expr(ctx, *value)?;
-                        if ctx.is_ref.contains(&value) {
+                        if ctx.is_ref.contains(value) {
                             write!(ctx.out, ".clone()")?;
                         }
                         writeln!(ctx.out, ",")?;
@@ -630,6 +787,11 @@ impl<'a> Codegen<'a> {
                 Ok(())
             }
 
+            &Binding::MakeSome { inner } => {
+                write!(ctx.out, "Some(")?;
+                self.emit_expr(ctx, inner)?;
+                write!(ctx.out, ")")
+            }
             &Binding::MatchSome { source } => {
                 self.emit_expr(ctx, source)?;
                 write!(ctx.out, "?")
@@ -683,6 +845,7 @@ impl<'a> Codegen<'a> {
             }
         }
         match *constraint {
+            Constraint::ConstBool { val, .. } => self.emit_bool(ctx, val),
             Constraint::ConstInt { val, ty } => self.emit_int(ctx, val, ty),
             Constraint::ConstPrim { val } => {
                 write!(ctx.out, "{}", &self.typeenv.syms[val.index()])
@@ -740,24 +903,25 @@ impl<'a> Codegen<'a> {
         }
     }
 
+    fn emit_bool<W: Write>(
+        &self,
+        ctx: &mut BodyContext<W>,
+        val: bool,
+    ) -> Result<(), std::fmt::Error> {
+        write!(ctx.out, "{val}")
+    }
+
     fn emit_int<W: Write>(
         &self,
         ctx: &mut BodyContext<W>,
         val: i128,
         ty: TypeId,
     ) -> Result<(), std::fmt::Error> {
-        // For the kinds of situations where we use ISLE, magic numbers are
-        // much more likely to be understandable if they're in hex rather than
-        // decimal.
-        // TODO: use better type info (https://github.com/bytecodealliance/wasmtime/issues/5431)
-        if val < 0
-            && self.typeenv.types[ty.index()]
-                .name(self.typeenv)
-                .starts_with('i')
-        {
-            write!(ctx.out, "-{:#X}", -val)
-        } else {
-            write!(ctx.out, "{:#X}", val)
+        let ty_data = &self.typeenv.types[ty.index()];
+        match ty_data {
+            Type::Builtin(BuiltinType::Int(ty)) if ty.is_signed() => write!(ctx.out, "{val}_{ty}"),
+            Type::Builtin(BuiltinType::Int(ty)) => write!(ctx.out, "{val:#x}_{ty}"),
+            _ => write!(ctx.out, "{val:#x}"),
         }
     }
 }

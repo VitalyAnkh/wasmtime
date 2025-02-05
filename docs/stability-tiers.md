@@ -25,35 +25,100 @@ For explanations of what each tier means see below.
 | Target               | `x86_64-apple-darwin`                      |
 | Target               | `x86_64-pc-windows-msvc`                   |
 | Target               | `x86_64-unknown-linux-gnu`                 |
+| Compiler Backend     | Cranelift                                  |
+| WebAssembly Proposal | [`mutable-globals`]                        |
+| WebAssembly Proposal | [`sign-extension-ops`]                     |
+| WebAssembly Proposal | [`nontrapping-float-to-int-conversion`]    |
+| WebAssembly Proposal | [`multi-value`]                            |
+| WebAssembly Proposal | [`bulk-memory`]                            |
+| WebAssembly Proposal | [`reference-types`]                        |
+| WebAssembly Proposal | [`simd`]                                   |
+| WebAssembly Proposal | [`component-model`]                        |
+| WebAssembly Proposal | [`relaxed-simd`]                           |
+| WebAssembly Proposal | [`multi-memory`]                           |
+| WebAssembly Proposal | [`threads`]                                |
+| WebAssembly Proposal | [`tail-call`]                              |
+| WebAssembly Proposal | [`memory64`]                               |
+| WASI Proposal        | [`wasi-io`]                                |
+| WASI Proposal        | [`wasi-clocks`]                            |
+| WASI Proposal        | [`wasi-filesystem`]                        |
+| WASI Proposal        | [`wasi-random`]                            |
+| WASI Proposal        | [`wasi-sockets`]                           |
+| WASI Proposal        | [`wasi-http`]                              |
 | WASI Proposal        | `wasi_snapshot_preview1`                   |
 | WASI Proposal        | `wasi_unstable`                            |
-| WebAssembly Proposal | `bulk-memory`                              |
-| WebAssembly Proposal | `reference-types`                          |
-| WebAssembly Proposal | `simd`                                     |
+
+[`mutable-globals`]: https://github.com/WebAssembly/mutable-global/blob/master/proposals/mutable-global/Overview.md
+[`sign-extension-ops`]: https://github.com/WebAssembly/spec/blob/master/proposals/sign-extension-ops/Overview.md
+[`nontrapping-float-to-int-conversion`]: https://github.com/WebAssembly/spec/blob/master/proposals/nontrapping-float-to-int-conversion/Overview.md
+[`multi-value`]: https://github.com/WebAssembly/spec/blob/master/proposals/multi-value/Overview.md
+[`bulk-memory`]: https://github.com/WebAssembly/bulk-memory-operations/blob/master/proposals/bulk-memory-operations/Overview.md
+[`reference-types`]: https://github.com/WebAssembly/reference-types/blob/master/proposals/reference-types/Overview.md
+[`simd`]: https://github.com/WebAssembly/simd/blob/master/proposals/simd/SIMD.md
+[`wasi-clocks`]: https://github.com/WebAssembly/wasi-clocks
+[`wasi-filesystem`]: https://github.com/WebAssembly/wasi-filesystem
+[`wasi-io`]: https://github.com/WebAssembly/wasi-io
+[`wasi-random`]: https://github.com/WebAssembly/wasi-random
+[`wasi-sockets`]: https://github.com/WebAssembly/wasi-sockets
+[`wasi-http`]: https://github.com/WebAssembly/wasi-http
+[`tail-call`]: https://github.com/WebAssembly/tail-call/blob/main/proposals/tail-call/Overview.md
 
 #### Tier 2
 
 | Category             | Description                | Missing Tier 1 Requirements |
 |----------------------|----------------------------|-----------------------------|
 | Target               | `aarch64-unknown-linux-gnu`| Continuous fuzzing          |
+| Target               | `aarch64-apple-darwin`     | Continuous fuzzing          |
 | Target               | `s390x-unknown-linux-gnu`  | Continuous fuzzing          |
 | Target               | `x86_64-pc-windows-gnu`    | Clear owner of the target   |
-| WebAssembly Proposal | `memory64`                 | Unstable wasm proposal      |
-| WebAssembly Proposal | `multi-memory`             | Unstable wasm proposal      |
+| Target               | Support for `#![no_std]`   | Support beyond CI checks    |
+| WebAssembly Proposal | [`function-references`]    | Unstable wasm proposal      |
+| WebAssembly Proposal | [`wide-arithmetic`]        | Unstable wasm proposal      |
+| Execution Backend    | Pulley                     | More time fuzzing/baking    |
+
+[`memory64`]: https://github.com/WebAssembly/memory64/blob/master/proposals/memory64/Overview.md
+[`multi-memory`]: https://github.com/WebAssembly/multi-memory/blob/master/proposals/multi-memory/Overview.md
+[`threads`]: https://github.com/WebAssembly/threads/blob/master/proposals/threads/Overview.md
+[`component-model`]: https://github.com/WebAssembly/component-model/blob/main/design/mvp/Explainer.md
+[`relaxed-simd`]: https://github.com/WebAssembly/relaxed-simd/blob/main/proposals/relaxed-simd/Overview.md
+[`function-references`]: https://github.com/WebAssembly/function-references/blob/main/proposals/function-references/Overview.md
+[`wide-arithmetic`]: https://github.com/WebAssembly/wide-arithmetic/blob/main/proposals/wide-arithmetic/Overview.md
 
 #### Tier 3
 
 | Category             | Description                       | Missing Tier 2 Requirements |
 |----------------------|-----------------------------------|-----------------------------|
-| Target               | `aarch64-apple-darwin`            | CI testing                  |
-| Target               | `aarch64-pc-windows-msvc`         | CI testing, unwinding, full-time maintainer |
+| Target               | `aarch64-apple-ios`               | CI testing, full-time maintainer |
+| Target               | `aarch64-linux-android`           | CI testing, full-time maintainer |
+| Target               | `aarch64-pc-windows-msvc`         | CI testing, full-time maintainer |
+| Target               | `aarch64-unknown-linux-musl` [^4] | CI testing, full-time maintainer |
+| Target               | `armv7-unknown-linux-gnueabihf`   | full-time maintainer |
+| Target               | `i686-pc-windows-msvc`            | CI testing, full-time maintainer |
+| Target               | `i686-unknown-linux-gnu`          | full-time maintainer |
+| Target               | `powerpc64le-unknown-linux-gnu`   | CI testing, full-time maintainer |
+| Target               | `riscv32imac-unknown-none-elf`[^5]| CI testing, full-time maintainer |
 | Target               | `riscv64gc-unknown-linux-gnu`     | full-time maintainer        |
-| WASI Proposal        | `wasi-nn`                         | More expansive CI testing   |
-| WASI Proposal        | `wasi-crypto`                     | CI testing, clear owner     |
-| WebAssembly Proposal | `threads`                         | Complete implementation     |
-| WebAssembly Proposal | `component-model`                 | Complete implementation     |
+| Target               | `wasm32-wasip1` [^3]              | Supported but not tested    |
+| Target               | `x86_64-linux-android`            | CI testing, full-time maintainer |
+| Target               | `x86_64-unknown-freebsd`          | CI testing, full-time maintainer |
+| Target               | `x86_64-unknown-illumos`          | CI testing, full-time maintainer |
+| Target               | `x86_64-unknown-linux-musl` [^4]  | CI testing, full-time maintainer |
+| Target               | `x86_64-unknown-none` [^5]        | CI testing, full-time maintainer |
+| Compiler Backend     | Winch on x86\_64                  | WebAssembly proposals (`simd`, `relaxed-simd`, `tail-call`, `reference-types`, `threads`)     |
+| Compiler Backend     | Winch on aarch64                  | Complete implementation     |
+| WebAssembly Proposal | [`gc`]                            | Complete implementation     |
+| WASI Proposal        | [`wasi-nn`]                       | More expansive CI testing   |
+| WASI Proposal        | [`wasi-threads`]                  | More CI, unstable proposal  |
+| WASI Proposal        | [`wasi-config`]                   | unstable proposal           |
+| WASI Proposal        | [`wasi-keyvalue`]                 | unstable proposal           |
 | *misc*               | Non-Wasmtime Cranelift usage [^1] | CI testing, full-time maintainer |
 | *misc*               | DWARF debugging [^2]              | CI testing, full-time maintainer, improved quality |
+
+[`wasi-nn`]: https://github.com/WebAssembly/wasi-nn
+[`wasi-threads`]: https://github.com/WebAssembly/wasi-threads
+[`wasi-config`]: https://github.com/WebAssembly/wasi-config
+[`wasi-keyvalue`]: https://github.com/WebAssembly/wasi-keyvalue
+[`gc`]: https://github.com/WebAssembly/gc
 
 [^1]: This is intended to encompass features that Cranelift supports as a
 general-purpose code generator such as integer value types other than `i32` and
@@ -67,6 +132,54 @@ exercised by Wasmtime.
 support is currently best-effort. Additionally there are known shortcomings
 and bugs. At this time there's no developer time to improve the situation here
 as well.
+
+[^3]: Wasmtime's `cranelift` and `winch` features can be compiled to WebAssembly
+but not the `runtime` feature at this time. This means that
+Wasmtime-compiled-to-wasm can itself compile wasm but cannot execute wasm.
+
+[^4]: Binary artifacts for MUSL are dynamically linked, not statically
+linked, meaning that they are not suitable for "run on any linux distribution"
+style use cases. Wasmtime does not have static binary artifacts at this time and
+that will require building from source.
+
+[^5]: Rust targets that are `#![no_std]` don't support the entire feature set of
+Wasmtime. For example the `threads` Cargo feature requires the standard library.
+For more information see the [`no_std` documentation][nostd]. Additionally these
+targets are sound in the presence of multiple threads but will panic on
+contention of data structures. If you're doing multithreaded things in `no_std`
+please file an issue so we can help solve your use case.
+
+[nostd]: ./stability-platform-support.md
+
+#### Unsupported features and platforms
+
+While this is not an exhaustive list, Wasmtime does not currently have support
+for the following features. Note that this is intended to document Wasmtime's
+current state and does not mean Wasmtime does not want to ever support these
+features; rather design discussion and PRs are welcome for many of the below
+features to figure out how best to implement them and at least move them to Tier
+3 above.
+
+* Target: [AArch64 FreeBSD](https://github.com/bytecodealliance/wasmtime/issues/5499)
+* Target: [NetBSD/OpenBSD](https://github.com/bytecodealliance/wasmtime/issues/6962)
+* Cranelift Target: [i686 (32-bit Intel targets)](https://github.com/bytecodealliance/wasmtime/issues/1980)
+* Cranelift Target: ARM 32-bit
+* Cranelift Target: MIPS
+* Cranelift Target: SPARC
+* Cranelift Target: PowerPC
+* Cranelift Target: RISC-V 32-bit
+* WebAssembly Proposals: see [documentation here](./stability-wasm-proposals.md)
+* [WASI proposal: `proxy-wasm`](https://github.com/proxy-wasm/spec)
+* [WASI proposal: `wasi-blob-store`](https://github.com/WebAssembly/wasi-blob-store)
+* [WASI proposal: `wasi-crypto`](https://github.com/WebAssembly/wasi-crypto)
+* [WASI proposal: `wasi-data`](https://github.com/WebAssembly/wasi-data)
+* [WASI proposal: `wasi-distributed-lock-service`](https://github.com/WebAssembly/wasi-distributed-lock-service)
+* [WASI proposal: `wasi-grpc`](https://github.com/WebAssembly/wasi-grpc)
+* [WASI proposal: `wasi-message-queue`](https://github.com/WebAssembly/wasi-message-queue)
+* [WASI proposal: `wasi-parallel`](https://github.com/WebAssembly/wasi-parallel)
+* [WASI proposal: `wasi-pubsub`](https://github.com/WebAssembly/wasi-pubsub)
+* [WASI proposal: `wasi-sql`](https://github.com/WebAssembly/wasi-sql)
+* [WASI proposal: `wasi-url`](https://github.com/WebAssembly/wasi-url)
 
 ## Tier Details
 
@@ -206,6 +319,9 @@ Tier 1 features include:
 
 * Major changes affecting Tier 1 features require an RFC and prior agreement on
   the change before an implementation is committed.
+
+* WebAssembly proposals meet [all stabilization
+  requirements](./stability-wasm-proposals.md).
 
 A major inclusion point for this tier is intended to be the continuous fuzzing
 of Wasmtime. This implies a significant commitment of resources for fixing

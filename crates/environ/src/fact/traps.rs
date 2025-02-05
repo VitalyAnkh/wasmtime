@@ -18,6 +18,7 @@
 //! This information is currently encoded as a custom section in the wasm
 //! module.
 
+use crate::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
 use wasm_encoder::Encode;
@@ -109,7 +110,7 @@ impl fmt::Display for Trap {
             Trap::ListByteLengthOverflow => "byte size of list too large for i32".fmt(f),
             Trap::StringLengthTooBig => "string byte size exceeds maximum".fmt(f),
             Trap::StringLengthOverflow => "string byte size overflows i32".fmt(f),
-            Trap::AssertFailed(s) => write!(f, "assertion failure: {}", s),
+            Trap::AssertFailed(s) => write!(f, "assertion failure: {s}"),
         }
     }
 }

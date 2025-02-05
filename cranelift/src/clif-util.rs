@@ -1,17 +1,3 @@
-#![deny(trivial_numeric_casts)]
-#![warn(unused_import_braces, unstable_features, unused_extern_crates)]
-#![cfg_attr(
-    feature = "cargo-clippy",
-    warn(
-        clippy::float_arithmetic,
-        clippy::mut_mut,
-        clippy::nonminimal_bool,
-        clippy::map_unwrap_or,
-        clippy::clippy::unicode_not_nfc,
-        clippy::use_self
-    )
-)]
-
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -27,9 +13,6 @@ mod utils;
 #[cfg(feature = "souper-harvest")]
 mod souper_harvest;
 
-#[cfg(feature = "wasm")]
-mod wasm;
-
 /// Cranelift code generator utility.
 #[derive(Parser)]
 enum Commands {
@@ -42,11 +25,6 @@ enum Commands {
     Pass(PassOptions),
     Bugpoint(bugpoint::Options),
 
-    #[cfg(feature = "wasm")]
-    Wasm(wasm::Options),
-    #[cfg(not(feature = "wasm"))]
-    Wasm(CompiledWithoutSupportOptions),
-
     #[cfg(feature = "souper-harvest")]
     SouperHarvest(souper_harvest::Options),
     #[cfg(not(feature = "souper-harvest"))]
@@ -57,15 +35,15 @@ enum Commands {
 #[derive(Parser)]
 struct TestOptions {
     /// Be more verbose
-    #[clap(short, long)]
+    #[arg(short, long)]
     verbose: bool,
 
     /// Print pass timing report for test
-    #[clap(short = 'T')]
+    #[arg(short = 'T')]
     time_passes: bool,
 
     /// Specify an input file to be used. Use '-' for stdin.
-    #[clap(required = true)]
+    #[arg(required = true)]
     files: Vec<PathBuf>,
 }
 
@@ -73,11 +51,11 @@ struct TestOptions {
 #[derive(Parser)]
 struct PassOptions {
     /// Be more verbose
-    #[clap(short, long)]
+    #[arg(short, long)]
     verbose: bool,
 
     /// Print pass timing report for test
-    #[clap(short = 'T')]
+    #[arg(short = 'T')]
     time_passes: bool,
 
     /// Specify an input file to be used. Use '-' for stdin.
@@ -87,7 +65,7 @@ struct PassOptions {
     target: String,
 
     /// Specify pass(es) to be run on the input file
-    #[clap(required = true)]
+    #[arg(required = true)]
     passes: Vec<String>,
 }
 
@@ -105,11 +83,6 @@ fn main() -> anyhow::Result<()> {
         Commands::PrintCfg(p) => print_cfg::run(&p)?,
         Commands::Compile(c) => compile::run(&c)?,
         Commands::Bugpoint(b) => bugpoint::run(&b)?,
-
-        #[cfg(feature = "wasm")]
-        Commands::Wasm(w) => wasm::run(&w)?,
-        #[cfg(not(feature = "wasm"))]
-        Commands::Wasm(_) => anyhow::bail!("Error: clif-util was compiled without wasm support."),
 
         #[cfg(feature = "souper-harvest")]
         Commands::SouperHarvest(s) => souper_harvest::run(&s)?,
@@ -141,4 +114,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[test]
+fn verify_cli() {
+    use clap::CommandFactory;
+    Commands::command().debug_assert()
 }

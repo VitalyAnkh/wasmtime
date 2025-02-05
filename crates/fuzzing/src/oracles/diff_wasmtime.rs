@@ -1,9 +1,10 @@
 //! Evaluate an exported Wasm function using Wasmtime.
 
-use crate::generators::{self, DiffValue, DiffValueType, WasmtimeConfig};
+use crate::generators::{self, CompilerStrategy, DiffValue, DiffValueType, WasmtimeConfig};
 use crate::oracles::dummy;
 use crate::oracles::engine::DiffInstance;
 use crate::oracles::{compile_module, engine::DiffEngine, StoreLimits};
+use crate::single_module_fuzzer::KnownValid;
 use anyhow::{Context, Error, Result};
 use arbitrary::Unstructured;
 use wasmtime::{Extern, FuncType, Instance, Module, Store, Trap, Val};
@@ -18,9 +19,16 @@ impl WasmtimeEngine {
     /// later. Ideally the store and engine could be built here but
     /// `compile_module` takes a [`generators::Config`]; TODO re-factor this if
     /// that ever changes.
-    pub fn new(u: &mut Unstructured<'_>, config: &generators::Config) -> arbitrary::Result<Self> {
+    pub fn new(
+        u: &mut Unstructured<'_>,
+        config: &mut generators::Config,
+        compiler_strategy: CompilerStrategy,
+    ) -> arbitrary::Result<Self> {
         let mut new_config = u.arbitrary::<WasmtimeConfig>()?;
+        new_config.compiler_strategy = compiler_strategy;
+        new_config.update_module_config(&mut config.module_config.config, u)?;
         new_config.make_compatible_with(&config.wasmtime);
+
         let config = generators::Config {
             wasmtime: new_config,
             module_config: config.module_config.clone(),
@@ -31,21 +39,25 @@ impl WasmtimeEngine {
 
 impl DiffEngine for WasmtimeEngine {
     fn name(&self) -> &'static str {
-        "wasmtime"
+        match self.config.wasmtime.compiler_strategy {
+            CompilerStrategy::CraneliftNative => "wasmtime",
+            CompilerStrategy::Winch => "winch",
+            CompilerStrategy::CraneliftPulley => "pulley",
+        }
     }
 
     fn instantiate(&mut self, wasm: &[u8]) -> Result<Box<dyn DiffInstance>> {
         let store = self.config.to_store();
-        let module = compile_module(store.engine(), wasm, true, &self.config).unwrap();
+        let module = compile_module(store.engine(), wasm, KnownValid::Yes, &self.config).unwrap();
         let instance = WasmtimeInstance::new(store, module)?;
         Ok(Box::new(instance))
     }
 
-    fn assert_error_match(&self, trap: &Trap, err: &Error) {
-        let trap2 = err
+    fn assert_error_match(&self, lhs: &Error, rhs: &Trap) {
+        let lhs = lhs
             .downcast_ref::<Trap>()
-            .expect(&format!("not a trap: {:?}", err));
-        assert_eq!(trap, trap2, "{}\nis not equal to\n{}", trap, trap2);
+            .expect(&format!("not a trap: {lhs:?}"));
+        assert_eq!(lhs, rhs, "{lhs}\nis not equal to\n{rhs}");
     }
 
     fn is_stack_overflow(&self, err: &Error) -> bool {
@@ -130,6 +142,11 @@ impl WasmtimeInstance {
             })
             .collect()
     }
+
+    /// Returns whether or not this instance has hit its OOM condition yet.
+    pub fn is_oom(&self) -> bool {
+        self.store.data().is_oom()
+    }
 }
 
 impl DiffInstance for WasmtimeInstance {
@@ -191,7 +208,7 @@ impl From<&DiffValue> for Val {
             DiffValue::I64(n) => Val::I64(n),
             DiffValue::F32(n) => Val::F32(n),
             DiffValue::F64(n) => Val::F64(n),
-            DiffValue::V128(n) => Val::V128(n),
+            DiffValue::V128(n) => Val::V128(n.into()),
             DiffValue::FuncRef { null } => {
                 assert!(null);
                 Val::FuncRef(None)
@@ -199,6 +216,10 @@ impl From<&DiffValue> for Val {
             DiffValue::ExternRef { null } => {
                 assert!(null);
                 Val::ExternRef(None)
+            }
+            DiffValue::AnyRef { null } => {
+                assert!(null);
+                Val::AnyRef(None)
             }
         }
     }
@@ -211,14 +232,39 @@ impl Into<DiffValue> for Val {
             Val::I64(n) => DiffValue::I64(n),
             Val::F32(n) => DiffValue::F32(n),
             Val::F64(n) => DiffValue::F64(n),
-            Val::V128(n) => DiffValue::V128(n),
-            Val::FuncRef(f) => DiffValue::FuncRef { null: f.is_none() },
-            Val::ExternRef(e) => DiffValue::ExternRef { null: e.is_none() },
+            Val::V128(n) => DiffValue::V128(n.into()),
+            Val::ExternRef(r) => DiffValue::ExternRef { null: r.is_none() },
+            Val::FuncRef(r) => DiffValue::FuncRef { null: r.is_none() },
+            Val::AnyRef(r) => DiffValue::AnyRef { null: r.is_none() },
         }
     }
 }
 
-#[test]
-fn smoke() {
-    crate::oracles::engine::smoke_test_engine(|u, config| WasmtimeEngine::new(u, config))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoke_cranelift_native() {
+        crate::oracles::engine::smoke_test_engine(|u, config| {
+            WasmtimeEngine::new(u, config, CompilerStrategy::CraneliftNative)
+        })
+    }
+
+    #[test]
+    fn smoke_cranelift_pulley() {
+        crate::oracles::engine::smoke_test_engine(|u, config| {
+            WasmtimeEngine::new(u, config, CompilerStrategy::CraneliftPulley)
+        })
+    }
+
+    #[test]
+    fn smoke_winch() {
+        if !cfg!(target_arch = "x86_64") {
+            return;
+        }
+        crate::oracles::engine::smoke_test_engine(|u, config| {
+            WasmtimeEngine::new(u, config, CompilerStrategy::Winch)
+        })
+    }
 }

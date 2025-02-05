@@ -7,13 +7,16 @@ license = "Apache-2.0 WITH LLVM-exception"
 repository = "https://github.com/bytecodealliance/wasmtime"
 readme = "README.md"
 edition.workspace = true
+rust-version.workspace = true
 publish = false
 
+[lints]
+workspace = true
 
 [dependencies]
 cranelift = { workspace = true }
 cranelift-native = { workspace = true }
 
-anyhow = { workspace = true }
-arbitrary = "1.0.0"
+anyhow = { workspace = true, features = ['std'] }
+arbitrary = { workspace = true }
 target-lexicon = { workspace = true, features = ["std"] }

@@ -1,5 +1,5 @@
 use cranelift_codegen::ir::*;
-use cranelift_codegen::isa::CallConv;
+use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::{ir::types::I16, Context};
 use cranelift_entity::EntityRef;
@@ -7,18 +7,20 @@ use cranelift_frontend::*;
 use cranelift_jit::*;
 use cranelift_module::*;
 
-#[test]
-fn error_on_incompatible_sig_in_declare_function() {
+fn isa() -> Option<OwnedTargetIsa> {
     let mut flag_builder = settings::builder();
     flag_builder.set("use_colocated_libcalls", "false").unwrap();
     // FIXME set back to true once the x64 backend supports it.
     flag_builder.set("is_pic", "false").unwrap();
-    let isa_builder = cranelift_native::builder().unwrap_or_else(|msg| {
-        panic!("host machine is not supported: {}", msg);
-    });
-    let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
-        .unwrap();
+    let isa_builder = cranelift_native::builder().ok()?;
+    isa_builder.finish(settings::Flags::new(flag_builder)).ok()
+}
+
+#[test]
+fn error_on_incompatible_sig_in_declare_function() {
+    let Some(isa) = isa() else {
+        return;
+    };
     let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
 
     let mut sig = Signature {
@@ -36,16 +38,14 @@ fn error_on_incompatible_sig_in_declare_function() {
         .unwrap(); // Make sure this is an error
 }
 
-fn define_simple_function(module: &mut JITModule) -> FuncId {
+fn define_simple_function(module: &mut JITModule) -> Result<FuncId, ModuleError> {
     let sig = Signature {
         params: vec![],
         returns: vec![],
         call_conv: CallConv::SystemV,
     };
 
-    let func_id = module
-        .declare_function("abc", Linkage::Local, &sig)
-        .unwrap();
+    let func_id = module.declare_function("abc", Linkage::Local, &sig)?;
 
     let mut ctx = Context::new();
     ctx.func = Function::with_name_signature(UserFuncName::user(0, func_id.as_u32()), sig);
@@ -57,28 +57,20 @@ fn define_simple_function(module: &mut JITModule) -> FuncId {
         bcx.ins().return_(&[]);
     }
 
-    module.define_function(func_id, &mut ctx).unwrap();
+    module.define_function(func_id, &mut ctx)?;
 
-    func_id
+    Ok(func_id)
 }
 
 #[test]
-#[should_panic(expected = "Result::unwrap()` on an `Err` value: DuplicateDefinition(\"abc\")")]
 fn panic_on_define_after_finalize() {
-    let mut flag_builder = settings::builder();
-    flag_builder.set("use_colocated_libcalls", "false").unwrap();
-    // FIXME set back to true once the x64 backend supports it.
-    flag_builder.set("is_pic", "false").unwrap();
-    let isa_builder = cranelift_native::builder().unwrap_or_else(|msg| {
-        panic!("host machine is not supported: {}", msg);
-    });
-    let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
-        .unwrap();
+    let Some(isa) = isa() else {
+        return;
+    };
     let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
 
-    define_simple_function(&mut module);
-    define_simple_function(&mut module);
+    define_simple_function(&mut module).unwrap();
+    define_simple_function(&mut module).err().unwrap();
 }
 
 #[test]
@@ -101,7 +93,7 @@ fn switch_error() {
         let bb1 = bcx.create_block();
         let bb2 = bcx.create_block();
         let bb3 = bcx.create_block();
-        println!("{} {} {} {} {}", start, bb0, bb1, bb2, bb3);
+        println!("{start} {bb0} {bb1} {bb2} {bb3}");
 
         bcx.declare_var(Variable::new(0), types::I32);
         bcx.declare_var(Variable::new(1), types::I32);
@@ -149,23 +141,16 @@ fn switch_error() {
         Err(err) => {
             let pretty_error =
                 cranelift_codegen::print_errors::pretty_verifier_error(&func, None, err);
-            panic!("pretty_error:\n{}", pretty_error);
+            panic!("pretty_error:\n{pretty_error}");
         }
     }
 }
 
 #[test]
 fn libcall_function() {
-    let mut flag_builder = settings::builder();
-    flag_builder.set("use_colocated_libcalls", "false").unwrap();
-    // FIXME set back to true once the x64 backend supports it.
-    flag_builder.set("is_pic", "false").unwrap();
-    let isa_builder = cranelift_native::builder().unwrap_or_else(|msg| {
-        panic!("host machine is not supported: {}", msg);
-    });
-    let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
-        .unwrap();
+    let Some(isa) = isa() else {
+        return;
+    };
     let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
 
     let sig = Signature {
@@ -207,7 +192,26 @@ fn libcall_function() {
         bcx.ins().return_(&[]);
     }
 
-    module.define_function(func_id, &mut ctx).unwrap();
+    module
+        .define_function_with_control_plane(func_id, &mut ctx, &mut Default::default())
+        .unwrap();
 
     module.finalize_definitions().unwrap();
+}
+
+// This used to cause UB. See https://github.com/bytecodealliance/wasmtime/issues/7918.
+#[test]
+fn empty_data_object() {
+    let Some(isa) = isa() else {
+        return;
+    };
+    let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
+
+    let data_id = module
+        .declare_data("empty", Linkage::Export, false, false)
+        .unwrap();
+
+    let mut data = DataDescription::new();
+    data.define(Box::new([]));
+    module.define_data(data_id, &data).unwrap();
 }

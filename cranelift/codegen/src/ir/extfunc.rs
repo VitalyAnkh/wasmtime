@@ -7,12 +7,11 @@
 
 use crate::ir::{ExternalName, SigRef, Type};
 use crate::isa::CallConv;
-use crate::machinst::RelocDistance;
 use alloc::vec::Vec;
 use core::fmt;
 use core::str::FromStr;
 #[cfg(feature = "enable-serde")]
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 
 use super::function::FunctionParameters;
 
@@ -109,9 +108,9 @@ fn write_list(f: &mut fmt::Formatter, args: &[AbiParam]) -> fmt::Result {
     match args.split_first() {
         None => {}
         Some((first, rest)) => {
-            write!(f, "{}", first)?;
+            write!(f, "{first}")?;
             for arg in rest {
-                write!(f, ", {}", arg)?;
+                write!(f, ", {arg}")?;
             }
         }
     }
@@ -234,7 +233,13 @@ pub enum ArgumentPurpose {
     Normal,
 
     /// A C struct passed as argument.
-    StructArgument(u32),
+    ///
+    /// Note that this should only be used when interacting with code following
+    /// a C ABI which is expecting a struct passed *by value*.
+    StructArgument(
+        /// The size, in bytes, of the struct.
+        u32,
+    ),
 
     /// Struct return pointer.
     ///
@@ -251,22 +256,15 @@ pub enum ArgumentPurpose {
     /// This is a pointer to a context struct containing details about the current sandbox. It is
     /// used as a base pointer for `vmctx` global values.
     VMContext,
-
-    /// A stack limit pointer.
-    ///
-    /// This is a pointer to a stack limit. It is used to check the current stack pointer
-    /// against. Can only appear once in a signature.
-    StackLimit,
 }
 
 impl fmt::Display for ArgumentPurpose {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(match self {
             Self::Normal => "normal",
-            Self::StructArgument(size) => return write!(f, "sarg({})", size),
+            Self::StructArgument(size) => return write!(f, "sarg({size})"),
             Self::StructReturn => "sret",
             Self::VMContext => "vmctx",
-            Self::StackLimit => "stack_limit",
         })
     }
 }
@@ -278,7 +276,6 @@ impl FromStr for ArgumentPurpose {
             "normal" => Ok(Self::Normal),
             "sret" => Ok(Self::StructReturn),
             "vmctx" => Ok(Self::VMContext),
-            "stack_limit" => Ok(Self::StackLimit),
             _ if s.starts_with("sarg(") => {
                 if !s.ends_with(")") {
                     return Err(());
@@ -319,15 +316,6 @@ pub struct ExtFuncData {
 }
 
 impl ExtFuncData {
-    /// Return an estimate of the distance to the referred-to function symbol.
-    pub fn reloc_distance(&self) -> RelocDistance {
-        if self.colocated {
-            RelocDistance::Near
-        } else {
-            RelocDistance::Far
-        }
-    }
-
     /// Returns a displayable version of the `ExtFuncData`, with or without extra context to
     /// prettify the output.
     pub fn display<'a>(
@@ -384,7 +372,6 @@ mod tests {
             (ArgumentPurpose::Normal, "normal"),
             (ArgumentPurpose::StructReturn, "sret"),
             (ArgumentPurpose::VMContext, "vmctx"),
-            (ArgumentPurpose::StackLimit, "stack_limit"),
             (ArgumentPurpose::StructArgument(42), "sarg(42)"),
         ];
         for &(e, n) in &all_purpose {

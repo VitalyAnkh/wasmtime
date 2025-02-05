@@ -32,6 +32,8 @@ impl V8Engine {
         config.min_memories = config.min_memories.min(1);
         config.max_memories = config.max_memories.min(1);
         config.memory64_enabled = false;
+        config.custom_page_sizes_enabled = false;
+        config.wide_arithmetic_enabled = false;
 
         Self {
             isolate: Rc::new(RefCell::new(v8::Isolate::new(Default::default()))),
@@ -50,7 +52,7 @@ impl DiffEngine for V8Engine {
         let mut isolate = self.isolate.borrow_mut();
         let isolate = &mut **isolate;
         let mut scope = v8::HandleScope::new(isolate);
-        let context = v8::Context::new(&mut scope);
+        let context = v8::Context::new(&mut scope, Default::default());
         let global = context.global(&mut scope);
         let mut scope = v8::ContextScope::new(&mut scope, context);
 
@@ -76,26 +78,21 @@ impl DiffEngine for V8Engine {
         }))
     }
 
-    fn assert_error_match(&self, wasmtime: &Trap, err: &Error) {
+    fn assert_error_match(&self, err: &Error, wasmtime: &Trap) {
         let v8 = err.to_string();
         let wasmtime_msg = wasmtime.to_string();
         let verify_wasmtime = |msg: &str| {
-            assert!(wasmtime_msg.contains(msg), "{}\n!=\n{}", wasmtime_msg, v8);
+            assert!(wasmtime_msg.contains(msg), "{wasmtime_msg}\n!=\n{v8}");
         };
         let verify_v8 = |msg: &[&str]| {
             assert!(
                 msg.iter().any(|msg| v8.contains(msg)),
-                "{:?}\n\t!=\n{}",
-                wasmtime_msg,
-                v8
+                "{wasmtime_msg:?}\n\t!=\n{v8}"
             );
         };
         match wasmtime {
             Trap::MemoryOutOfBounds => {
-                return verify_v8(&[
-                    "memory access out of bounds",
-                    "data segment is out of bounds",
-                ])
+                return verify_v8(&["memory access out of bounds", "is out of bounds"])
             }
             Trap::UnreachableCodeReached => {
                 return verify_v8(&[
@@ -132,6 +129,7 @@ impl DiffEngine for V8Engine {
                 return verify_v8(&[
                     "table initializer is out of bounds",
                     "table index is out of bounds",
+                    "element segment out of bounds",
                 ])
             }
             Trap::BadSignature => return verify_v8(&["function signature mismatch"]),
@@ -191,6 +189,7 @@ impl DiffInstance for V8Instance {
                 }
                 // JS doesn't support v128 parameters
                 DiffValue::V128(_) => return Ok(None),
+                DiffValue::AnyRef { .. } => unimplemented!(),
             });
         }
         // JS doesn't support v128 return values
@@ -297,7 +296,7 @@ fn get_diff_value(
     scope: &mut v8::HandleScope<'_>,
 ) -> DiffValue {
     match ty {
-        DiffValueType::I32 => DiffValue::I32(val.to_int32(scope).unwrap().value() as i32),
+        DiffValueType::I32 => DiffValue::I32(val.to_int32(scope).unwrap().value()),
         DiffValueType::I64 => {
             let (val, todo) = val.to_big_int(scope).unwrap().i64_value();
             assert!(todo);
@@ -313,6 +312,7 @@ fn get_diff_value(
         DiffValueType::ExternRef => DiffValue::ExternRef {
             null: val.is_null(),
         },
+        DiffValueType::AnyRef => unimplemented!(),
         DiffValueType::V128 => unreachable!(),
     }
 }

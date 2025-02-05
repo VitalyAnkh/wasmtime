@@ -1,4 +1,4 @@
-# WASI
+# WASIp2
 
 You can also [browse this source code online][code] and clone the wasmtime
 repository to run the example locally.
@@ -7,66 +7,55 @@ repository to run the example locally.
 
 This example shows how to use the [`wasmtime-wasi`] crate to define WASI
 functions within a [`Linker`] which can then be used to instantiate a
-WebAssembly module.
+WebAssembly component.
 
 [`wasmtime-wasi`]: https://crates.io/crates/wasmtime-wasi
 [`Linker`]: https://docs.rs/wasmtime/*/wasmtime/struct.Linker.html
 
-## Wasm Source code
+## WebAssembly Component Source Code
 
+For this WASI example, this Hello World program is compiled to a WebAssembly component using the WASIp2 API.
+
+`wasi.rs`
 ```rust
-{{#include ../examples/wasi/wasm/wasi.rs}}
+{{#include ../examples/wasm/wasi.rs}}
 ```
 
-## `wasi.rs`
+> Building instructions:
+> 1. Have Rust installed
+> 2. Add WASIp2 target if you haven't already: `rustup target add wasm32-wasip2`
+> 3. `cargo build --target wasm32-wasip2`
+
+Building this program generates `target/wasm32-wasip2/debug/wasi.wasm`, used below.
+
+### Invoke the WASM component
+
+This example shows adding and configuring the WASI imports to invoke the above WASM component.
+
+`main.rs`
+```rust,ignore
+{{#include ../examples/wasip2/main.rs}}
+```
+
+### Async example
+
+This [async example code][code2] shows how to use the [wasmtime-wasi][`wasmtime-wasi`] crate to
+execute the same WASIp2 component from the example above. This example requires the `wasmtime` crate `async` feature to be enabled.
+
+This does not require any change to the WASIp2 component, it's just the WASIp2 API host functions which are implemented to be async. See [wasmtime async support](https://docs.wasmtime.dev/api/wasmtime/struct.Config.html#method.async_support).
+
+[code2]: https://github.com/bytecodealliance/wasmtime/blob/main/examples/wasi-async/main.rs
+[`wasmtime-wasi`]: https://docs.rs/wasmtime-wasi/*/wasmtime_wasi/preview2/index.html
 
 ```rust,ignore
-{{#include ../examples/wasi/main.rs}}
+{{#include ../examples/wasip2-async/main.rs}}
 ```
 
-## WASI state with other custom host state
+You can also [browse this source code online][code2] and clone the wasmtime
+repository to run the example locally.
 
-The [`add_to_linker`] takes a second argument which is a closure to access `&mut
-WasiCtx` from within the `T` stored in the `Store<T>` itself. In the above
-example this is trivial because the `T` in `Store<T>` is `WasiCtx` itself, but
-you can also store other state in `Store` like so:
+## Beyond Basics
 
-[`add_to_linker`]: https://docs.rs/wasmtime-wasi/*/wasmtime_wasi/sync/fn.add_to_linker.html
-[`Store`]: https://docs.rs/wasmtime/0.26.0/wasmtime/struct.Store.html
-[`BorrowMut<WasiCtx>`]: https://doc.rust-lang.org/stable/std/borrow/trait.BorrowMut.html
-[`WasiCtx`]: https://docs.rs/wasmtime-wasi/*/wasmtime_wasi/struct.WasiCtx.html
-
-```rust
-# extern crate wasmtime;
-# extern crate wasmtime_wasi;
-# extern crate anyhow;
-use anyhow::Result;
-use std::borrow::{Borrow, BorrowMut};
-use wasmtime::*;
-use wasmtime_wasi::{WasiCtx, sync::WasiCtxBuilder};
-
-struct MyState {
-    message: String,
-    wasi: WasiCtx,
-}
-
-fn main() -> Result<()> {
-    let engine = Engine::default();
-    let mut linker = Linker::new(&engine);
-    wasmtime_wasi::add_to_linker(&mut linker, |state: &mut MyState| &mut state.wasi)?;
-
-    let wasi = WasiCtxBuilder::new()
-        .inherit_stdio()
-        .inherit_args()?
-        .build();
-    let mut store = Store::new(&engine, MyState {
-        message: format!("hello!"),
-        wasi,
-    });
-
-    // ...
-
-# let _linker: Linker<MyState> = linker;
-    Ok(())
-}
-```
+Please see these references:
+* The [book](https://component-model.bytecodealliance.org) for understanding the component model of WASIp2.
+* [Bindgen Examples](https://docs.rs/wasmtime/latest/wasmtime/component/bindgen_examples/index.html) for implementing WASIp2 hosts and guests.

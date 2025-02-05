@@ -5,18 +5,17 @@ use clap::Parser;
 use serde::{ser::SerializeMap, Serialize};
 use std::collections::BTreeMap;
 use std::str::FromStr;
-use wasmtime_environ::{CompilerBuilder, FlagValue, Setting, SettingKind};
+use wasmtime_environ::{CompilerBuilder, FlagValue, Setting, SettingKind, Tunables};
 
 /// Displays available Cranelift settings for a target.
-#[derive(Parser)]
-#[clap(name = "run")]
+#[derive(Parser, PartialEq)]
 pub struct SettingsCommand {
     /// The target triple to get the settings for; defaults to the host triple.
-    #[clap(long, value_name = "TARGET")]
+    #[arg(long, value_name = "TARGET")]
     target: Option<String>,
 
     /// Switch output format to JSON
-    #[clap(long)]
+    #[arg(long)]
     json: bool,
 }
 
@@ -36,7 +35,7 @@ impl Serialize for SettingData {
 }
 
 // Gather together all of the setting data to displays
-#[derive(Serialize)]
+#[derive(serde_derive::Serialize)]
 struct Settings {
     triple: String,
 
@@ -45,7 +44,7 @@ struct Settings {
     bools: Vec<SettingData>,
     presets: Vec<SettingData>,
 
-    inferred: Option<Vec<String>>,
+    inferred: Option<Vec<&'static str>>,
 }
 
 impl Settings {
@@ -108,11 +107,17 @@ impl SettingsCommand {
     /// Executes the command.
     pub fn execute(self) -> Result<()> {
         // Gather settings from the cranelift compiler builder
-        let mut builder = wasmtime_cranelift::builder();
-        if let Some(target) = &self.target {
+        let mut builder = wasmtime_cranelift::builder(None)?;
+        let tunables = if let Some(target) = &self.target {
             let target = target_lexicon::Triple::from_str(target).map_err(|e| anyhow!(e))?;
+            let tunables = Tunables::default_for_target(&target)?;
             builder.target(target)?;
-        }
+            tunables
+        } else {
+            Tunables::default_host()
+        };
+
+        builder.set_tunables(tunables)?;
         let mut settings = Settings::from_builder(&builder);
 
         // Add inferred settings if no target specified
@@ -151,7 +156,7 @@ impl SettingsCommand {
             println!("Settings inferred for the current host:");
 
             for name in inferred {
-                println!("  {}", name);
+                println!("  {name}");
             }
         }
 
@@ -164,7 +169,7 @@ impl SettingsCommand {
         }
 
         println!();
-        println!("{}", header);
+        println!("{header}");
 
         let width = settings.iter().map(|s| s.0.name.len()).max().unwrap_or(0);
 

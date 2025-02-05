@@ -1,11 +1,9 @@
 //! AArch64 ISA definitions: immediate constants.
 
 use crate::ir::types::*;
-use crate::ir::Type;
 use crate::isa::aarch64::inst::{OperandSize, ScalarSize};
-use crate::machinst::{AllocationConsumer, PrettyPrint};
+use crate::machinst::PrettyPrint;
 
-use core::convert::TryFrom;
 use std::string::String;
 
 /// An immediate that represents the NZCV flags.
@@ -180,7 +178,7 @@ impl FPURightShiftImm {
         // | 32                | 01xxxxx  |
         // | 64                | 1xxxxxx  |
         //
-        // The shift amount is negated such that a shift ammount
+        // The shift amount is negated such that a shift amount
         // of 1 (in 64-bit) is encoded as 0b111111 and a shift
         // amount of 64 is encoded as 0b000000,
         // in the bottom 6 bits.
@@ -222,9 +220,9 @@ impl SImm9 {
 #[derive(Clone, Copy, Debug)]
 pub struct UImm12Scaled {
     /// The value.
-    pub value: u16,
+    value: u16,
     /// multiplied by the size of this type
-    pub scale_ty: Type,
+    scale_ty: Type,
 }
 
 impl UImm12Scaled {
@@ -259,11 +257,6 @@ impl UImm12Scaled {
     pub fn value(&self) -> u32 {
         self.value as u32
     }
-
-    /// The value type which is the scaling base.
-    pub fn scale_ty(&self) -> Type {
-        self.scale_ty
-    }
 }
 
 /// A shifted immediate value in 'imm12' format: supports 12 bits, shifted
@@ -279,17 +272,12 @@ pub struct Imm12 {
 impl Imm12 {
     /// Compute a Imm12 from raw bits, if possible.
     pub fn maybe_from_u64(val: u64) -> Option<Imm12> {
-        if val == 0 {
-            Some(Imm12 {
-                bits: 0,
-                shift12: false,
-            })
-        } else if val < 0xfff {
+        if val & !0xfff == 0 {
             Some(Imm12 {
                 bits: val as u16,
                 shift12: false,
             })
-        } else if val < 0xfff_000 && (val & 0xfff == 0) {
+        } else if val & !(0xfff << 12) == 0 {
             Some(Imm12 {
                 bits: (val >> 12) as u16,
                 shift12: true,
@@ -311,6 +299,16 @@ impl Imm12 {
     /// Bits for 12-bit "imm" field in e.g. AddI.
     pub fn imm_bits(&self) -> u32 {
         self.bits as u32
+    }
+
+    /// Get the actual value that this immediate corresponds to.
+    pub fn value(&self) -> u32 {
+        let base = self.bits as u32;
+        if self.shift12 {
+            base << 12
+        } else {
+            base
+        }
     }
 }
 
@@ -752,7 +750,7 @@ impl ASIMDMovModImm {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ASIMDFPModImm {
     imm: u8,
-    is_64bit: bool,
+    size: ScalarSize,
 }
 
 impl ASIMDFPModImm {
@@ -761,6 +759,21 @@ impl ASIMDFPModImm {
         // In all cases immediates are encoded as an 8-bit number 0b_abcdefgh;
         // let `D` be the inverse of the digit `d`.
         match size {
+            ScalarSize::Size16 => {
+                // In this case the representable immediates are 16-bit numbers of the form
+                // 0b_aBbb_cdef_gh00_0000.
+                let value = value as u16;
+                let b0_5 = (value >> 6) & 0b111111;
+                let b6 = (value >> 6) & (1 << 6);
+                let b7 = (value >> 8) & (1 << 7);
+                let imm = (b0_5 | b6 | b7) as u8;
+
+                if value == Self::value16(imm) {
+                    Some(ASIMDFPModImm { imm, size })
+                } else {
+                    None
+                }
+            }
             ScalarSize::Size32 => {
                 // In this case the representable immediates are 32-bit numbers of the form
                 // 0b_aBbb_bbbc_defg_h000 shifted to the left by 16.
@@ -771,10 +784,7 @@ impl ASIMDFPModImm {
                 let imm = (b0_5 | b6 | b7) as u8;
 
                 if value == Self::value32(imm) {
-                    Some(ASIMDFPModImm {
-                        imm,
-                        is_64bit: false,
-                    })
+                    Some(ASIMDFPModImm { imm, size })
                 } else {
                     None
                 }
@@ -788,10 +798,7 @@ impl ASIMDFPModImm {
                 let imm = (b0_5 | b6 | b7) as u8;
 
                 if value == Self::value64(imm) {
-                    Some(ASIMDFPModImm {
-                        imm,
-                        is_64bit: true,
-                    })
+                    Some(ASIMDFPModImm { imm, size })
                 } else {
                     None
                 }
@@ -803,6 +810,17 @@ impl ASIMDFPModImm {
     /// Returns bits ready for encoding.
     pub fn enc_bits(&self) -> u8 {
         self.imm
+    }
+
+    /// Returns the 16-bit value that corresponds to an 8-bit encoding.
+    fn value16(imm: u8) -> u16 {
+        let imm = imm as u16;
+        let b0_5 = imm & 0b111111;
+        let b6 = (imm >> 6) & 1;
+        let b6_inv = b6 ^ 1;
+        let b7 = (imm >> 7) & 1;
+
+        b0_5 << 6 | (b6 * 0b11) << 12 | b6_inv << 14 | b7 << 15
     }
 
     /// Returns the 32-bit value that corresponds to an 8-bit encoding.
@@ -829,7 +847,7 @@ impl ASIMDFPModImm {
 }
 
 impl PrettyPrint for NZCV {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         let fmt = |c: char, v| if v { c.to_ascii_uppercase() } else { c };
         format!(
             "#{}{}{}{}",
@@ -842,63 +860,63 @@ impl PrettyPrint for NZCV {
 }
 
 impl PrettyPrint for UImm5 {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.value)
     }
 }
 
 impl PrettyPrint for Imm12 {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         let shift = if self.shift12 { 12 } else { 0 };
         let value = u32::from(self.bits) << shift;
-        format!("#{}", value)
+        format!("#{value}")
     }
 }
 
 impl PrettyPrint for SImm7Scaled {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.value)
     }
 }
 
 impl PrettyPrint for FPULeftShiftImm {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.amount)
     }
 }
 
 impl PrettyPrint for FPURightShiftImm {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.amount)
     }
 }
 
 impl PrettyPrint for SImm9 {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.value)
     }
 }
 
 impl PrettyPrint for UImm12Scaled {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.value)
     }
 }
 
 impl PrettyPrint for ImmLogic {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.value())
     }
 }
 
 impl PrettyPrint for ImmShift {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.imm)
     }
 }
 
 impl PrettyPrint for MoveWideConst {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         if self.shift == 0 {
             format!("#{}", self.bits)
         } else {
@@ -908,7 +926,7 @@ impl PrettyPrint for MoveWideConst {
 }
 
 impl PrettyPrint for ASIMDMovModImm {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         if self.is_64bit {
             debug_assert_eq!(self.shift, 0);
 
@@ -921,7 +939,7 @@ impl PrettyPrint for ASIMDMovModImm {
                 imm |= (-b as u8 as u64) << (i * 8);
             }
 
-            format!("#{}", imm)
+            format!("#{imm}")
         } else if self.shift == 0 {
             format!("#{}", self.imm)
         } else {
@@ -932,11 +950,22 @@ impl PrettyPrint for ASIMDMovModImm {
 }
 
 impl PrettyPrint for ASIMDFPModImm {
-    fn pretty_print(&self, _: u8, _: &mut AllocationConsumer<'_>) -> String {
-        if self.is_64bit {
-            format!("#{}", f64::from_bits(Self::value64(self.imm)))
-        } else {
-            format!("#{}", f32::from_bits(Self::value32(self.imm)))
+    fn pretty_print(&self, _: u8) -> String {
+        match self.size {
+            ScalarSize::Size16 => {
+                // FIXME(#8312): Use `f16` once it is stable.
+                // `value` will always be a normal number. Convert it to a `f32`.
+                let value: u32 = Self::value16(self.imm).into();
+                let sign = (value & 0x8000) << 16;
+                // Adjust the exponent for the difference between the `f16` exponent bias and the
+                // `f32` exponent bias.
+                let exponent = ((value & 0x7c00) + ((127 - 15) << 10)) << 13;
+                let significand = (value & 0x3ff) << 13;
+                format!("#{}", f32::from_bits(sign | exponent | significand))
+            }
+            ScalarSize::Size32 => format!("#{}", f32::from_bits(Self::value32(self.imm))),
+            ScalarSize::Size64 => format!("#{}", f64::from_bits(Self::value64(self.imm))),
+            _ => unreachable!(),
         }
     }
 }

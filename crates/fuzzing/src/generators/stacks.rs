@@ -1,17 +1,18 @@
 //! Generate a Wasm program that keeps track of its current stack frames.
 //!
 //! We can then compare the stack trace we observe in Wasmtime to what the Wasm
-//! program believes its stack should be. Any discrepencies between the two
+//! program believes its stack should be. Any discrepancies between the two
 //! points to a bug in either this test case generator or Wasmtime's stack
 //! walker.
 
 use std::mem;
 
 use arbitrary::{Arbitrary, Result, Unstructured};
-use wasm_encoder::Instruction;
+use wasm_encoder::{Instruction, ValType};
 
-const MAX_FUNCS: usize = 20;
+const MAX_FUNCS: u32 = 20;
 const MAX_OPS: usize = 1_000;
+const MAX_PARAMS: usize = 10;
 
 /// Generate a Wasm module that keeps track of its current call stack, to
 /// compare to the host.
@@ -24,13 +25,16 @@ pub struct Stacks {
 #[derive(Debug, Default)]
 struct Function {
     ops: Vec<Op>,
+    params: usize,
+    results: usize,
 }
 
-#[derive(Arbitrary, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum Op {
     CheckStackInHost,
     Call(u32),
     CallThroughHost(u32),
+    ReturnCall(u32),
 }
 
 impl<'a> Arbitrary<'a> for Stacks {
@@ -44,35 +48,44 @@ impl<'a> Arbitrary<'a> for Stacks {
 
 impl Stacks {
     fn arbitrary_funcs(u: &mut Unstructured) -> Result<Vec<Function>> {
-        let mut funcs = vec![Function::default()];
+        // Generate a list of functions first with a number of parameters and
+        // results. Bodies are generated afterwards.
+        let nfuncs = u.int_in_range(1..=MAX_FUNCS)?;
+        let mut funcs = (0..nfuncs)
+            .map(|_| {
+                Ok(Function {
+                    ops: Vec::new(), // generated later
+                    params: u.int_in_range(0..=MAX_PARAMS)?,
+                    results: u.int_in_range(0..=MAX_PARAMS)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut funcs_by_result = vec![Vec::new(); MAX_PARAMS + 1];
+        for (i, func) in funcs.iter().enumerate() {
+            funcs_by_result[func.results].push(i as u32);
+        }
 
-        // The indices of functions within `funcs` that we still need to
-        // generate.
-        let mut work_list = vec![0];
-
-        while let Some(f) = work_list.pop() {
-            let mut ops = Vec::with_capacity(u.arbitrary_len::<Op>()?.min(MAX_OPS));
-            for _ in 0..ops.capacity() {
-                ops.push(u.arbitrary()?);
-            }
-            for op in &mut ops {
-                match op {
-                    Op::CallThroughHost(idx) | Op::Call(idx) => {
-                        if u.is_empty() || funcs.len() >= MAX_FUNCS || u.ratio(4, 5)? {
-                            // Call an existing function.
-                            *idx = *idx % u32::try_from(funcs.len()).unwrap();
-                        } else {
-                            // Call a new function...
-                            *idx = u32::try_from(funcs.len()).unwrap();
-                            // ...which means we also need to eventually define it.
-                            work_list.push(funcs.len());
-                            funcs.push(Function::default());
-                        }
-                    }
-                    Op::CheckStackInHost => {}
+        // Fill in each function body with various instructions/operations now
+        // that the set of functions is known.
+        for f in funcs.iter_mut() {
+            let funcs_with_same_results = &funcs_by_result[f.results];
+            for _ in 0..u.arbitrary_len::<usize>()?.min(MAX_OPS) {
+                let op = match u.int_in_range(0..=3)? {
+                    0 => Op::CheckStackInHost,
+                    1 => Op::Call(u.int_in_range(0..=nfuncs - 1)?),
+                    2 => Op::CallThroughHost(u.int_in_range(0..=nfuncs - 1)?),
+                    // This only works if the target function has the same
+                    // number of results, so choose from a different set here.
+                    3 => Op::ReturnCall(*u.choose(funcs_with_same_results)?),
+                    _ => unreachable!(),
+                };
+                f.ops.push(op);
+                // once a `return_call` has been generated there's no need to
+                // generate any more instructions, so fall through to below.
+                if let Some(Op::ReturnCall(_)) = f.ops.last() {
+                    break;
                 }
             }
-            funcs[f].ops = ops;
         }
 
         Ok(funcs)
@@ -89,7 +102,7 @@ impl Stacks {
     ///
     /// * `host.check_stack: [] -> []`: The host can check the Wasm's
     ///   understanding of its own stack against the host's understanding of the
-    ///   Wasm stack to find discrepency bugs.
+    ///   Wasm stack to find discrepancy bugs.
     ///
     /// * `host.call_func: [funcref] -> []`: The host should call the given
     ///   `funcref`, creating a call stack with multiple sequences of contiguous
@@ -110,19 +123,31 @@ impl Stacks {
         let mut types = wasm_encoder::TypeSection::new();
 
         let run_type = types.len();
-        types.function(vec![wasm_encoder::ValType::I32], vec![]);
+        types
+            .ty()
+            .function(vec![wasm_encoder::ValType::I32], vec![]);
 
         let get_stack_type = types.len();
-        types.function(
+        types.ty().function(
             vec![],
             vec![wasm_encoder::ValType::I32, wasm_encoder::ValType::I32],
         );
 
-        let null_type = types.len();
-        types.function(vec![], vec![]);
-
         let call_func_type = types.len();
-        types.function(vec![wasm_encoder::ValType::FuncRef], vec![]);
+        types
+            .ty()
+            .function(vec![wasm_encoder::ValType::FUNCREF], vec![]);
+
+        let check_stack_type = types.len();
+        types.ty().function(vec![], vec![]);
+
+        let func_types_start = types.len();
+        for func in self.funcs.iter() {
+            types.ty().function(
+                vec![ValType::I32; func.params],
+                vec![ValType::I32; func.results],
+            );
+        }
 
         section(&mut module, types);
 
@@ -131,7 +156,7 @@ impl Stacks {
         imports.import(
             "host",
             "check_stack",
-            wasm_encoder::EntityType::Function(null_type),
+            wasm_encoder::EntityType::Function(check_stack_type),
         );
         let call_func_func = 1;
         imports.import(
@@ -143,8 +168,8 @@ impl Stacks {
         section(&mut module, imports);
 
         let mut funcs = wasm_encoder::FunctionSection::new();
-        for _ in &self.funcs {
-            funcs.function(null_type);
+        for (i, _) in self.funcs.iter().enumerate() {
+            funcs.function(func_types_start + (i as u32));
         }
         let run_func = funcs.len() + num_imported_funcs;
         funcs.function(run_type);
@@ -159,6 +184,7 @@ impl Stacks {
             maximum: Some(1),
             memory64: false,
             shared: false,
+            page_size_log2: None,
         });
         section(&mut module, mems);
 
@@ -168,6 +194,7 @@ impl Stacks {
             wasm_encoder::GlobalType {
                 val_type: wasm_encoder::ValType::I32,
                 mutable: true,
+                shared: false,
             },
             &wasm_encoder::ConstExpr::i32_const(0),
         );
@@ -176,6 +203,7 @@ impl Stacks {
             wasm_encoder::GlobalType {
                 val_type: wasm_encoder::ValType::I32,
                 mutable: true,
+                shared: false,
             },
             &wasm_encoder::ConstExpr::i32_const(0),
         );
@@ -189,13 +217,11 @@ impl Stacks {
         section(&mut module, exports);
 
         let mut elems = wasm_encoder::ElementSection::new();
-        elems.declared(
-            wasm_encoder::ValType::FuncRef,
-            wasm_encoder::Elements::Functions(
-                &(0..num_imported_funcs + u32::try_from(self.funcs.len()).unwrap())
-                    .collect::<Vec<_>>(),
-            ),
-        );
+        elems.declared(wasm_encoder::Elements::Functions(
+            (0..num_imported_funcs + u32::try_from(self.funcs.len()).unwrap())
+                .collect::<Vec<_>>()
+                .into(),
+        ));
         section(&mut module, elems);
 
         let check_fuel = |body: &mut wasm_encoder::Function| {
@@ -241,6 +267,25 @@ impl Stacks {
                 .instruction(&Instruction::GlobalSet(stack_len_global));
         };
 
+        let push_params = |body: &mut wasm_encoder::Function, func: u32| {
+            let func = &self.funcs[func as usize];
+            for _ in 0..func.params {
+                body.instruction(&Instruction::I32Const(0));
+            }
+        };
+        let pop_results = |body: &mut wasm_encoder::Function, func: u32| {
+            let func = &self.funcs[func as usize];
+            for _ in 0..func.results {
+                body.instruction(&Instruction::Drop);
+            }
+        };
+        let push_results = |body: &mut wasm_encoder::Function, func: u32| {
+            let func = &self.funcs[func as usize];
+            for _ in 0..func.results {
+                body.instruction(&Instruction::I32Const(0));
+            }
+        };
+
         let mut code = wasm_encoder::CodeSection::new();
         for (func_index, func) in self.funcs.iter().enumerate() {
             let mut body = wasm_encoder::Function::new(vec![]);
@@ -251,18 +296,34 @@ impl Stacks {
             );
             check_fuel(&mut body);
 
+            let mut check_fuel_and_pop_at_end = true;
+
             // Perform our specified operations.
             for op in &func.ops {
+                assert!(check_fuel_and_pop_at_end);
                 match op {
                     Op::CheckStackInHost => {
                         body.instruction(&Instruction::Call(check_stack_func));
                     }
                     Op::Call(f) => {
+                        push_params(&mut body, *f);
                         body.instruction(&Instruction::Call(f + num_imported_funcs));
+                        pop_results(&mut body, *f);
                     }
                     Op::CallThroughHost(f) => {
                         body.instruction(&Instruction::RefFunc(f + num_imported_funcs))
                             .instruction(&Instruction::Call(call_func_func));
+                    }
+
+                    // For a `return_call` preemptively check fuel to possibly
+                    // trap and then pop our function from the in-wasm managed
+                    // stack. After that execute the `return_call` itself.
+                    Op::ReturnCall(f) => {
+                        push_params(&mut body, *f);
+                        check_fuel(&mut body);
+                        pop_func_from_stack(&mut body);
+                        check_fuel_and_pop_at_end = false;
+                        body.instruction(&Instruction::ReturnCall(f + num_imported_funcs));
                     }
                 }
             }
@@ -273,9 +334,11 @@ impl Stacks {
             // function, but then we returned back to Wasm and then trapped
             // while `last_wasm_exit_sp` et al are still initialized from that
             // previous host call.
-            check_fuel(&mut body);
-
-            pop_func_from_stack(&mut body);
+            if check_fuel_and_pop_at_end {
+                check_fuel(&mut body);
+                pop_func_from_stack(&mut body);
+                push_results(&mut body, func_index as u32);
+            }
 
             function(&mut code, body);
         }
@@ -302,7 +365,9 @@ impl Stacks {
         check_fuel(&mut run_body);
 
         // Call the first locally defined function.
+        push_params(&mut run_body, 0);
         run_body.instruction(&Instruction::Call(num_imported_funcs));
+        pop_results(&mut run_body, 0);
 
         check_fuel(&mut run_body);
         pop_func_from_stack(&mut run_body);
@@ -366,6 +431,6 @@ mod tests {
         if let Ok(text) = wasmprinter::print_bytes(wasm) {
             drop(std::fs::write("test.wat", &text));
         }
-        panic!("wasm failed to validate: {}", err);
+        panic!("wasm failed to validate: {err}");
     }
 }

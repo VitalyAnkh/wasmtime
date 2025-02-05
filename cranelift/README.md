@@ -3,6 +3,8 @@ Cranelift Code Generator
 
 **A [Bytecode Alliance][BA] project**
 
+[Website](https://cranelift.dev/)
+
 Cranelift is a low-level retargetable code generator. It translates a
 [target-independent intermediate representation](docs/ir.md)
 into executable machine code.
@@ -44,8 +46,8 @@ active effort to formally verify Cranelift's instruction-selection backends. We
 take security seriously and have a [security policy] as a part of Bytecode
 Alliance.
 
-Cranelift has three backends: x86-64, aarch64 (aka ARM64), and s390x (aka IBM
-Z). All three backends fully support enough functionality for Wasm MVP, and
+Cranelift has four backends: x86-64, aarch64 (aka ARM64), s390x (aka IBM
+Z) and riscv64. All backends fully support enough functionality for Wasm MVP, and
 x86-64 and aarch64 fully support SIMD as well. On x86-64, Cranelift supports
 both the System V AMD64 ABI calling convention used on many platforms and the
 Windows x64 calling convention. On aarch64, Cranelift supports the standard
@@ -60,7 +62,7 @@ V8 (TurboFan), and ~14% slower than WAVM (LLVM). Its compilation speed, in the
 same paper, is measured as approximately an order of magnitude faster than WAVM
 (LLVM). We continue to work to improve both measures.
 
-[Rust compiler backend]: https://github.com/bjorn3/rustc_codegen_cranelift
+[Rust compiler backend]: https://github.com/rust-lang/rustc_codegen_cranelift
 [security policy]: https://bytecodealliance.org/security
 [recent paper]: https://arxiv.org/abs/2011.13127
 

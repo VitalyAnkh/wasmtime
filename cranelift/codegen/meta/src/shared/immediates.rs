@@ -31,6 +31,11 @@ pub(crate) struct Immediates {
     /// This is used to represent an immediate address offset in load/store instructions.
     pub offset32: OperandKind,
 
+    /// A 16-bit immediate floating point operand.
+    ///
+    /// IEEE 754-2008 binary16 interchange format.
+    pub ieee16: OperandKind,
+
     /// A 32-bit immediate floating point operand.
     ///
     /// IEEE 754-2008 binary32 interchange format.
@@ -119,6 +124,11 @@ impl Immediates {
                 "ir::immediates::Offset32",
                 "A 32-bit immediate signed offset.",
             ),
+            ieee16: new_imm(
+                "imm",
+                "ir::immediates::Ieee16",
+                "A 16-bit immediate floating point number.",
+            ),
             ieee32: new_imm(
                 "imm",
                 "ir::immediates::Ieee32",
@@ -177,10 +187,11 @@ impl Immediates {
 
             trapcode: {
                 let mut trapcode_values = HashMap::new();
-                trapcode_values.insert("stk_ovf", "StackOverflow");
-                trapcode_values.insert("heap_oob", "HeapOutOfBounds");
-                trapcode_values.insert("int_ovf", "IntegerOverflow");
-                trapcode_values.insert("int_divz", "IntegerDivisionByZero");
+                trapcode_values.insert("stk_ovf", "STACK_OVERFLOW");
+                trapcode_values.insert("heap_oob", "HEAP_OUT_OF_BOUNDS");
+                trapcode_values.insert("int_ovf", "INTEGER_OVERFLOW");
+                trapcode_values.insert("int_divz", "INTEGER_DIVISION_BY_ZERO");
+                trapcode_values.insert("bad_toint", "BAD_CONVERSION_TO_INTEGER");
                 new_enum(
                     "code",
                     "ir::TrapCode",

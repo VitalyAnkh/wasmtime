@@ -161,13 +161,13 @@ impl Builder {
     }
 
     /// Extract contents of builder once everything is configured.
-    pub fn state_for(self, name: &str) -> Box<[u8]> {
+    pub fn state_for(&self, name: &str) -> &[u8] {
         assert_eq!(name, self.template.name);
-        self.bytes
+        &self.bytes
     }
 
     /// Iterates the available settings in the builder.
-    pub fn iter(&self) -> impl Iterator<Item = Setting> {
+    pub fn iter(&self) -> impl Iterator<Item = Setting> + use<> {
         let template = self.template;
 
         template.descriptors.iter().map(move |d| {
@@ -231,21 +231,10 @@ fn parse_bool_value(value: &str) -> SetResult<bool> {
 fn parse_enum_value(value: &str, choices: &[&str]) -> SetResult<u8> {
     match choices.iter().position(|&tag| tag == value) {
         Some(idx) => Ok(idx as u8),
-        None => {
-            // TODO: Use `join` instead of this code, once
-            // https://github.com/rust-lang/rust/issues/27747 is resolved.
-            let mut all_choices = String::new();
-            let mut first = true;
-            for choice in choices {
-                if first {
-                    first = false
-                } else {
-                    all_choices += ", ";
-                }
-                all_choices += choice;
-            }
-            Err(SetError::BadValue(format!("any among {}", all_choices)))
-        }
+        None => Err(SetError::BadValue(format!(
+            "any among {}",
+            choices.join(", ")
+        ))),
     }
 }
 
@@ -306,12 +295,12 @@ impl std::error::Error for SetError {}
 impl fmt::Display for SetError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            SetError::BadName(name) => write!(f, "No existing setting named '{}'", name),
+            SetError::BadName(name) => write!(f, "No existing setting named '{name}'"),
             SetError::BadType => {
                 write!(f, "Trying to set a setting with the wrong type")
             }
             SetError::BadValue(value) => {
-                write!(f, "Unexpected value for a setting, expected {}", value)
+                write!(f, "Unexpected value for a setting, expected {value}")
             }
         }
     }
@@ -386,13 +375,13 @@ pub mod detail {
         ) -> fmt::Result {
             match detail {
                 Detail::Bool { bit } => write!(f, "{}", (byte & (1 << bit)) != 0),
-                Detail::Num => write!(f, "{}", byte),
+                Detail::Num => write!(f, "{byte}"),
                 Detail::Enum { last, enumerators } => {
                     if byte <= last {
                         let tags = self.enums(last, enumerators);
                         write!(f, "\"{}\"", tags[usize::from(byte)])
                     } else {
-                        write!(f, "{}", byte)
+                        write!(f, "{byte}")
                     }
                 }
                 // Presets aren't printed. They are reflected in the other settings.
@@ -493,13 +482,13 @@ pub struct FlagsOrIsa<'a> {
 }
 
 impl<'a> From<&'a Flags> for FlagsOrIsa<'a> {
-    fn from(flags: &'a Flags) -> FlagsOrIsa {
+    fn from(flags: &'a Flags) -> FlagsOrIsa<'a> {
         FlagsOrIsa { flags, isa: None }
     }
 }
 
 impl<'a> From<&'a dyn TargetIsa> for FlagsOrIsa<'a> {
-    fn from(isa: &'a dyn TargetIsa) -> FlagsOrIsa {
+    fn from(isa: &'a dyn TargetIsa) -> FlagsOrIsa<'a> {
         FlagsOrIsa {
             flags: isa.flags(),
             isa: Some(isa),
@@ -520,31 +509,32 @@ mod tests {
         let f = Flags::new(b);
         let actual = f.to_string();
         let expected = r#"[shared]
+regalloc_algorithm = "backtracking"
 opt_level = "none"
 tls_model = "none"
+stack_switch_model = "none"
 libcall_call_conv = "isa_default"
 probestack_size_log2 = 12
 probestack_strategy = "outline"
+bb_padding_log2_minus_one = 0
 regalloc_checker = false
 regalloc_verbose_logs = false
 enable_alias_analysis = true
-use_egraphs = true
 enable_verifier = true
+enable_pcc = false
 is_pic = false
 use_colocated_libcalls = false
-avoid_div_traps = false
 enable_float = true
 enable_nan_canonicalization = false
 enable_pinned_reg = false
-enable_simd = false
 enable_atomics = true
 enable_safepoints = false
 enable_llvm_abi_extensions = false
+enable_multi_ret_implicit_sret = false
 unwind_info = true
 preserve_frame_pointers = false
 machine_code_cfg_info = false
 enable_probestack = false
-probestack_func_adjusts_sp = false
 enable_jump_tables = true
 enable_heap_access_spectre_mitigation = true
 enable_table_access_spectre_mitigation = true
@@ -559,18 +549,17 @@ enable_incremental_compilation_cache_checks = false
             );
         }
         assert_eq!(f.opt_level(), super::OptLevel::None);
-        assert_eq!(f.enable_simd(), false);
     }
 
     #[test]
     fn modify_bool() {
         let mut b = builder();
         assert_eq!(b.enable("not_there"), Err(BadName("not_there".to_string())));
-        assert_eq!(b.enable("enable_simd"), Ok(()));
-        assert_eq!(b.set("enable_simd", "false"), Ok(()));
+        assert_eq!(b.enable("enable_atomics"), Ok(()));
+        assert_eq!(b.set("enable_atomics", "false"), Ok(()));
 
         let f = Flags::new(b);
-        assert_eq!(f.enable_simd(), false);
+        assert_eq!(f.enable_atomics(), false);
     }
 
     #[test]
@@ -580,9 +569,12 @@ enable_incremental_compilation_cache_checks = false
             b.set("not_there", "true"),
             Err(BadName("not_there".to_string()))
         );
-        assert_eq!(b.set("enable_simd", ""), Err(BadValue("bool".to_string())));
         assert_eq!(
-            b.set("enable_simd", "best"),
+            b.set("enable_atomics", ""),
+            Err(BadValue("bool".to_string()))
+        );
+        assert_eq!(
+            b.set("enable_atomics", "best"),
             Err(BadValue("bool".to_string()))
         );
         assert_eq!(
@@ -592,10 +584,10 @@ enable_incremental_compilation_cache_checks = false
             ))
         );
         assert_eq!(b.set("opt_level", "speed"), Ok(()));
-        assert_eq!(b.set("enable_simd", "0"), Ok(()));
+        assert_eq!(b.set("enable_atomics", "0"), Ok(()));
 
         let f = Flags::new(b);
-        assert_eq!(f.enable_simd(), false);
+        assert_eq!(f.enable_atomics(), false);
         assert_eq!(f.opt_level(), super::OptLevel::Speed);
     }
 }

@@ -83,6 +83,7 @@ pub fn map_reg(reg: Reg) -> Result<Register, RegisterMappingError> {
     match reg.class() {
         RegClass::Int => Ok(GPR_MAP[reg.to_real_reg().unwrap().hw_enc() as usize]),
         RegClass::Float => Ok(VR_MAP[reg.to_real_reg().unwrap().hw_enc() as usize]),
+        RegClass::Vector => unreachable!(),
     }
 }
 
@@ -91,9 +92,6 @@ pub(crate) struct RegisterMapper;
 impl crate::isa::unwind::systemv::RegisterMapper<Reg> for RegisterMapper {
     fn map(&self, reg: Reg) -> Result<u16, RegisterMappingError> {
         Ok(map_reg(reg)?.0)
-    }
-    fn sp(&self) -> u16 {
-        Register(15).0
     }
 }
 
@@ -107,7 +105,6 @@ mod tests {
     use crate::settings::{builder, Flags};
     use crate::Context;
     use gimli::write::Address;
-    use std::str::FromStr;
     use target_lexicon::triple;
 
     #[test]
@@ -119,10 +116,12 @@ mod tests {
 
         let mut context = Context::for_function(create_function(
             CallConv::SystemV,
-            Some(StackSlotData::new(StackSlotKind::ExplicitSlot, 64)),
+            Some(StackSlotData::new(StackSlotKind::ExplicitSlot, 64, 0)),
         ));
 
-        let code = context.compile(&*isa).expect("expected compilation");
+        let code = context
+            .compile(&*isa, &mut Default::default())
+            .expect("expected compilation");
 
         let fde = match code
             .create_unwind_info(isa.as_ref())
@@ -134,7 +133,7 @@ mod tests {
             _ => panic!("expected unwind information"),
         };
 
-        assert_eq!(format!("{:?}", fde), "FrameDescriptionEntry { address: Constant(1234), length: 10, lsda: None, instructions: [(4, CfaOffset(224))] }");
+        assert_eq!(format!("{fde:?}"), "FrameDescriptionEntry { address: Constant(1234), length: 10, lsda: None, instructions: [(4, CfaOffset(224))] }");
     }
 
     fn create_function(call_conv: CallConv, stack_slot: Option<StackSlotData>) -> Function {
@@ -161,10 +160,12 @@ mod tests {
 
         let mut context = Context::for_function(create_multi_return_function(
             CallConv::SystemV,
-            Some(StackSlotData::new(StackSlotKind::ExplicitSlot, 64)),
+            Some(StackSlotData::new(StackSlotKind::ExplicitSlot, 64, 0)),
         ));
 
-        let code = context.compile(&*isa).expect("expected compilation");
+        let code = context
+            .compile(&*isa, &mut Default::default())
+            .expect("expected compilation");
 
         let fde = match code
             .create_unwind_info(isa.as_ref())
@@ -176,7 +177,7 @@ mod tests {
             _ => panic!("expected unwind information"),
         };
 
-        assert_eq!(format!("{:?}", fde), "FrameDescriptionEntry { address: Constant(4321), length: 26, lsda: None, instructions: [(4, CfaOffset(224))] }");
+        assert_eq!(format!("{fde:?}"), "FrameDescriptionEntry { address: Constant(4321), length: 26, lsda: None, instructions: [(4, CfaOffset(224))] }");
     }
 
     fn create_multi_return_function(
